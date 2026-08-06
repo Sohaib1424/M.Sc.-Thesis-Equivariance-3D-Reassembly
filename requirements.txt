@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# torch and torch-geometric are deliberately NOT pinned here.
+# Install them FIRST, matching your machine's CUDA version, e.g.:
+#
+#   Kaggle / Colab (CUDA 12.x, already has torch):   nothing to do
+#   Local CUDA 12.1: pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   CPU only:        pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+#   then:            pip install torch-geometric
+#
+# Installing torch from a generic requirements.txt is how people end up with a
+# CPU-only wheel on a GPU machine and then spend a day debugging "CUDA not
+# available".
+# ---------------------------------------------------------------------------
+numpy>=1.23
+scipy>=1.9
+trimesh>=3.20
+libigl>=2.5
+tqdm>=4.64
+matplotlib>=3.6
+pyyaml>=6.0
+
+# dev / test
+pytest>=7.0
+pytest-timeout>=2.1

@@ -1,0 +1,26 @@
+# The frac-vs-full input-source experiment.
+#
+# The model consumes ONLY the pruned fracture-surface mesh, while every
+# geometry loss is still evaluated against the full fragment -- so the question
+# it answers is "can a model that only ever sees the interface skeleton still
+# reassemble the whole object, and at what fraction of the compute?".
+#
+# Run this alongside configs/default.yaml with everything else identical, then
+# compare with scripts/benchmark_compute.py.
+data:
+  root_dir: data
+  input_source: frac
+  decimate_to: 30000          # applied to the FULL mesh, before extraction
+  max_vertices: 90000
+  num_workers: 4
+model:
+  hidden_channels: 32
+  num_layers: 3
+  gradient_checkpointing: true
+train:
+  epochs: 60
+  batch_size: 4
+  steps_per_epoch: 150
+  val_steps: 30
+  amp: true
+  checkpoint_dir: checkpoints/frac

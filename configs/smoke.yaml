@@ -1,0 +1,22 @@
+# Tiny, fast configuration for verifying the pipeline runs at all.
+data:
+  root_dir: data
+  decimate_to: 3000
+  max_vertices: 8000
+  num_workers: 0
+model:
+  hidden_channels: 8
+  num_layers: 2
+  num_vn_slots: 4
+  heads: 2
+  embed_dim: 16
+  gradient_checkpointing: false
+train:
+  epochs: 2
+  batch_size: 2
+  steps_per_epoch: 4
+  val_steps: 2
+  amp: false
+  num_gpus: 1
+  device: cpu
+  checkpoint_dir: checkpoints/smoke

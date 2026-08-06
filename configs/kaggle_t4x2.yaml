@@ -1,0 +1,48 @@
+# Kaggle: 2x Tesla T4 (16 GB each, Turing -> fp16 yes, bf16 NO), ~4 CPU cores.
+#
+# The three settings that make this fit in 16 GB, in order of how much each
+# buys:
+#   data.decimate_to          caps vertices per scene -> caps peak memory
+#   model.gradient_checkpointing  trades ~30% compute for ~4x less activation memory
+#   train.amp (fp16)          halves every activation tensor
+#
+# accum_steps=4 with batch_size=2 gives an effective batch of 8 scenes per rank
+# (16 across both GPUs) at the memory cost of 2.
+#
+# num_workers is deliberately low: with 2 ranks this is 2x2 = 4 worker
+# processes on a ~4-core box, and scene loading is CPU-bound mesh work.
+data:
+  root_dir: /kaggle/input/breaking-bad-dataset
+  input_source: full
+  decimate_to: 15000
+  max_vertices: 40000
+  num_workers: 2
+  seed: 0
+
+model:
+  hidden_channels: 32
+  num_layers: 3
+  num_vn_slots: 8
+  heads: 4
+  embed_dim: 32
+  norm: layer
+  gradient_checkpointing: true
+
+loss:
+  rot_loss: chordal
+
+optim:
+  lr: 3.0e-4
+  grad_clip: 5.0
+
+train:
+  epochs: 60
+  batch_size: 2
+  accum_steps: 4
+  steps_per_epoch: 150
+  val_steps: 30
+  amp: true
+  amp_dtype: fp16
+  num_gpus: 2
+  checkpoint_dir: /kaggle/working/checkpoints
+  max_consecutive_oom: 5

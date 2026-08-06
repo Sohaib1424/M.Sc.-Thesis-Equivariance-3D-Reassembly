@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reassembly"
+version = "0.2.0"
+description = "SO(3)-equivariant graph networks for 3D fracture reassembly on commodity GPUs"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.9",
+    "trimesh>=3.20",
+    "libigl>=2.5",
+    "tqdm>=4.64",
+    "matplotlib>=3.6",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# torch / torch-geometric are intentionally NOT listed as hard dependencies:
+# the correct wheel depends on the CUDA version of the target machine, so they
+# must be installed first, by hand (see README "Installation").
+dev = ["pytest>=7.0", "pytest-timeout>=2.1"]
+
+[project.scripts]
+reassembly-train = "reassembly.cli.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: tests that load real scenes from disk (need --root-dir data)",
+    "needs_data: requires the Breaking Bad dataset to be present",
+    "cuda: requires a CUDA device",
+]

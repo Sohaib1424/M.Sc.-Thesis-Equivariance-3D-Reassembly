@@ -1,0 +1,65 @@
+# Reference configuration. Reasonable on a single modern GPU (>=24 GB).
+# For Kaggle's 2xT4 (16 GB each) use configs/kaggle_t4x2.yaml.
+data:
+  root_dir: data
+  val_frac: 0.1
+  test_frac: 0.1
+  split_seed: 0
+  input_source: full          # full | frac
+  decimate_to: 30000          # total vertices per scene (null disables)
+  max_vertices: 90000         # hard reject + redraw above this
+  min_vertices_per_fragment: 32
+  correspondence_tol: 1.0e-5
+  num_workers: 4
+  seed: 0
+
+model:
+  hidden_channels: 32
+  num_layers: 3
+  num_vn_slots: 8
+  heads: 4
+  head_dim: null              # null -> hidden_channels // heads
+  embed_dim: 32
+  norm: layer
+  gradient_checkpointing: true
+  angular: false
+  max_triplets_per_node: 24
+
+loss:
+  rot: 1.0
+  pos: 1.0
+  node: 1.0
+  mid: 1.0
+  face: 1.0
+  embv: 1.0
+  embe: 1.0
+  rot_loss: chordal           # chordal | geodesic | hybrid
+  auto_balance: false
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 5.0
+  scheduler: plateau
+  plateau_patience: 5
+  plateau_factor: 0.5
+  warmup_steps: 0
+
+train:
+  epochs: 60
+  batch_size: 4
+  accum_steps: 1
+  steps_per_epoch: 150
+  val_steps: 30
+  amp: true
+  amp_dtype: fp16
+  num_gpus: 1
+  device: cuda
+  master_port: 12355
+  checkpoint_dir: checkpoints
+  resume: null
+  resume_history: false
+  max_consecutive_oom: 5
+  log_every: 1
+  save_every: 1
+  seed: 0

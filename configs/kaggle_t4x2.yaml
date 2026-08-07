@@ -44,7 +44,6 @@ optim:
   grad_clip: 5.0
 
 train:
-  epochs: 60
   # 6,000 vertices per scene at batch 16 is roughly the same GPU work as
   # 22,500 at batch 4 -- same node count per step, four times the scenes.
   # That is where most of the throughput comes from; see docs/TRAINING_BUDGET.md.
@@ -56,4 +55,16 @@ train:
   amp_dtype: fp16
   num_gpus: 2
   checkpoint_dir: /kaggle/working/checkpoints
+
+  # A ~6-day run inside 12-hour sessions is about a dozen restarts.
+  #   resume: auto           picks up last.pt by itself, so the SAME command
+  #                          can be re-run every session with no editing
+  #   time_budget_hours      stops cleanly rather than being killed mid-epoch;
+  #                          11.5 leaves room for the final checkpoint write
+  #   save_every: 1          a killed session then costs at most one epoch
+  resume: auto
+  time_budget_hours: 11.5
+  save_every: 1
+  epochs: 3000
+
   max_consecutive_oom: 5

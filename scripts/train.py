@@ -76,7 +76,13 @@ def build_config(argv=None) -> Config:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-gpus", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--resume", type=str, default=None,
+                        metavar="PATH|auto",
+                        help="Checkpoint to continue from, or 'auto' to pick up "
+                             "<checkpoint-dir>/last.pt when it exists")
+    parser.add_argument("--time-budget-hours", type=float, default=None,
+                        help="Stop cleanly after N hours instead of being killed "
+                             "mid-epoch (Kaggle caps sessions at 12)")
     parser.add_argument("--input-source", type=str, default=None, choices=["full", "frac"])
     parser.add_argument("--decimate-to", type=int, default=None)
     parser.add_argument("--cache-dir", type=str, default=None,
@@ -96,7 +102,8 @@ def build_config(argv=None) -> Config:
         ("root_dir", "data.root_dir"), ("checkpoint_dir", "train.checkpoint_dir"),
         ("epochs", "train.epochs"), ("batch_size", "train.batch_size"),
         ("num_gpus", "train.num_gpus"), ("device", "train.device"),
-        ("resume", "train.resume"), ("input_source", "data.input_source"),
+        ("resume", "train.resume"),
+        ("time_budget_hours", "train.time_budget_hours"), ("input_source", "data.input_source"),
         ("decimate_to", "data.decimate_to"),
         ("cache_dir", "data.cache_dir"),
     ):

@@ -38,11 +38,13 @@ def quiet_third_party_warnings() -> None:
         "ignore", category=UserWarning,
         message=r".*given NumPy array is not writable.*",
     )
-    for _category in (FutureWarning, DeprecationWarning):
-    warnings.filterwarnings(
-        "ignore", category=_category,
-        message=r".*torch\.(cuda\.)?amp\..*is deprecated.*",
-    )
+    # One call per category: warnings.filterwarnings asserts
+    # isinstance(category, type), so a tuple raises "category must be a class".
+    for category in (FutureWarning, DeprecationWarning):
+        warnings.filterwarnings(
+            "ignore", category=category,
+            message=r".*torch\.(cuda\.)?amp\..*is deprecated.*",
+        )
     warnings.filterwarnings(
         "ignore", category=UserWarning,
         message=r".*TypedStorage is deprecated.*",

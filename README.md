@@ -109,13 +109,11 @@ via DDP; run it as `!python scripts/train.py ...` from a notebook cell (a
 subprocess), not by importing `main()`, because `mp.spawn` needs a real process
 to fork from.
 
-Sessions cap at 12 hours, so expect to resume:
-
-```bash
-python scripts/train.py --config configs/kaggle_t4x2.yaml \
-    --root-dir /kaggle/input/<slug> --num-gpus 2 \
-    --resume /kaggle/working/checkpoints/last.pt
-```
+Sessions cap at 12 hours. The Kaggle config sets `resume: auto` and
+`time_budget_hours: 11.5`, so training stops cleanly before the cap and picks
+itself up next time — **re-run the same cell, nothing to edit**. Full state
+(optimizer, scheduler, AMP scale, RNG, history) is carried across, and the loss
+curve stays continuous. See `docs/RESUMING.md`.
 
 What makes it fit, in order of effect:
 
@@ -225,6 +223,8 @@ memory-hungry optional component — budget for roughly double activation memory
   thesis-relevant, not cosmetic; §13 covers what the first real scene exposed.
 - **`docs/ARCHITECTURE.md`** — how the model works and the invariants the code
   depends on.
+- **`docs/RESUMING.md`** — training across 12-hour sessions: what is saved,
+  how the history stays continuous, and how to check a resume worked.
 - **`docs/TRAINING_BUDGET.md`** — how long training actually takes, derived
   from measured throughput: epochs, wall-clock, FLOPs, and the GARF comparison
   with its assumptions stated.

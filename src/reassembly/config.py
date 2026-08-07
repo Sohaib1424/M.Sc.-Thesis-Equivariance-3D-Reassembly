@@ -105,8 +105,18 @@ class TrainConfig:
     device: str = "cuda"
     master_port: int = 12355
     checkpoint_dir: str = "checkpoints"
+    #: Path to a checkpoint, or "auto" to pick up <checkpoint_dir>/last.pt if
+    #: it exists and start fresh otherwise. "auto" is what makes the same
+    #: command re-runnable across capped sessions.
     resume: Optional[str] = None
-    resume_history: bool = False
+    #: Carry the loss history across a resume. Defaults to True: a resumed run
+    #: that discards its history produces a curve starting at the resume point,
+    #: which is useless for judging convergence across a dozen sessions.
+    resume_history: bool = True
+    #: Stop cleanly after this many hours rather than being killed mid-epoch.
+    #: Kaggle caps sessions at 12 h; 11.5 leaves room for the final save.
+    #: None disables the budget.
+    time_budget_hours: Optional[float] = None
     max_consecutive_oom: int = 5
     log_every: int = 1
     save_every: int = 1

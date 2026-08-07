@@ -26,6 +26,9 @@ from ..utils.memory import (
 from .bridge import build_model_inputs, build_predictions, build_targets, select_input_graph
 from .distributed import all_ranks_agree, get_world_size, is_main_process, reduce_metrics
 from .losses import LOSS_KEYS
+from .session import (
+    SessionLimit, load_rng_state, merge_history, rng_state,
+)
 
 METRIC_KEYS = ("total", *LOSS_KEYS, "rot_deg")
 
@@ -197,25 +200,52 @@ def run_epoch(
 
 
 def save_checkpoint(path: Path, model, optimizer, scheduler, epoch: int,
-                    best_val: float, cfg: Config) -> None:
-    """Full training state, not just weights -- an interrupted run should
-    resume, not restart."""
+                    best_val: float, cfg: Config, amp=None, history=None,
+                    loss_fn=None) -> None:
+    """Everything needed to continue, not just to evaluate.
+
+    Weights alone restart the optimizer from zero momentum and reset the AMP
+    scale factor. Across a dozen capped sessions that produces a visible bump
+    in the loss at every boundary -- which is indistinguishable, on a plot,
+    from a model that is failing to converge.
+
+    Written to a temporary file and renamed, so a session killed mid-write
+    leaves the previous checkpoint intact rather than a truncated one.
+    """
     underlying = model.module if hasattr(model, "module") else model
-    torch.save(
-        {
-            "model": underlying.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict() if scheduler is not None else None,
-            "epoch": epoch,
-            "best_val": best_val,
-            "config": cfg.to_dict(),
-        },
-        path,
-    )
+    payload = {
+        "model": underlying.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "epoch": epoch,
+        "best_val": best_val,
+        "config": cfg.to_dict(),
+        # The loss module holds learnable parameters when auto_balance is on.
+        "loss_fn": loss_fn.state_dict() if loss_fn is not None else None,
+        # Scale factor: dropping it costs a few skipped steps while AMP
+        # re-discovers it, every single session.
+        "scaler": amp.state_dict() if amp is not None else None,
+        # So the data order and augmentations continue rather than replay.
+        "rng": rng_state(),
+        # Carried inside the checkpoint as well as in loss_history.json, so
+        # weights and curves cannot drift apart.
+        "history": history or {},
+        "version": 2,
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    tmp.replace(path)
 
 
 def load_checkpoint(path: str, model, optimizer=None, scheduler=None,
-                    map_location="cpu") -> Dict:
+                    map_location="cpu", amp=None, loss_fn=None,
+                    restore_rng: bool = True) -> Dict:
+    """Restore as much as the checkpoint carries.
+
+    Older checkpoints (version 1) have no scaler, RNG or history; those fields
+    are simply absent and are skipped, so an older file still resumes -- just
+    without the extras.
+    """
     state = torch.load(path, map_location=map_location, weights_only=False)
     underlying = model.module if hasattr(model, "module") else model
     underlying.load_state_dict(state["model"])
@@ -223,7 +253,29 @@ def load_checkpoint(path: str, model, optimizer=None, scheduler=None,
         optimizer.load_state_dict(state["optimizer"])
     if scheduler is not None and state.get("scheduler"):
         scheduler.load_state_dict(state["scheduler"])
+    if loss_fn is not None and state.get("loss_fn"):
+        loss_fn.load_state_dict(state["loss_fn"])
+    if amp is not None and state.get("scaler"):
+        amp.load_state_dict(state["scaler"])
+    state["_rng_restored"] = load_rng_state(state.get("rng")) if restore_rng else False
     return state
+
+
+def find_resume_checkpoint(spec: Optional[str], checkpoint_dir: Path) -> Optional[str]:
+    """Resolve ``train.resume``.
+
+    ``"auto"`` picks up ``last.pt`` from the checkpoint directory if it exists
+    and starts fresh otherwise, so the SAME command can be re-run each session
+    without editing a path by hand. That matters when a run spans a dozen
+    12-hour sessions: editing the command every time is how a run ends up
+    resumed from the wrong checkpoint.
+    """
+    if not spec:
+        return None
+    if str(spec).lower() != "auto":
+        return str(spec)
+    candidate = checkpoint_dir / "last.pt"
+    return str(candidate) if candidate.exists() else None
 
 
 def fit(
@@ -248,18 +300,52 @@ def fit(
     history: Dict[str, Dict[str, list]] = {"train": {}, "val": {}}
     start_epoch, best_val = 0, float("inf")
 
-    if cfg.train.resume:
-        state = load_checkpoint(cfg.train.resume, model, optimizer, scheduler,
-                                map_location=device)
+    resume_path = find_resume_checkpoint(cfg.train.resume, ckpt_dir)
+    if resume_path:
+        state = load_checkpoint(resume_path, model, optimizer, scheduler,
+                                map_location=device, amp=amp, loss_fn=loss_fn)
         start_epoch = int(state.get("epoch", -1)) + 1
         best_val = float(state.get("best_val", float("inf")))
-        if main:
-            print(f"Resumed from {cfg.train.resume} at epoch {start_epoch} "
-                  f"(best_val={best_val:.4f})")
 
-    if main and cfg.train.resume_history and history_path.exists():
-        with open(history_path) as f:
-            history = json.load(f)
+        # Prefer the history carried inside the checkpoint: it cannot have
+        # drifted from the weights. Fall back to the JSON file for older
+        # checkpoints that predate it.
+        loaded = state.get("history") or {}
+        if not loaded and history_path.exists():
+            try:
+                with open(history_path) as f:
+                    loaded = json.load(f)
+            except (OSError, ValueError):
+                loaded = {}
+        history = merge_history(loaded, start_epoch)
+
+        if main:
+            epochs_recorded = len(history.get("train", {}).get("total", []))
+            print(
+                f"resumed from {resume_path}\n"
+                f"  epoch          : {start_epoch} of {cfg.train.epochs}\n"
+                f"  best val total : {best_val:.6f}\n"
+                f"  history        : {epochs_recorded} epochs carried forward\n"
+                f"  optimizer/sched: restored\n"
+                f"  amp scaler     : {'restored' if state.get('scaler') else 'not in checkpoint'}\n"
+                f"  rng stream     : {'continued' if state.get('_rng_restored') else 'reset'}"
+            )
+    elif cfg.train.resume and str(cfg.train.resume).lower() == "auto" and main:
+        print(f"resume=auto: no {ckpt_dir / 'last.pt'} yet, starting fresh")
+
+    if start_epoch >= cfg.train.epochs:
+        if main:
+            print(f"nothing to do: already at epoch {start_epoch} of "
+                  f"{cfg.train.epochs}. Raise train.epochs to continue.")
+        return history
+
+    session = SessionLimit(cfg.train.time_budget_hours, main=main)
+    if main and session.budget:
+        print(f"session budget: {cfg.train.time_budget_hours:.2f} h "
+              f"-- will stop cleanly rather than be killed mid-epoch")
+
+    stop_reason = ""
+    last_epoch_seconds = 0.0
 
     for epoch in range(start_epoch, cfg.train.epochs):
         epoch_start = time.perf_counter()
@@ -295,14 +381,53 @@ def fit(
             with open(history_path, "w") as f:
                 json.dump(history, f)
 
-            if (epoch + 1) % cfg.train.save_every == 0:
-                save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler,
-                                epoch, best_val, cfg)
             current = val_metrics.get("total", float("inf"))
             if current == current and current < best_val:
                 best_val = current
                 save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler,
-                                epoch, best_val, cfg)
+                                epoch, best_val, cfg, amp=amp, history=history,
+                                loss_fn=loss_fn)
+
+            if (epoch + 1) % cfg.train.save_every == 0:
+                save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler,
+                                epoch, best_val, cfg, amp=amp, history=history,
+                                loss_fn=loss_fn)
+
+        last_epoch_seconds = elapsed
+
+        # Whether to stop is decided on the main rank and then agreed by all.
+        # One rank leaving the loop while the others continue hangs the job at
+        # the next collective, with no error and no progress.
+        stop, reason = session.should_stop(last_epoch_seconds)
+        if not all_ranks_agree(not stop, device):
+            stop_reason = reason or "another rank requested a stop"
+            if main:
+                # last.pt may be several epochs stale if save_every > 1, and
+                # this epoch is the one worth keeping.
+                save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler,
+                                epoch, best_val, cfg, amp=amp, history=history,
+                                loss_fn=loss_fn)
+                with open(history_path, "w") as f:
+                    json.dump(history, f)
+                tqdm.write(f"\nstopping after epoch {epoch}: {stop_reason}")
+            break
+
+    session.restore()
+
+    if main and stop_reason:
+        remaining = cfg.train.epochs - (epoch + 1)
+        print(
+            f"\nPAUSED, not finished -- {remaining} of {cfg.train.epochs} epochs left.\n"
+            f"  reason         : {stop_reason}\n"
+            f"  {session.describe()}\n"
+            f"  best val total : {best_val:.6f}\n"
+            f"  saved          : {ckpt_dir / 'last.pt'}  (resume point)\n"
+            f"                   {ckpt_dir / 'best.pt'}  (lowest validation)\n"
+            f"                   {history_path}\n\n"
+            f"continue with the SAME command -- train.resume: auto picks up\n"
+            f"last.pt by itself, so nothing needs editing between sessions."
+        )
+        return history
 
     if main:
         # Written unconditionally when the loop finishes, separate from the
@@ -315,7 +440,8 @@ def fit(
         # epoch, which is exactly when you want to be able to tell them apart.
         final_path = ckpt_dir / "final.pt"
         save_checkpoint(final_path, model, optimizer, scheduler,
-                        cfg.train.epochs - 1, best_val, cfg)
+                        cfg.train.epochs - 1, best_val, cfg, amp=amp,
+                        history=history, loss_fn=loss_fn)
         underlying = model.module if hasattr(model, "module") else model
         weights_path = ckpt_dir / "final_weights.pt"
         torch.save(underlying.state_dict(), weights_path)

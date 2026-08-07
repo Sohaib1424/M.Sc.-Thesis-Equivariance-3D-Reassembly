@@ -132,7 +132,7 @@ def test_geodesic_angle_matches_known_rotations():
                           [np.sin(th), np.cos(th), 0.0],
                           [0.0, 0.0, 1.0]], dtype=torch.float32)[None]
         angle = geodesic_rotation_angle(R, torch.eye(3)[None])
-        assert abs(float(torch.rad2deg(angle)) - deg) < 0.15
+        assert abs(float(torch.rad2deg(angle)) - deg) < 1e-3
 
 
 def test_chordal_loss_is_zero_at_the_optimum_and_increases_with_angle():
@@ -150,10 +150,19 @@ def test_chordal_loss_is_zero_at_the_optimum_and_increases_with_angle():
         prev = value
 
 
-def test_chordal_gradient_stays_bounded_near_the_optimum():
-    """Why the default loss is chordal, not geodesic: arccos has infinite slope
-    at 1, so the geodesic gradient BLOWS UP exactly as the prediction becomes
-    correct -- the opposite of what a loss should do."""
+def test_chordal_gradient_vanishes_at_the_optimum_and_geodesic_does_not():
+    """Why chordal is the default.
+
+    NOT because the geodesic gradient explodes -- with the atan2 formulation it
+    does not. The explosion in the original code came from the
+    arccos-of-trace parameterisation, and it is gone.
+
+    The real reason is the shape of the gradient near the optimum. Chordal
+    behaves like an L2 loss: the gradient decays smoothly to zero as the
+    prediction converges. The geodesic angle behaves like an L1 loss: bounded
+    (a constant 1/sqrt(2)) but non-vanishing, with a kink at zero, so the
+    update size never shrinks however close you get.
+    """
     R_gt = rotation_6d_to_matrix(torch.randn(8, 3), torch.randn(8, 3)).detach()
 
     def grad_norm(kind, deg):
@@ -168,9 +177,32 @@ def test_chordal_gradient_stays_bounded_near_the_optimum():
     chordal_far, chordal_near = grad_norm("chordal", 30.0), grad_norm("chordal", 0.05)
     geodesic_far, geodesic_near = grad_norm("geodesic", 30.0), grad_norm("geodesic", 0.05)
 
-    assert chordal_near < chordal_far                     # well behaved
-    assert geodesic_near > geodesic_far * 5               # blows up
-    assert chordal_near < geodesic_near
+    # chordal: vanishes as the prediction converges
+    assert chordal_near < chordal_far / 100
+
+    # geodesic: bounded -- this is the regression against the old arccos form,
+    # where the same measurement gave ~500 at 0.1 degrees
+    assert geodesic_near < 10.0, "geodesic gradient should not explode any more"
+    assert geodesic_near > chordal_near, "geodesic does not vanish at the optimum"
+
+
+def test_geodesic_angle_is_exactly_zero_for_identical_rotations():
+    """The eps clamp in the old arccos form put a hard 0.028-degree floor on
+    the reported angle, so RMSE(R) could never read zero -- and the perfect
+    prediction test failed on it."""
+    R = rotation_6d_to_matrix(torch.randn(16, 3), torch.randn(16, 3))
+    angle = geodesic_rotation_angle(R, R)
+    assert float(angle.abs().max()) == 0.0
+
+
+def test_geodesic_angle_is_accurate_across_the_whole_range():
+    for deg in (1e-3, 0.01, 0.1, 1.0, 45.0, 90.0, 150.0, 179.0, 179.99):
+        th = np.deg2rad(deg)
+        R = torch.tensor([[np.cos(th), -np.sin(th), 0.0],
+                          [np.sin(th), np.cos(th), 0.0],
+                          [0.0, 0.0, 1.0]], dtype=torch.float32)[None]
+        got = float(torch.rad2deg(geodesic_rotation_angle(R, torch.eye(3)[None])))
+        assert abs(got - deg) < 1e-3, f"{deg} -> {got}"
 
 
 def test_rotation_loss_rejects_unknown_kinds():

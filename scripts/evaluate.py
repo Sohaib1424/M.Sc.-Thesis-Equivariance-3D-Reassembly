@@ -26,6 +26,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import numpy as np
 import torch
+
+from reassembly.utils.console import quiet_third_party_warnings
+
+quiet_third_party_warnings()
 from tqdm.auto import tqdm
 
 from reassembly.assembly.matching import match_scene

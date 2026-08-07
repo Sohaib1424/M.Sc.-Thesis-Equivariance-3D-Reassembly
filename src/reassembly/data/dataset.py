@@ -42,6 +42,7 @@ from .correspondence import (
     derive_edge_clusters_for_scene,
     transfer_vertex_clusters,
 )
+from .cache import ScenePreprocessCache
 from .decimate import decimate_scene, suggested_correspondence_tol
 from .features import get_features
 from .mesh_ops import extract_fractures_with_map
@@ -92,6 +93,8 @@ class BreakingBadDataset(Dataset):
         decimate_to: Optional[int] = None,
         min_vertices_per_fragment: int = 32,
         fracture_pattern: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+        cache_max_gib: float = 8.0,
         max_retries: int = 8,
         nominal_length: int = 10_000,
         seed: int = 0,
@@ -110,6 +113,8 @@ class BreakingBadDataset(Dataset):
         self.decimate_to = decimate_to
         self.min_vertices_per_fragment = min_vertices_per_fragment
         self.fracture_pattern = fracture_pattern
+        self.cache = ScenePreprocessCache(
+            cache_dir, max_bytes=int(cache_max_gib * 1024 ** 3))
         self.max_retries = max_retries
         self.nominal_length = nominal_length
         self.seed = seed
@@ -152,8 +157,30 @@ class BreakingBadDataset(Dataset):
 
         for _attempt in range(max(1, self.max_retries)):
             scene_dir = self.scene_index.sample(py_rng)
+
+            # Pick the fracture here rather than inside load_scene, so it can
+            # go into the cache key. Everything from here to correspondence
+            # detection is a pure function of (scene, fracture, settings).
+            fracture_id = self._choose_fracture(scene_dir, py_rng)
+            if fracture_id is None:
+                self.stats["scenes_rejected"] += 1
+                continue
+
+            cache_key = self.cache.key(
+                str(scene_dir), fracture_id,
+                decimate_to=self.decimate_to,
+                min_vertices_per_fragment=self.min_vertices_per_fragment,
+                correspondence_tol=self.correspondence_tol,
+                input_source=self.input_source,
+            )
+            cached = self.cache.load(cache_key)
+            if cached is not None:
+                self.stats["scenes_loaded"] += 1
+                return self._build_sample_from_arrays(cached, scene_dir, rng)
+
             try:
-                meshes = load_scene(str(scene_dir), rng=py_rng,
+                meshes = load_scene(str(scene_dir), fracture_id=fracture_id,
+                                    rng=py_rng,
                                     fracture_pattern=self.fracture_pattern)
             except Exception:
                 self.stats["scenes_rejected"] += 1
@@ -197,12 +224,58 @@ class BreakingBadDataset(Dataset):
                 continue
 
             self.stats["scenes_loaded"] += 1
-            return self._build_sample(meshes, scene_dir, tol, rng)
+            return self._build_sample(meshes, scene_dir, tol, rng,
+                                      cache_key=cache_key)
 
         return None  # collate_fn drops Nones
 
-    def _build_sample(self, meshes, scene_dir, tol, rng) -> Dict:
+    def _choose_fracture(self, scene_dir, py_rng) -> Optional[str]:
+        """Pick a fracture subdirectory, so the choice can enter the cache key."""
+        import fnmatch
+        import os
+
+        try:
+            names = sorted(
+                d for d in os.listdir(str(scene_dir))
+                if os.path.isdir(os.path.join(str(scene_dir), d))
+                and (self.fracture_pattern is None
+                     or fnmatch.fnmatch(d, self.fracture_pattern))
+            )
+        except OSError:
+            return None
+        return py_rng.choice(names) if names else None
+
+    def _build_sample_from_arrays(self, cached: Dict, scene_dir, rng) -> Dict:
+        """Rebuild a sample from cached geometry.
+
+        The scattering transform is applied here, NOT read from the cache --
+        it must stay random per epoch or every visit to a scene would present
+        the model with the same rotation.
+        """
+        import trimesh
+
+        meshes = [
+            trimesh.Trimesh(np.asarray(v, dtype=np.float64),
+                            np.asarray(f, dtype=np.int64), process=False)
+            for v, f in zip(cached["vertices"], cached["faces"])
+        ]
+        return self._assemble(meshes, cached["vertex_cluster_ids"],
+                              cached["edge_cluster_ids"], scene_dir, rng)
+
+    def _build_sample(self, meshes, scene_dir, tol, rng, cache_key=None) -> Dict:
         vertex_ids, edge_ids = compute_scene_correspondence(meshes, tol=tol)
+
+        if cache_key is not None:
+            self.cache.store(
+                cache_key,
+                [np.asarray(m.vertices) for m in meshes],
+                [np.asarray(m.faces) for m in meshes],
+                vertex_ids, edge_ids, tol,
+            )
+
+        return self._assemble(meshes, vertex_ids, edge_ids, scene_dir, rng)
+
+    def _assemble(self, meshes, vertex_ids, edge_ids, scene_dir, rng) -> Dict:
 
         clean_graph = merge_fragments([
             get_features(m, vcid, ecid) for m, vcid, ecid in zip(meshes, vertex_ids, edge_ids)

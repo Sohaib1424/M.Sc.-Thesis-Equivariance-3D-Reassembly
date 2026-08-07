@@ -18,3 +18,4 @@ for f in validation/v*.py; do echo "=== $f"; python "$f"; done
 | `v04_decimation.py`, `v04b_interface.py` | a shared voxel grid preserves cross-fragment interfaces better than per-fragment grids | §3 |
 | `v05_translation_solver.py`, `v05b_translation.py` | `E_normal` has zero translation gradient; the Laplacian solve is exact; IRLS survives 40% outliers | §4, §5 |
 | `v06_assembly_e2e.py` | matching → solving → scoring end to end; disconnection detection; Euler vs geodesic | §5, §6, §7 |
+| `v07_geodesic_angle.py` | the `arccos` angle has a 0.028° floor and an exploding gradient; `atan2` has neither | §10 |

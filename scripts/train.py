@@ -30,6 +30,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
+
+from reassembly.utils.console import quiet_third_party_warnings
+
+quiet_third_party_warnings()
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, RandomSampler
@@ -75,6 +79,8 @@ def build_config(argv=None) -> Config:
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--input-source", type=str, default=None, choices=["full", "frac"])
     parser.add_argument("--decimate-to", type=int, default=None)
+    parser.add_argument("--cache-dir", type=str, default=None,
+                        help="Cache preprocessed scenes here (big speedup after epoch 1)")
     args = parser.parse_args(argv)
 
     cfg = Config.from_yaml(args.config) if args.config else Config()
@@ -92,6 +98,7 @@ def build_config(argv=None) -> Config:
         ("num_gpus", "train.num_gpus"), ("device", "train.device"),
         ("resume", "train.resume"), ("input_source", "data.input_source"),
         ("decimate_to", "data.decimate_to"),
+        ("cache_dir", "data.cache_dir"),
     ):
         value = getattr(args, flag)
         if value is not None:
@@ -111,6 +118,8 @@ def build_dataloaders(cfg: Config):
         decimate_to=cfg.data.decimate_to,
         min_vertices_per_fragment=cfg.data.min_vertices_per_fragment,
         fracture_pattern=cfg.data.fracture_pattern,
+        cache_dir=cfg.data.cache_dir,
+        cache_max_gib=cfg.data.cache_max_gib,
         seed=cfg.data.seed,
     )
     train_set = BreakingBadDataset(split="train", **common)

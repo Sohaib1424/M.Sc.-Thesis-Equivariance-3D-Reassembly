@@ -14,9 +14,17 @@
 data:
   root_dir: /kaggle/input/breaking-bad-dataset
   input_source: full
-  decimate_to: 15000
-  max_vertices: 40000
+  decimate_to: 6000
+  max_vertices: 20000
   num_workers: 2
+  # Preprocessing was measured at ~49% of epoch wall-clock. It is deterministic
+  # given (scene, fracture, decimation settings), so it is cached to disk and
+  # paid once. /kaggle/working persists across sessions of the same notebook.
+  cache_dir: /kaggle/working/scene_cache
+  # /kaggle/working has a 20 GB quota that ALSO holds your checkpoints. Entries
+  # average ~437 KB, so an uncapped cache reaches the quota within the first
+  # hour and then checkpoint saves start failing.
+  cache_max_gib: 8.0
   seed: 0
 
 model:
@@ -37,8 +45,11 @@ optim:
 
 train:
   epochs: 60
-  batch_size: 2
-  accum_steps: 4
+  # 6,000 vertices per scene at batch 16 is roughly the same GPU work as
+  # 22,500 at batch 4 -- same node count per step, four times the scenes.
+  # That is where most of the throughput comes from; see docs/TRAINING_BUDGET.md.
+  batch_size: 16
+  accum_steps: 1
   steps_per_epoch: 150
   val_steps: 30
   amp: true

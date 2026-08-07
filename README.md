@@ -96,10 +96,25 @@ clean run means the pipeline is correctly wired end to end.
 
 ## Kaggle: 2×T4, 16 GB each
 
-This is the configuration the VRAM work targeted.
+```bash
+python scripts/train.py --config configs/kaggle_t4x2.yaml \
+    --root-dir /kaggle/input/<your-dataset-slug> \
+    --cache-dir /kaggle/working/scene_cache \
+    --num-gpus 2
+```
+
+`--root-dir` overrides whatever path is in the YAML, so you do not have to edit
+the config to point at your dataset. `--num-gpus 2` spawns one process per GPU
+via DDP; run it as `!python scripts/train.py ...` from a notebook cell (a
+subprocess), not by importing `main()`, because `mp.spawn` needs a real process
+to fork from.
+
+Sessions cap at 12 hours, so expect to resume:
 
 ```bash
-python scripts/train.py --config configs/kaggle_t4x2.yaml --num-gpus 2
+python scripts/train.py --config configs/kaggle_t4x2.yaml \
+    --root-dir /kaggle/input/<slug> --num-gpus 2 \
+    --resume /kaggle/working/checkpoints/last.pt
 ```
 
 What makes it fit, in order of effect:
@@ -111,6 +126,7 @@ What makes it fit, in order of effect:
 | `train.amp` / `amp_dtype` | true / **fp16** | halves every activation. T4 is Turing — fp16 works, **bf16 does not** |
 | `train.batch_size` × `accum_steps` | 2 × 4 | effective batch of 8 per rank (16 across both GPUs) at the memory cost of 2 |
 | `data.num_workers` | 2 | 2 ranks × 2 workers on a ~4-core box; scene loading is CPU-bound mesh work |
+| `data.cache_dir` | `/kaggle/working/scene_cache` | preprocessing measured at 49% of epoch wall-clock, and it is deterministic — so it is paid once |
 
 If it still OOMs, lower `decimate_to` first — it is the lever with the most
 headroom and the least effect on the model.
@@ -130,6 +146,8 @@ the bottleneck is mesh loading, not the GPU, and shrinking the model will not he
 | `profile_memory.py` | measured peak memory on synthetic graphs of a chosen size |
 | `benchmark_compute.py` | throughput, memory, projected wall-clock and GPU-hours |
 | `plot_history.py` | loss curves, with run-comparison overlay |
+| `vis_prediction.py` | a trained model's reassembly next to the ground truth |
+| `visualize/` | scene, scattered scene, and fracture-surface viewers |
 
 From a notebook, call `main([...])` explicitly rather than relying on `sys.argv`
 — in Jupyter that holds the kernel's launch arguments and argparse exits with a
@@ -207,6 +225,9 @@ memory-hungry optional component — budget for roughly double activation memory
   thesis-relevant, not cosmetic; §13 covers what the first real scene exposed.
 - **`docs/ARCHITECTURE.md`** — how the model works and the invariants the code
   depends on.
+- **`docs/TRAINING_BUDGET.md`** — how long training actually takes, derived
+  from measured throughput: epochs, wall-clock, FLOPs, and the GARF comparison
+  with its assumptions stated.
 
 ---
 

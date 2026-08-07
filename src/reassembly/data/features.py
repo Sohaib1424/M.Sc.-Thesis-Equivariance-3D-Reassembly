@@ -146,14 +146,19 @@ def get_features(
             np.asarray(vertex_cluster_ids, dtype=np.int64)
         ).long()
 
-    edges_unique = np.asarray(mesh.edges_unique)
+    # np.array (not asarray) so this is a WRITABLE copy. trimesh caches
+    # edges_unique as a read-only array, and indexing a torch tensor with a
+    # read-only numpy array makes PyTorch warn on every single call -- which on
+    # a training run is one warning per fragment per batch.
+    edges_unique = np.array(mesh.edges_unique, dtype=np.int64)
     if len(edges_unique) == 0:
         data = _empty_graph(num_nodes, x, vertex_cluster_id, edge_cluster_ids is not None)
         data.centroid = centroid
         return data
 
     E = len(edges_unique)
-    u, v = edges_unique[:, 0], edges_unique[:, 1]
+    u = torch.from_numpy(edges_unique[:, 0]).long()
+    v = torch.from_numpy(edges_unique[:, 1]).long()
     p_u, p_v = pos[u], pos[v]
 
     edge_lens = torch.norm(p_u - p_v, dim=1, keepdim=True)     # (E, 1) invariant

@@ -24,6 +24,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
+from reassembly.utils.console import quiet_third_party_warnings
+
+quiet_third_party_warnings()
+
 from reassembly.models.vn_gat_model import VNGATModel
 from reassembly.utils.memory import estimate_activation_bytes
 

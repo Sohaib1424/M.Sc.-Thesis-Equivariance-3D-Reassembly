@@ -10,6 +10,8 @@ them -- never introducing a direction of its own.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -188,22 +190,40 @@ def rotation_6d_to_matrix(a1: torch.Tensor, a2: torch.Tensor, eps: float = 1e-8)
 # ---------------------------------------------------------------------------
 # Rotation losses / metrics
 # ---------------------------------------------------------------------------
-def geodesic_rotation_angle(
-    R_pred: torch.Tensor, R_gt: torch.Tensor, eps: float = 1e-7
-) -> torch.Tensor:
-    """Geodesic angle on SO(3), in radians: ``arccos((tr(R_pred^T R_gt) - 1)/2)``.
+def geodesic_rotation_angle(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
+    """Geodesic angle on SO(3), in radians, via ``atan2``.
 
-    This is the right *metric* (it is what GARF's RMSE(R) reports, in degrees)
-    but a poor *loss*: ``d/du arccos(u) = -1/sqrt(1-u^2)`` diverges as ``u -> 1``,
-    i.e. the gradient blows up exactly as the prediction becomes correct. With
-    ``eps = 1e-7`` the gradient magnitude is capped around 2000, which is more
-    than enough to destabilize late training. Use
-    :func:`chordal_rotation_loss` to optimize and this to report.
+    The obvious formulation, ``arccos((tr(R_pred^T R_gt) - 1) / 2)``, is a bad
+    way to compute this. Near the optimum ``(tr - 1) / 2 -> 1``, where arccos
+    has infinite slope, so float32 rounding in the trace turns into a large
+    error in the angle. Clamping the argument to ``1 - eps`` to keep it finite
+    then puts a hard FLOOR on the reported angle: at ``eps = 1e-7`` two
+    identical rotations are reported as 0.028 degrees apart, and the metric can
+    never read zero.
+
+    Using both the sine and cosine of the angle and letting ``atan2`` combine
+    them is well conditioned across the whole range:
+
+        cos(theta) = (tr(D) - 1) / 2
+        sin(theta) = ||D - D^T||_F / (2 sqrt(2))        for theta in [0, pi]
+
+    Measured in float32 against known angles from 0 to 180 degrees
+    (``validation/v07_geodesic_angle.py``):
+
+        formulation        max error      angle for identical rotations
+        arccos, eps=1e-7   0.028 deg      0.028 deg      <- hard floor
+        2*asin(chordal)    0.021 deg      0.000 deg
+        atan2              0.00001 deg    0.000 deg      <- used here
+
+    This is the reported metric, and the reason RMSE(R) can now legitimately
+    reach zero. For the training objective see :func:`chordal_rotation_loss`.
     """
     R_diff = torch.matmul(R_pred.transpose(-1, -2), R_gt)
     trace = R_diff.diagonal(dim1=-2, dim2=-1).sum(-1)
-    cos_theta = ((trace - 1) / 2).clamp(-1 + eps, 1 - eps)
-    return torch.acos(cos_theta)
+    cos_theta = (trace - 1) / 2
+    skew = R_diff - R_diff.transpose(-1, -2)
+    sin_theta = torch.linalg.matrix_norm(skew) / (2 * math.sqrt(2))
+    return torch.atan2(sin_theta, cos_theta)
 
 
 def chordal_rotation_loss(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
@@ -217,11 +237,24 @@ def chordal_rotation_loss(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Ten
     return ((R_pred - R_gt) ** 2).sum(dim=(-1, -2))
 
 
-def geodesic_rotation_loss(
-    R_pred: torch.Tensor, R_gt: torch.Tensor, eps: float = 1e-7
-) -> torch.Tensor:
-    """Kept for parity with the design document. Prefer the chordal loss."""
-    return geodesic_rotation_angle(R_pred, R_gt, eps=eps)
+def geodesic_rotation_loss(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
+    """Geodesic angle as a training objective. Kept for parity with the design
+    document, and usable -- but the chordal loss is still the default.
+
+    With the ``atan2`` formulation the gradient is well behaved: measured by
+    finite differences, its magnitude sits at a constant 0.707 all the way in
+    to the optimum, rather than the ~500 the clamped arccos form reached at 0.1
+    degrees. So this is no longer dangerous.
+
+    It is still not the default, for a different reason than originally
+    documented. The geodesic gradient is BOUNDED but does not VANISH at the
+    optimum -- it behaves like an L1 loss, with a kink at zero, so the update
+    size stays constant however close the prediction gets. The chordal
+    gradient decays smoothly to zero (L2-like: 1.46 at 30 degrees, 0.049 at 1
+    degree, 4.9e-5 at 0.001). For a rotation that must converge tightly, the
+    vanishing gradient is the better-behaved choice.
+    """
+    return geodesic_rotation_angle(R_pred, R_gt)
 
 
 def rotation_loss(
@@ -234,9 +267,9 @@ def rotation_loss(
     if kind == "chordal":
         return chordal_rotation_loss(R_pred, R_gt)
     if kind == "geodesic":
-        return geodesic_rotation_angle(R_pred, R_gt, eps=eps)
+        return geodesic_rotation_angle(R_pred, R_gt)
     if kind == "hybrid":
         return chordal_rotation_loss(R_pred, R_gt) + 0.1 * geodesic_rotation_angle(
-            R_pred, R_gt, eps=eps
+            R_pred, R_gt
         )
     raise ValueError(f"unknown rotation loss kind {kind!r}")

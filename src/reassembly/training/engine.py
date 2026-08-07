@@ -16,6 +16,7 @@ import torch
 from tqdm.auto import tqdm
 
 from ..config import Config
+from ..utils.console import MetricTable, format_epoch_line
 from ..utils.memory import (
     AmpContext,
     cuda_memory_summary,
@@ -28,11 +29,9 @@ from .losses import LOSS_KEYS
 
 METRIC_KEYS = ("total", *LOSS_KEYS, "rot_deg")
 
-# Kept short deliberately. With all eight terms in the live postfix, a long
-# prefix pushes the redrawn line past what a Kaggle/Colab output cell renders,
-# which looks like the numbers are missing rather than merely truncated.
-_SHORT = {"total": "tot", "rot": "rot", "pos": "pos", "node": "nrm", "mid": "mid",
-          "face": "fac", "embv": "ev", "embe": "ee", "rot_deg": "deg"}
+# Column order for the live table and the per-epoch summary. Kept identical
+# between the two so the numbers line up vertically as an epoch finishes.
+COLUMNS = ("total", "rot", "pos", "node", "mid", "face", "embv", "embe", "rot_deg")
 
 
 def _to_device(batch: Dict, device: torch.device, keys) -> Dict:
@@ -66,7 +65,7 @@ def run_epoch(
 
     main = is_main_process()
     prefix = f"E{epoch:03d} {phase}"
-    pbar = tqdm(loader, desc=f"{prefix} load", leave=False, unit="batch", disable=not main)
+    pbar = MetricTable(loader, COLUMNS, desc=f"{prefix} load", disable=not main)
 
     if train:
         optimizer.zero_grad(set_to_none=True)
@@ -84,7 +83,7 @@ def run_epoch(
 
         if local_ok:
             try:
-                pbar.set_description(f"{prefix} \u2192dev")
+                pbar.set_desc(f"{prefix} \u2192dev")
                 batch = _to_device(batch, device,
                                    ("graph", "diffused_graph", "frac_graph",
                                     "diff_frac_graph", "t_matrices"))
@@ -98,7 +97,7 @@ def run_epoch(
                                         input_graph=input_graph)
 
                 with torch.set_grad_enabled(train):
-                    pbar.set_description(f"{prefix} fwd")
+                    pbar.set_desc(f"{prefix} fwd")
                     with amp.autocast():
                         outputs = model(**model_inputs)
 
@@ -108,7 +107,7 @@ def run_epoch(
                     R_pred = outputs["R_pred"].float()
                     predicted = build_predictions(full_diffused, R_pred)
 
-                    pbar.set_description(f"{prefix} loss")
+                    pbar.set_desc(f"{prefix} loss")
                     losses = loss_fn(
                         dict(
                             R_pred=R_pred,
@@ -120,7 +119,7 @@ def run_epoch(
                     )
 
                     if train:
-                        pbar.set_description(f"{prefix} bwd")
+                        pbar.set_desc(f"{prefix} bwd")
                         amp.backward(losses["total"] / cfg.train.accum_steps)
 
             except RuntimeError as exc:
@@ -166,13 +165,11 @@ def run_epoch(
                 totals[k] = totals.get(k, 0.0) + float(v.detach())
             num_batches += 1
             max_nodes = max(max_nodes, nodes_here)
-            pbar.set_postfix({
-                _SHORT.get(k, k): f"{v / num_batches:.3f}" for k, v in totals.items()
-            })
+            pbar.update_metrics({k: v / num_batches for k, v in totals.items()})
         else:
             skipped += 1
 
-        pbar.set_description(f"{prefix} load")
+        pbar.set_desc(f"{prefix} load")
         data_start = time.perf_counter()
 
     pbar.close()
@@ -285,19 +282,10 @@ def fit(
         elapsed = time.perf_counter() - epoch_start
 
         if main:
-            tqdm.write(
-                f"[epoch {epoch:04d}] train={train_metrics.get('total', float('nan')):.4f} "
-                f"val={val_metrics.get('total', float('nan')):.4f} | "
-                f"rot={val_metrics.get('rot', float('nan')):.4f} "
-                f"({val_metrics.get('rot_deg', float('nan')):.2f}deg) "
-                f"pos={val_metrics.get('pos', float('nan')):.4f} "
-                f"node={val_metrics.get('node', float('nan')):.4f} "
-                f"mid={val_metrics.get('mid', float('nan')):.4f} "
-                f"face={val_metrics.get('face', float('nan')):.4f} "
-                f"embv={val_metrics.get('embv', float('nan')):.4f} "
-                f"embe={val_metrics.get('embe', float('nan')):.4f} "
-                f"| lr={optimizer.param_groups[0]['lr']:.2e} [{elapsed:.1f}s]"
-            )
+            tqdm.write(format_epoch_line(
+                epoch, train_metrics, val_metrics, COLUMNS,
+                lr=optimizer.param_groups[0]["lr"], seconds=elapsed,
+            ))
             for k, v in train_metrics.items():
                 history["train"].setdefault(k, []).append(v)
             for k, v in val_metrics.items():
@@ -315,5 +303,34 @@ def fit(
                 best_val = current
                 save_checkpoint(ckpt_dir / "best.pt", model, optimizer, scheduler,
                                 epoch, best_val, cfg)
+
+    if main:
+        # Written unconditionally when the loop finishes, separate from the
+        # every-N-epochs `last.pt` and from `best.pt`. Three files, three
+        # different questions:
+        #   best.pt   lowest validation loss seen        -> evaluate this one
+        #   last.pt   periodic snapshot                  -> resume from this one
+        #   final.pt  the weights training ended on      -> reproducibility
+        # `best` and `final` differ whenever the run overfits after its best
+        # epoch, which is exactly when you want to be able to tell them apart.
+        final_path = ckpt_dir / "final.pt"
+        save_checkpoint(final_path, model, optimizer, scheduler,
+                        cfg.train.epochs - 1, best_val, cfg)
+        underlying = model.module if hasattr(model, "module") else model
+        weights_path = ckpt_dir / "final_weights.pt"
+        torch.save(underlying.state_dict(), weights_path)
+        print(
+            f"\ntraining complete\n"
+            f"  best validation total : {best_val:.6f}\n"
+            f"  {final_path}          full state (model + optimizer + scheduler)\n"
+            f"  {weights_path}   weights only, for inference\n"
+            f"  {ckpt_dir / 'best.pt'}           lowest-validation checkpoint\n"
+            f"  {ckpt_dir / 'loss_history.json'} curves\n\n"
+            f"evaluate with:\n"
+            f"  python scripts/evaluate.py --checkpoint {ckpt_dir / 'best.pt'}\n"
+            f"visualise with:\n"
+            f"  python scripts/vis_prediction.py --checkpoint {ckpt_dir / 'best.pt'} "
+            f"--root-dir <data>"
+        )
 
     return history

@@ -37,6 +37,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
+from reassembly.utils.console import quiet_third_party_warnings
+
+quiet_third_party_warnings()
+
 from reassembly.config import Config
 from reassembly.models.vn_gat_model import VNGATModel
 from reassembly.utils.memory import AmpContext
@@ -107,6 +111,62 @@ def run_point(cfg, nodes, fragments, batch_scenes, device):
     return dict(seconds_per_step=sec, peak_gib=peak, status=status, params=params)
 
 
+
+def analytic_flops(nodes, edges, cfg):
+    """FLOPs for one forward pass, counted from the architecture.
+
+    Counted, not measured -- a profiler on the real GPU is authoritative. This
+    exists so the number can be scaled to configurations you have not run, and
+    so the shape of the cost (which term dominates) is visible.
+
+    Multiply-accumulate counts as 2 FLOPs. Every VNLinear on (M, C_in, 3) is a
+    (3M x C_in) @ (C_in x C_out) matmul.
+    """
+    C = cfg.model.hidden_channels
+    L = cfg.model.num_layers
+    K = cfg.model.num_vn_slots
+    H = cfg.model.heads
+    D = (cfg.model.head_dim or C // H)
+    N, E = nodes, edges
+
+    def vnlinear(count, c_in, c_out):
+        return 2 * count * 3 * c_in * c_out
+
+    # --- message passing ---------------------------------------------------
+    per_gat = (
+        vnlinear(N, C, C) * 2          # source and destination projections
+        + vnlinear(E, 3, C)            # edge vector projection
+        + 2 * E * H * D * 3            # attention logits from invariants
+        + 2 * E * C * 3                # weighted messages
+        + 2 * E * C * 3                # scatter-add aggregation
+    )
+    gat = per_gat * L
+
+    # --- virtual-node communication, one block per layer -------------------
+    per_block = (
+        vnlinear(N, C, H * D) * 2      # keys and values over vertices (up)
+        + 2 * N * K * H * D * 3        # up-attention logits
+        + 2 * N * K * H * D * 3        # up-aggregation
+        + vnlinear(N, C, H * D)        # queries over vertices (down)
+        + 2 * N * K * H * D * 3 * 2    # down logits + aggregation
+        + vnlinear(N, H * D, C)        # output projection
+    )
+    vnodes = per_block * L
+
+    heads = vnlinear(N, C, cfg.model.embed_dim) + vnlinear(E, C, cfg.model.embed_dim)
+
+    forward = gat + vnodes + heads
+    return {
+        "message_passing": gat,
+        "virtual_nodes": vnodes,
+        "heads": heads,
+        "forward": forward,
+        # Backward is ~2x forward. Gradient checkpointing recomputes the
+        # forward pass during backward, so the total is 4x rather than 3x.
+        "step": forward * (4 if cfg.model.gradient_checkpointing else 3),
+    }
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str, default=None)
@@ -147,8 +207,10 @@ def main(argv=None):
         hours = (sec * steps / 3600.0) if sec == sec else float("nan")
         print(f"{nodes:>15,} {cfg.train.batch_size:>6} {sec:>9.4f} {scenes_per_s:>9.2f} "
               f"{r['peak_gib']:>9.3f} {hours:>9.3f} {r['status']:>7}")
+        flops = analytic_flops(nodes, 6 * nodes, cfg)
         rows.append(dict(vertices=nodes, batch=cfg.train.batch_size, **r,
-                         scenes_per_second=scenes_per_s, hours_per_epoch=hours))
+                         scenes_per_second=scenes_per_s, hours_per_epoch=hours,
+                         flops_per_scene_step=flops["step"]))
 
     ok = [r for r in rows if r["status"] == "ok"]
     if ok:
@@ -161,6 +223,22 @@ def main(argv=None):
               f"{total_h:.2f} h on {world}x {gpu_name}")
         print(f"projected total GPU-hours      : {gpu_hours:.2f}")
         print(f"GARF reference                 : 4x H100 x 72 h = 288 H100-GPU-hours")
+        print()
+        fl = analytic_flops(budgets[-1], 6 * budgets[-1], cfg)
+        per_step = fl["step"] * cfg.train.batch_size
+        achieved = per_step / best["seconds_per_step"] if best["seconds_per_step"] == best["seconds_per_step"] else float("nan")
+        print(f"analytic FLOPs per scene per step: {fl['step'] / 1e9:.2f} GFLOP")
+        print(f"  message passing {100*fl['message_passing']/fl['forward']:.0f}%  "
+              f"virtual nodes {100*fl['virtual_nodes']/fl['forward']:.0f}%  "
+              f"heads {100*fl['heads']/fl['forward']:.0f}%  (of forward)")
+        print(f"achieved throughput               : {achieved / 1e12:.3f} TFLOP/s")
+        print(f"  T4 fp16 peak is ~65 TFLOP/s, so this is "
+              f"{100 * achieved / 65e12:.2f}% of peak -- expected for graph work,")
+        print(f"  which is bound by scatter/gather memory traffic, not arithmetic.")
+        print(f"total training FLOPs, {cfg.train.epochs} epochs x "
+              f"{cfg.train.steps_per_epoch} steps x {cfg.train.batch_size} scenes x "
+              f"{world} ranks:")
+        print(f"  {fl['step'] * cfg.train.batch_size * cfg.train.steps_per_epoch * cfg.train.epochs * world / 1e15:.1f} PFLOP")
         print()
         print("NOTE: this measures COMPUTE COST only, on synthetic graphs of the given\n"
               "size -- it excludes data loading (real mesh work, often the actual\n"

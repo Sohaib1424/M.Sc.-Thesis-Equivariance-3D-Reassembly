@@ -122,7 +122,9 @@ def test_composite_loss_is_zero_for_a_perfect_prediction():
     losses = CompositeLoss()(outputs, targets)
     for key in ("rot", "pos", "node", "mid", "face"):
         assert float(losses[key]) == pytest.approx(0.0, abs=1e-5), key
-    assert float(losses["rot_deg"]) == pytest.approx(0.0, abs=1e-2)
+    # Exactly zero now: the old arccos+eps form floored this at 0.028 degrees,
+    # which is what made this assertion fail.
+    assert float(losses["rot_deg"]) == pytest.approx(0.0, abs=1e-4)
 
 
 def test_composite_loss_reports_every_component():

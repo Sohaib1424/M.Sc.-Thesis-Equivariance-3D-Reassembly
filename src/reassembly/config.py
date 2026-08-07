@@ -35,6 +35,17 @@ class DataConfig:
     # None uses every subdirectory; see scene_io.load_scene for why that is
     # a decision worth making explicitly.
     fracture_pattern: Optional[str] = None
+    # Disk cache for preprocessed scenes. Measured on a real run, preprocessing
+    # was 49% of epoch wall-clock with four workers, and it is a pure function
+    # of (scene, fracture, decimation settings) -- so it only has to be paid
+    # once. None disables. On Kaggle use /kaggle/working/cache (writable and
+    # persisted between sessions of the same notebook).
+    cache_dir: Optional[str] = None
+    #: Cache size cap in GiB. Kaggle's /kaggle/working quota is 20 GB TOTAL and
+    #: also holds your checkpoints -- an unbounded cache fills it and makes
+    #: checkpoint writes fail, losing the run. Entries average ~437 KB at
+    #: decimate_to=6000, so 8 GiB is roughly 19,000 of them.
+    cache_max_gib: float = 8.0
     correspondence_tol: float = 1e-5
     num_workers: int = 2
     seed: int = 0

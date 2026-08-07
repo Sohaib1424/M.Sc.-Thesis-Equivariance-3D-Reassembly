@@ -38,8 +38,9 @@ def quiet_third_party_warnings() -> None:
         "ignore", category=UserWarning,
         message=r".*given NumPy array is not writable.*",
     )
+    for _category in (FutureWarning, DeprecationWarning):
     warnings.filterwarnings(
-        "ignore", category=(FutureWarning, DeprecationWarning),
+        "ignore", category=_category,
         message=r".*torch\.(cuda\.)?amp\..*is deprecated.*",
     )
     warnings.filterwarnings(

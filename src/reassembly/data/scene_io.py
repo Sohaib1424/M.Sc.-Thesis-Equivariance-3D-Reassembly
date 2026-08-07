@@ -138,12 +138,18 @@ def load_scene(
     fracture_id: Optional[str] = None,
     rng: Optional[random.Random] = None,
     fracture_pattern: Optional[str] = None,
+    base_mesh=None,
 ) -> List["trimesh.Trimesh"]:
     """Load one scene directory into a list of independent fragment meshes.
 
     ``fracture_id`` pins a specific fracture subdirectory (useful for
     reproducible evaluation); the default draws one at random, which is the
     training behaviour.
+
+    ``base_mesh`` optionally supplies an already-parsed
+    ``(vertices, faces, piece_to_fine_vertices)`` triple, skipping the two file
+    reads. See ``data.cache.BaseMeshCache`` for why that is worth doing
+    separately from caching the whole preprocessed scene.
 
     ``fracture_pattern`` restricts which subdirectories are eligible, e.g.
     ``"fractured_*"``. This matters and the default deliberately does NOT
@@ -159,8 +165,14 @@ def load_scene(
 
     mesh_path = os.path.join(scene_dir, "compressed_mesh.obj")
     data_path = os.path.join(scene_dir, "compressed_data.npz")
-    fine_vertices, fine_triangles = igl.read_triangle_mesh(mesh_path)
-    piece_to_fine_vertices = load_npz(data_path)
+    if base_mesh is not None:
+        # Supplied by the caller, already parsed. These two files are identical
+        # across every fracture of a scene, and parsing them costs ~105 ms per
+        # sample -- so on a randomly-drawn fracture the work is pure repetition.
+        fine_vertices, fine_triangles, piece_to_fine_vertices = base_mesh
+    else:
+        fine_vertices, fine_triangles = igl.read_triangle_mesh(mesh_path)
+        piece_to_fine_vertices = load_npz(data_path)
 
     if fracture_id is None:
         frac_dirs = sorted(

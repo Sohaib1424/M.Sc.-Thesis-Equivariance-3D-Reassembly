@@ -28,6 +28,7 @@ WHAT IS NEW HERE
 """
 from __future__ import annotations
 
+import os
 import random
 from typing import Dict, List, Optional
 
@@ -42,7 +43,7 @@ from .correspondence import (
     derive_edge_clusters_for_scene,
     transfer_vertex_clusters,
 )
-from .cache import ScenePreprocessCache
+from .cache import BaseMeshCache, ScenePreprocessCache
 from .decimate import decimate_scene, suggested_correspondence_tol
 from .features import get_features
 from .mesh_ops import extract_fractures_with_map
@@ -115,6 +116,10 @@ class BreakingBadDataset(Dataset):
         self.fracture_pattern = fracture_pattern
         self.cache = ScenePreprocessCache(
             cache_dir, max_bytes=int(cache_max_gib * 1024 ** 3))
+        # Keyed by scene alone, so it hits from the first repeat -- unlike the
+        # (scene, fracture) cache, which with ~100 fractures per scene rarely
+        # sees the same pair twice early in training.
+        self.base_cache = BaseMeshCache(cache_dir)
         self.max_retries = max_retries
         self.nominal_length = nominal_length
         self.seed = seed
@@ -178,13 +183,29 @@ class BreakingBadDataset(Dataset):
                 self.stats["scenes_loaded"] += 1
                 return self._build_sample_from_arrays(cached, scene_dir, rng)
 
+            base = self.base_cache.load(str(scene_dir))
             try:
                 meshes = load_scene(str(scene_dir), fracture_id=fracture_id,
                                     rng=py_rng,
-                                    fracture_pattern=self.fracture_pattern)
+                                    fracture_pattern=self.fracture_pattern,
+                                    base_mesh=base)
             except Exception:
                 self.stats["scenes_rejected"] += 1
                 continue
+
+            if base is None:
+                # Populate on the way past. Reading it back costs 2.3 ms
+                # against 105 ms to reparse.
+                try:
+                    import igl
+                    from scipy.sparse import load_npz as _load_npz
+                    v, f = igl.read_triangle_mesh(
+                        os.path.join(str(scene_dir), "compressed_mesh.obj"))
+                    self.base_cache.store(
+                        str(scene_dir), v, f,
+                        _load_npz(os.path.join(str(scene_dir), "compressed_data.npz")))
+                except Exception:                            # noqa: BLE001
+                    pass                                     # caching is best-effort
 
             if len(meshes) < 2:
                 # A "scene" with one fragment has no cross-fragment structure

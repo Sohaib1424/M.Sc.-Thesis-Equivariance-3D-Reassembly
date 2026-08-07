@@ -68,7 +68,8 @@ def run_epoch(
 
     main = is_main_process()
     prefix = f"E{epoch:03d} {phase}"
-    pbar = MetricTable(loader, COLUMNS, desc=f"{prefix} load", disable=not main)
+    pbar = MetricTable(loader, COLUMNS, desc=f"{prefix} load", disable=not main,
+                       log_every=max(cfg.train.log_every, 1) * 10)
 
     if train:
         optimizer.zero_grad(set_to_none=True)
@@ -191,10 +192,19 @@ def run_epoch(
     metrics = reduce_metrics(metrics, device)
 
     if main:
+        cache_note = ""
+        dataset = getattr(loader, "dataset", None)
+        for attr, label in (("base_cache", "base"), ("cache", "scene")):
+            c = getattr(dataset, attr, None)
+            if c is not None and getattr(c, "enabled", False):
+                looked = c.hits + c.misses
+                if looked:
+                    cache_note += f" {label}-cache={100 * c.hits / looked:.0f}%"
         tqdm.write(
             f"  {phase}: data={data_seconds:.1f}s compute={compute_seconds:.1f}s "
             f"over {num_batches} batches ({skipped} skipped) on this rank; "
-            f"largest input graph {max_nodes} nodes; {cuda_memory_summary(device)}"
+            f"largest input graph {max_nodes} nodes;{cache_note} "
+            f"{cuda_memory_summary(device)}"
         )
     return metrics
 

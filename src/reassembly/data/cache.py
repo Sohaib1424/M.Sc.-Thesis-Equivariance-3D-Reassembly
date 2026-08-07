@@ -200,3 +200,116 @@ class ScenePreprocessCache:
         return (f"cache: {self.hits} hits / {total} lookups ({rate:.1f}%), "
                 f"{self.writes} written, {gb:.2f}{cap} GiB, "
                 f"{self.errors} errors{extra}")
+
+
+class BaseMeshCache:
+    """Cache of the parsed base mesh, keyed by SCENE only.
+
+    Separate from ``ScenePreprocessCache`` because of a hit-rate asymmetry that
+    is easy to miss.
+
+    ``compressed_mesh.obj`` and ``compressed_data.npz`` are identical across
+    every fracture of a scene, and parsing them costs ~105 ms per sample
+    (measured: 18,949 vertices, 35,274 faces). ``load_scene`` re-parses both on
+    every single draw.
+
+    The (scene, fracture) cache does not help here. With ~100 fractures per
+    scene and random draws, the same PAIR rarely recurs until a large fraction
+    of all pairs has been seen -- so early training misses almost every time.
+    The same SCENE recurs constantly. Keying on scene alone turns a 105 ms
+    parse into a 2.3 ms array load: **45x**, hitting from the first repeat.
+
+    At batch 16 that is 1.67 s -> 0.04 s per batch, before any decimation or
+    correspondence work.
+    """
+
+    VERSION = 1
+
+    def __init__(self, root: Optional[str], enabled: bool = True,
+                 max_bytes: Optional[int] = 4 * 1024 ** 3):
+        self.root = Path(root) / "base_meshes" if root else None
+        self.enabled = bool(enabled and root)
+        self.max_bytes = max_bytes
+        self.hits = 0
+        self.misses = 0
+        self.writes = 0
+        self._bytes = 0
+        if self.enabled:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self._bytes = _dir_size(self.root)
+
+    def _path(self, scene_dir: str) -> Path:
+        key = hashlib.sha1(f"v{self.VERSION}|{scene_dir}".encode()).hexdigest()
+        return self.root / key[:2] / f"{key}.npz"
+
+    def load(self, scene_dir: str):
+        """Returns ``(vertices, faces, piece_to_fine_vertices)`` or None."""
+        if not self.enabled:
+            return None
+        path = self._path(scene_dir)
+        if not path.exists():
+            self.misses += 1
+            return None
+        try:
+            from scipy.sparse import csr_matrix
+            with np.load(path, allow_pickle=False) as z:
+                vertices = z["v"].astype(np.float64)
+                faces = z["f"].astype(np.int64)
+                matrix = csr_matrix((z["md"], z["mi"], z["mp"]),
+                                    shape=(int(z["ms"][0]), int(z["ms"][1])))
+            self.hits += 1
+            return vertices, faces, matrix
+        except Exception:                                    # noqa: BLE001
+            self.misses += 1
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+
+    def store(self, scene_dir: str, vertices, faces, matrix) -> None:
+        if not self.enabled:
+            return
+        if self.max_bytes is not None and self._bytes >= self.max_bytes:
+            return
+        path = self._path(scene_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        csr = matrix.tocsr()
+        tmp = path.with_suffix(f".{os.getpid()}.tmp.npz")
+        try:
+            np.savez(
+                tmp,
+                v=np.asarray(vertices, dtype=np.float32),
+                f=np.asarray(faces, dtype=np.int32),
+                md=csr.data, mi=csr.indices, mp=csr.indptr,
+                ms=np.asarray(csr.shape, dtype=np.int64),
+            )
+            size = tmp.stat().st_size
+            os.replace(tmp, path)
+            self.writes += 1
+            self._bytes += size
+        except Exception:                                    # noqa: BLE001
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+    def summary(self) -> str:
+        total = self.hits + self.misses
+        rate = 100.0 * self.hits / total if total else 0.0
+        return (f"base-mesh cache: {self.hits}/{total} ({rate:.1f}%), "
+                f"{self._bytes / 1024 ** 3:.2f} GiB")
+
+
+def _dir_size(root: Path) -> int:
+    total = 0
+    try:
+        for sub in os.scandir(root):
+            if sub.is_dir():
+                for entry in os.scandir(sub.path):
+                    if entry.is_file():
+                        total += entry.stat().st_size
+    except OSError:
+        pass
+    return total

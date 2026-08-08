@@ -133,6 +133,21 @@ def resolve_duplicated_faces(F1: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return F1[J], J
 
 
+def load_base_mesh(scene_dir: str):
+    """Parse the scene-invariant half: ``(vertices, faces, piece_matrix)``.
+
+    Split out so a caller can parse ONCE, hand the result to
+    :func:`load_scene`, and cache it -- rather than parsing inside
+    ``load_scene`` and then parsing again to populate a cache. These two files
+    cost ~105 ms together and are identical across every fracture of a scene.
+    """
+    _require_deps()
+    vertices, faces = igl.read_triangle_mesh(
+        os.path.join(scene_dir, "compressed_mesh.obj"))
+    matrix = load_npz(os.path.join(scene_dir, "compressed_data.npz"))
+    return vertices, faces, matrix
+
+
 def load_scene(
     scene_dir: str,
     fracture_id: Optional[str] = None,

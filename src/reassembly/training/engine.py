@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import torch
 from tqdm.auto import tqdm
@@ -31,6 +31,11 @@ from .session import (
 )
 
 METRIC_KEYS = ("total", *LOSS_KEYS, "rot_deg")
+
+#: Where `resume: auto` looks when the working checkpoint directory is empty.
+#: Kaggle mounts a previous notebook's saved output read-only under
+#: /kaggle/input, which is the durable way to carry a run across sessions.
+DEFAULT_RESUME_ROOTS = ("/kaggle/input",)
 
 # Column order for the live table and the per-epoch summary. Kept identical
 # between the two so the numbers line up vertically as an epoch finishes.
@@ -271,7 +276,25 @@ def load_checkpoint(path: str, model, optimizer=None, scheduler=None,
     return state
 
 
-def find_resume_checkpoint(spec: Optional[str], checkpoint_dir: Path) -> Optional[str]:
+def rotate_snapshots(ckpt_dir: Path, keep: int) -> None:
+    """Keep only the newest ``keep`` snapshot files.
+
+    Snapshots are named ``snapshot_e00120.pt`` so they sort chronologically by
+    name -- no reliance on mtime, which is unreliable across a filesystem that
+    may be remounted between sessions.
+    """
+    if keep <= 0:
+        return
+    snapshots = sorted(ckpt_dir.glob("snapshot_e*.pt"))
+    for stale in snapshots[:-keep]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def find_resume_checkpoint(spec: Optional[str], checkpoint_dir: Path,
+                           extra_roots: Optional[Sequence[str]] = None) -> Optional[str]:
     """Resolve ``train.resume``.
 
     ``"auto"`` picks up ``last.pt`` from the checkpoint directory if it exists
@@ -284,8 +307,26 @@ def find_resume_checkpoint(spec: Optional[str], checkpoint_dir: Path) -> Optiona
         return None
     if str(spec).lower() != "auto":
         return str(spec)
+
     candidate = checkpoint_dir / "last.pt"
-    return str(candidate) if candidate.exists() else None
+    if candidate.exists():
+        return str(candidate)
+
+    # Nothing in the working directory. On Kaggle an interactive session does
+    # NOT reliably persist /kaggle/working -- the durable route is Save Version,
+    # then attach that notebook's output as a data source in the next session,
+    # which mounts it read-only under /kaggle/input. Search there too, so the
+    # same command resumes either way instead of silently starting over.
+    for root in (extra_roots or DEFAULT_RESUME_ROOTS):
+        base = Path(root)
+        if not base.exists():
+            continue
+        found = sorted(base.glob("*/checkpoints/last.pt")) + \
+            sorted(base.glob("*/last.pt")) + \
+            sorted(base.glob("*/checkpoints/snapshot_e*.pt"))
+        if found:
+            return str(found[-1])
+    return None
 
 
 def fit(
@@ -402,6 +443,17 @@ def fit(
                 save_checkpoint(ckpt_dir / "last.pt", model, optimizer, scheduler,
                                 epoch, best_val, cfg, amp=amp, history=history,
                                 loss_fn=loss_fn)
+
+            # Rotating snapshots. `last.pt` is a single file that is
+            # overwritten; snapshots keep a few numbered generations, so a
+            # checkpoint that turns out to be bad (NaN weights after a bad
+            # step, a truncated write on a filesystem without atomic rename)
+            # is not the only thing standing between you and starting over.
+            if cfg.train.snapshot_every and (epoch + 1) % cfg.train.snapshot_every == 0:
+                save_checkpoint(ckpt_dir / f"snapshot_e{epoch:05d}.pt", model,
+                                optimizer, scheduler, epoch, best_val, cfg,
+                                amp=amp, history=history, loss_fn=loss_fn)
+                rotate_snapshots(ckpt_dir, cfg.train.keep_snapshots)
 
         last_epoch_seconds = elapsed
 

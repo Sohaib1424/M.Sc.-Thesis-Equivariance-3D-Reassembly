@@ -58,52 +58,30 @@ def quiet_third_party_warnings() -> None:
     )
 
 
-def _is_interactive_terminal() -> bool:
-    """Can the terminal rewrite a line in place?
-
-    This is the difference between a progress bar and 150 lines of spam.
-    `!python script.py` in a notebook runs a SUBPROCESS whose stdout is a pipe,
-    not a TTY. tqdm still emits carriage returns, but the notebook renders each
-    one as a new line -- and the multi-line cursor movement that stacks a
-    header above live numbers does not work at all, so the header prints once
-    and every update lands underneath it.
-
-    When there is no TTY, printing a periodic status line is the only output
-    that stays readable.
-    """
-    import os
-    import sys
-
-    if os.environ.get("REASSEMBLY_FORCE_BAR"):
-        return True
-    for stream in (sys.stderr, sys.stdout):
-        try:
-            if stream is not None and stream.isatty():
-                return True
-        except Exception:                                    # noqa: BLE001
-            pass
-    return False
-
-
 class MetricTable:
-    """Live training metrics, in whichever form the terminal can actually show.
+    """A single progress bar with running metrics in its postfix.
 
-    **Interactive terminal** -- a progress bar with an aligned table under it,
-    rewritten in place:
+    Deliberately ONE bar and nothing else.
 
-        E000 train  67%|######7   | 100/150 [00:45<00:22,  2.21batch/s]
-              total     rot     pos    node     mid    face    embv    embe     deg
-              9.374   5.857   0.154   0.951   0.153   1.902   0.001   0.000  123.37
+    An earlier version stacked three tqdm bars -- a real one plus two whose
+    ``bar_format`` was just ``{desc}`` -- to pin column headers above live
+    numbers. That relies on ANSI cursor movement between lines, and Kaggle's
+    notebook subprocess reports ``isatty() == True`` while not actually
+    supporting it. The result was a header printed once, one new line per
+    update, and the metric row bleeding into the end of the bar line.
 
-    **Piped output** (`!python ...` in a notebook, nohup, a log file) -- a
-    header once, then one aligned row at intervals:
-
-        step      total     rot     pos    node     mid    face    embv    embe     deg
-         30/150    9.374   5.857   0.154   0.951   0.153   1.902   0.001   0.000  123.37
-         60/150    8.911   5.512   0.149   0.938   0.150   1.874   0.001   0.000  119.02
-
-    Same columns either way, so a log and a terminal read the same.
+    Detecting the difference is not reliably possible from inside the process,
+    so this does not try. One bar rewrites one line, which every terminal and
+    every notebook handles. The aligned table is printed once per epoch by
+    :func:`format_epoch_line`, where there is no cursor trickery involved.
     """
+
+    #: Short postfix keys -- the full names do not fit on one line alongside
+    #: the bar, and an overflowing line wraps, which looks like the bar is
+    #: broken.
+    SHORT = {"total": "tot", "rot": "rot", "pos": "pos", "node": "nrm",
+             "mid": "mid", "face": "fac", "embv": "ev", "embe": "ee",
+             "rot_deg": "deg"}
 
     def __init__(
         self,
@@ -118,100 +96,32 @@ class MetricTable:
         self.columns = list(columns)
         self.width = width
         self.disable = disable
-        self.iterable = iterable
-        self.desc = desc
-        self.log_every = max(1, log_every)
-        self.interactive = _is_interactive_terminal() and not disable
-        self._step = 0
-        self._last = {}
-        self._header_written = False
-
-        self.total = total
-        if self.total is None:
-            try:
-                self.total = len(iterable)
-            except TypeError:
-                self.total = None
-
-        self.bar = self.header = self.values = None
-        if disable:
-            return
-
-        if self.interactive:
-            self.bar = tqdm(iterable, desc=desc, total=self.total, leave=False,
-                            unit="batch", position=0, dynamic_ncols=True)
-            try:
-                self.header = tqdm(total=0, position=1, bar_format="{desc}",
-                                   leave=False, dynamic_ncols=True)
-                self.values = tqdm(total=0, position=2, bar_format="{desc}",
-                                   leave=False, dynamic_ncols=True)
-                self.header.set_description_str(self._row(self.columns, "step"))
-                self.values.set_description_str(self._row(["-"] * len(self.columns), ""))
-            except Exception:                                # noqa: BLE001
-                for extra in (self.header, self.values):
-                    if extra is not None:
-                        extra.close()
-                self.header = self.values = None
-
-    def _row(self, cells: Sequence[str], label: str) -> str:
-        return f"  {label:>9}" + "".join(f"{c:>{self.width}}" for c in cells)
+        self.bar = tqdm(iterable, desc=desc, total=total, disable=disable,
+                        leave=False, unit="batch", dynamic_ncols=True)
 
     def __iter__(self):
-        if self.bar is not None:
-            for item in self.bar:
-                self._step += 1
-                yield item
-        else:
-            for item in self.iterable:
-                self._step += 1
-                yield item
-                self._maybe_log()
-
-    def _maybe_log(self) -> None:
-        if self.disable or self.interactive or not self._last:
-            return
-        if self._step % self.log_every and self._step != self.total:
-            return
-        if not self._header_written:
-            print(self._row(self.columns, "step"), flush=True)
-            self._header_written = True
-        label = f"{self._step}/{self.total}" if self.total else str(self._step)
-        print(self._row(self._format(self._last), label), flush=True)
-
-    def _format(self, metrics: Dict[str, float]):
-        cells = []
-        for name in self.columns:
-            value = metrics.get(name)
-            if value is None:
-                cells.append("-")
-            elif abs(value) >= 1000 or (value != 0 and abs(value) < 1e-3):
-                cells.append(f"{value:.1e}")
-            else:
-                cells.append(f"{value:.3f}")
-        return cells
+        return iter(self.bar)
 
     def set_desc(self, text: str) -> None:
-        # Only meaningful for a redrawable bar; in a pipe it would print a line
-        # per phase change, which is four lines per batch of pure noise.
-        if self.bar is not None:
-            self.bar.set_description(text)
+        self.bar.set_description(text)
 
     def update_metrics(self, metrics: Dict[str, float]) -> None:
         if self.disable:
             return
-        self._last = dict(metrics)
-        if self.values is not None:
-            self.values.set_description_str(self._row(self._format(metrics), ""))
-        elif self.bar is not None:
-            self.bar.set_postfix(dict(zip(self.columns, self._format(metrics))),
-                                 refresh=False)
+        postfix = {}
+        for name in self.columns:
+            value = metrics.get(name)
+            if value is None:
+                continue
+            key = self.SHORT.get(name, name)
+            if abs(value) >= 1000 or (value != 0 and abs(value) < 1e-3):
+                postfix[key] = f"{value:.1e}"
+            else:
+                postfix[key] = f"{value:.3f}"
+        self.bar.set_postfix(postfix, refresh=False)
 
     def close(self) -> None:
-        for extra in (self.values, self.header):
-            if extra is not None:
-                extra.close()
-        if self.bar is not None:
-            self.bar.close()
+        self.bar.close()
 
     def __enter__(self):
         return self

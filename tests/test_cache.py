@@ -2,7 +2,9 @@
 import numpy as np
 import pytest
 
-from reassembly.data.cache import ScenePreprocessCache
+from reassembly.data.cache import (
+    BaseMeshCache, DiskGuard, ScenePreprocessCache, free_gib,
+)
 
 
 def sample(n_frag=3, n_vert=500, seed=0):
@@ -100,3 +102,75 @@ def test_corrupt_entry_is_treated_as_a_miss(tmp_path):
     assert c.load(key) is None
     assert c.errors == 1
     assert not c._path(key).exists(), "a corrupt entry should be removed"
+
+
+# ---------------------------------------------------------------------------
+# Disk protection. Filling /kaggle/working does not merely stop the cache --
+# it makes checkpoint writes fail, which loses the run.
+# ---------------------------------------------------------------------------
+def test_guard_stops_on_the_free_space_floor(tmp_path):
+    """The binding rule is FREE SPACE, not bytes written. A byte budget cannot
+    see the dataset, the repo, or the checkpoints sharing the same quota."""
+    guard = DiskGuard(str(tmp_path), min_free_gib=1e9, max_gib=None)
+    assert not guard.allows()
+    assert "free" in guard.stopped_reason
+
+
+def test_guard_stops_on_the_byte_budget(tmp_path):
+    guard = DiskGuard(str(tmp_path), min_free_gib=0.0, max_gib=1e-6,
+                      recheck_every=1)
+    assert guard.allows()
+    guard.record(10 * 1024 ** 2)
+    assert not guard.allows()
+    assert "budget" in guard.stopped_reason
+
+
+def test_both_caches_draw_from_ONE_budget(tmp_path):
+    """Separate budgets silently sum: an 8 GiB scene cache plus a 4 GiB base
+    cache is 12 GiB of a 20 GB quota, which is not what either number says."""
+    guard = DiskGuard(str(tmp_path), min_free_gib=0.0, max_gib=1e-5,
+                      recheck_every=1)
+    scene = ScenePreprocessCache(str(tmp_path), guard=guard)
+    base = BaseMeshCache(str(tmp_path), guard=guard)
+    assert scene.guard is base.guard
+
+    v, f, vc, ec = sample(n_frag=2, n_vert=900)
+    for i in range(10):
+        scene.store(scene.key("/s", f"frac_{i}", decimate_to=6000), v, f, vc, ec, 1e-5)
+
+    # the base cache must now see the budget as spent, because it is shared
+    assert not guard.allows()
+    import numpy as np
+    from scipy.sparse import csr_matrix
+    before = base.writes
+    base.store("/s", np.zeros((10, 3)), np.zeros((5, 3), dtype=np.int64),
+               csr_matrix((10, 4)))
+    assert base.writes == before, "base cache wrote past the shared budget"
+
+
+def test_reads_keep_working_after_the_budget_is_spent(tmp_path):
+    guard = DiskGuard(str(tmp_path), min_free_gib=0.0, max_gib=1e-5,
+                      recheck_every=1)
+    cache = ScenePreprocessCache(str(tmp_path), guard=guard)
+    v, f, vc, ec = sample(n_frag=1, n_vert=500)
+
+    key = cache.key("/s", "frac_0", decimate_to=6000)
+    cache.store(key, v, f, vc, ec, 1e-5)
+    assert cache.load(key) is not None
+
+    guard.record(10 * 1024 ** 3)          # blow the budget
+    assert not guard.allows()
+    assert cache.load(key) is not None, "existing entries must stay readable"
+
+
+def test_free_gib_reports_a_real_number(tmp_path):
+    value = free_gib(str(tmp_path))
+    assert value > 0 and value != float("inf")
+
+
+def test_disabled_cache_never_touches_the_disk(tmp_path):
+    cache = ScenePreprocessCache(None)
+    v, f, vc, ec = sample()
+    cache.store(cache.key("/s", "frac_0", decimate_to=6000), v, f, vc, ec, 1e-5)
+    assert cache.writes == 0
+    assert not any(tmp_path.iterdir())

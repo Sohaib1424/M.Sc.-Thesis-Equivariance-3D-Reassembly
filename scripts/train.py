@@ -127,6 +127,7 @@ def build_dataloaders(cfg: Config):
         fracture_pattern=cfg.data.fracture_pattern,
         cache_dir=cfg.data.cache_dir,
         cache_max_gib=cfg.data.cache_max_gib,
+        cache_min_free_gib=cfg.data.cache_min_free_gib,
         seed=cfg.data.seed,
     )
     train_set = BreakingBadDataset(split="train", **common)
@@ -178,16 +179,69 @@ def build_model_and_optim(cfg: Config, device):
     if cfg.optim.scheduler == "plateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=cfg.optim.plateau_factor,
-            patience=cfg.optim.plateau_patience,
+            patience=cfg.optim.plateau_patience, min_lr=cfg.optim.min_lr,
         )
     elif cfg.optim.scheduler == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(cfg.train.epochs, 1)
+            optimizer, T_max=max(cfg.train.epochs, 1), eta_min=cfg.optim.min_lr
         )
     else:
         scheduler = None
 
     return model, loss_fn, optimizer, scheduler
+
+
+#: Measured on a real Breaking Bad scene, compressed, at decimate_to=6000.
+BASE_ENTRY_KB = 308      # base mesh, keyed by scene
+SCENE_ENTRY_KB = 168     # preprocessed scene, keyed by (scene, fracture)
+
+
+def report_cache_capacity(cfg: Config) -> None:
+    """Say up front whether the cache can actually cover this dataset.
+
+    For uniform random scene draws, once the cache is full the hit rate is
+    roughly `scenes cached / scenes in the split`. So capacity IS hit rate,
+    and it is worth knowing before a multi-day run rather than inferring it
+    from a disappointing epoch time.
+    """
+    import os
+
+    from reassembly.data.cache import free_gib
+    from reassembly.data.splits import SceneIndex
+
+    target = os.path.abspath(cfg.data.cache_dir)
+    free = free_gib(os.path.dirname(target) or ".")
+    budget = min(cfg.data.cache_max_gib, max(free - cfg.data.cache_min_free_gib, 0.0))
+
+    print(f"disk: {free:.1f} GiB free at {cfg.data.cache_dir}; "
+          f"budget {cfg.data.cache_max_gib:.1f} GiB, floor "
+          f"{cfg.data.cache_min_free_gib:.1f} GiB -> {budget:.1f} GiB usable")
+
+    try:
+        n_scenes = len(SceneIndex(cfg.data.root_dir, split="train").scenes)
+    except Exception:                                        # noqa: BLE001
+        print("  (could not count scenes; skipping the capacity estimate)")
+        return
+
+    needed = n_scenes * BASE_ENTRY_KB / 1024 ** 2            # GiB
+    fits = min(int(budget * 1024 ** 2 / BASE_ENTRY_KB), n_scenes)
+    print(f"  train split: {n_scenes:,} scenes -> base cache needs "
+          f"{needed:.2f} GiB; {fits:,} fit ({100 * fits / max(n_scenes, 1):.0f}%)")
+
+    if fits >= n_scenes:
+        leftover = budget - needed
+        pairs = int(leftover * 1024 ** 2 / SCENE_ENTRY_KB)
+        print(f"  every scene fits. The remaining {leftover:.2f} GiB holds "
+              f"~{pairs:,} (scene, fracture) entries.")
+        if cfg.data.fracture_pattern is None:
+            print(f"  note: with ~100 fractures per scene there are ~"
+                  f"{n_scenes * 100:,} possible pairs, so the second cache will "
+                  f"stay mostly cold. Set data.fracture_pattern to a few "
+                  f"patterns if you want it to saturate.")
+    else:
+        print(f"  !! the base cache cannot cover this split, so the hit rate "
+              f"will settle near {100 * fits / n_scenes:.0f}%. Raise "
+              f"cache_max_gib, or train on a subset.")
 
 
 def worker(rank: int, world_size: int, cfg: Config):
@@ -207,6 +261,9 @@ def worker(rank: int, world_size: int, cfg: Config):
     if rank == 0:
         print(f"world_size={world_size}, device={device}")
         print(cfg.describe())
+
+        if cfg.data.cache_dir:
+            report_cache_capacity(cfg)
 
     model, loss_fn, optimizer, scheduler = build_model_and_optim(cfg, device)
 

@@ -37,10 +37,74 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+
+def free_gib(path) -> float:
+    """Free space on the filesystem holding ``path``, in GiB."""
+    try:
+        return shutil.disk_usage(str(path)).free / 1024 ** 3
+    except OSError:
+        return float("inf")
+
+
+class DiskGuard:
+    """Shared stop-writing rule for every cache on one filesystem.
+
+    A per-cache byte budget is not enough on its own. It only knows what THAT
+    cache wrote, so two caches with separate budgets can sum to more than
+    intended -- and neither can see the dataset, the repository, or the
+    checkpoints sharing the same 20 GB quota.
+
+    Filling that quota does not merely stop the cache. It makes CHECKPOINT
+    WRITES FAIL, which is the one failure that costs a whole run. So the
+    binding rule here is FREE SPACE, not bytes written: caching stops while
+    the filesystem still has ``min_free_gib`` in hand, whatever consumed it.
+
+    Checked periodically rather than on every write, because ``disk_usage`` is
+    a syscall and this sits in the data path.
+    """
+
+    def __init__(self, root, min_free_gib: float = 4.0, max_gib: Optional[float] = 10.0,
+                 recheck_every: int = 64):
+        self.root = Path(root) if root else None
+        self.min_free_gib = min_free_gib
+        self.max_bytes = int(max_gib * 1024 ** 3) if max_gib else None
+        self.recheck_every = max(1, recheck_every)
+        self._written = 0
+        self._since_check = 0
+        self._free = free_gib(root) if root else float("inf")
+        self.stopped_reason = ""
+
+    def allows(self, extra_bytes: int = 0) -> bool:
+        if self.root is None:
+            return False
+        self._since_check += 1
+        if self._since_check >= self.recheck_every:
+            self._free = free_gib(self.root)
+            self._since_check = 0
+
+        if self._free <= self.min_free_gib:
+            self.stopped_reason = (
+                f"only {self._free:.1f} GiB free, floor is {self.min_free_gib:.1f}")
+            return False
+        if self.max_bytes is not None and self._written >= self.max_bytes:
+            self.stopped_reason = (
+                f"cache budget of {self.max_bytes / 1024 ** 3:.1f} GiB reached")
+            return False
+        return True
+
+    def record(self, size: int) -> None:
+        self._written += size
+        self._free -= size / 1024 ** 3
+
+    @property
+    def written_gib(self) -> float:
+        return self._written / 1024 ** 3
 
 
 class ScenePreprocessCache:
@@ -56,7 +120,8 @@ class ScenePreprocessCache:
     VERSION = 1
 
     def __init__(self, root: Optional[str], enabled: bool = True,
-                 max_bytes: Optional[int] = 8 * 1024 ** 3,
+                 guard: Optional["DiskGuard"] = None,
+                 max_bytes: Optional[int] = None,
                  recheck_every: int = 256):
         """``max_bytes`` bounds the cache. Once exceeded, entries are still
         READ but no new ones are written.
@@ -78,36 +143,24 @@ class ScenePreprocessCache:
         its own share.
         """
         self.root = Path(root) if root else None
-        self.enabled = bool(enabled and root)
-        self.max_bytes = max_bytes
+        self.enabled = bool(enabled and root)   # '' or None disables
+        # A shared guard so every cache on this filesystem draws from ONE
+        # budget and one free-space floor, instead of each believing it has the
+        # whole quota to itself.
+        self.guard = guard if guard is not None else DiskGuard(
+            root, max_gib=(max_bytes / 1024 ** 3) if max_bytes else 10.0)
         self.recheck_every = max(1, recheck_every)
         self.hits = 0
         self.misses = 0
         self.writes = 0
         self.errors = 0
         self.skipped_full = 0
-        self._bytes = 0
-        self._since_check = 0
         if self.enabled:
             self.root.mkdir(parents=True, exist_ok=True)
-            self._bytes = self._measure()
-
-    def _measure(self) -> int:
-        total = 0
-        try:
-            for sub in os.scandir(self.root):
-                if not sub.is_dir():
-                    continue
-                for entry in os.scandir(sub.path):
-                    if entry.is_file():
-                        total += entry.stat().st_size
-        except OSError:
-            pass
-        return total
 
     @property
     def full(self) -> bool:
-        return self.max_bytes is not None and self._bytes >= self.max_bytes
+        return not self.guard.allows()
 
     # -- keying --------------------------------------------------------------
     def key(self, scene_dir: str, fracture_id: str, **settings) -> str:
@@ -157,10 +210,7 @@ class ScenePreprocessCache:
               edge_cluster_ids: Sequence[np.ndarray], tol: float) -> None:
         if not self.enabled:
             return
-        if self._since_check >= self.recheck_every:
-            self._bytes = self._measure()
-            self._since_check = 0
-        if self.full:
+        if not self.guard.allows():
             self.skipped_full += 1
             return
 
@@ -177,12 +227,11 @@ class ScenePreprocessCache:
 
         tmp = path.with_suffix(f".{os.getpid()}.tmp.npz")
         try:
-            np.savez(tmp, **payload)
+            np.savez_compressed(tmp, **payload)
             size = tmp.stat().st_size
             os.replace(tmp, path)        # atomic within a filesystem
             self.writes += 1
-            self._bytes += size
-            self._since_check += 1
+            self.guard.record(size)
         except Exception:                                    # noqa: BLE001
             self.errors += 1
             try:
@@ -194,12 +243,10 @@ class ScenePreprocessCache:
     def summary(self) -> str:
         total = self.hits + self.misses
         rate = 100.0 * self.hits / total if total else 0.0
-        gb = self._bytes / 1024 ** 3
-        cap = f"/{self.max_bytes / 1024 ** 3:.1f}" if self.max_bytes else ""
-        extra = f", {self.skipped_full} skipped (budget reached)" if self.skipped_full else ""
+        extra = (f", {self.skipped_full} skipped ({self.guard.stopped_reason})"
+                 if self.skipped_full else "")
         return (f"cache: {self.hits} hits / {total} lookups ({rate:.1f}%), "
-                f"{self.writes} written, {gb:.2f}{cap} GiB, "
-                f"{self.errors} errors{extra}")
+                f"{self.writes} written, {self.errors} errors{extra}")
 
 
 class BaseMeshCache:
@@ -226,17 +273,16 @@ class BaseMeshCache:
     VERSION = 1
 
     def __init__(self, root: Optional[str], enabled: bool = True,
-                 max_bytes: Optional[int] = 4 * 1024 ** 3):
+                 guard: Optional["DiskGuard"] = None, compress: bool = True):
+        self.compress = compress
         self.root = Path(root) / "base_meshes" if root else None
         self.enabled = bool(enabled and root)
-        self.max_bytes = max_bytes
+        self.guard = guard if guard is not None else DiskGuard(root)
         self.hits = 0
         self.misses = 0
         self.writes = 0
-        self._bytes = 0
         if self.enabled:
             self.root.mkdir(parents=True, exist_ok=True)
-            self._bytes = _dir_size(self.root)
 
     def _path(self, scene_dir: str) -> Path:
         key = hashlib.sha1(f"v{self.VERSION}|{scene_dir}".encode()).hexdigest()
@@ -270,14 +316,22 @@ class BaseMeshCache:
     def store(self, scene_dir: str, vertices, faces, matrix) -> None:
         if not self.enabled:
             return
-        if self.max_bytes is not None and self._bytes >= self.max_bytes:
+        if not self.guard.allows():
             return
         path = self._path(scene_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         csr = matrix.tocsr()
         tmp = path.with_suffix(f".{os.getpid()}.tmp.npz")
         try:
-            np.savez(
+            # Compressed by default. Measured on a real scene: 933 KB -> 308 KB
+            # (3.0x), write 6.6 ms -> 41 ms, read 2.0 ms -> 5.0 ms. The write
+            # cost is paid ONCE per scene; the read is still 21x faster than
+            # the 105 ms parse it replaces. Tripling coverage matters more than
+            # 3 ms on a hit, because for uniform random draws the hit rate is
+            # roughly (scenes cached) / (scenes in the split) -- so size IS the
+            # hit rate.
+            writer = np.savez_compressed if self.compress else np.savez
+            writer(
                 tmp,
                 v=np.asarray(vertices, dtype=np.float32),
                 f=np.asarray(faces, dtype=np.int32),
@@ -287,7 +341,7 @@ class BaseMeshCache:
             size = tmp.stat().st_size
             os.replace(tmp, path)
             self.writes += 1
-            self._bytes += size
+            self.guard.record(size)
         except Exception:                                    # noqa: BLE001
             try:
                 if tmp.exists():
@@ -298,8 +352,7 @@ class BaseMeshCache:
     def summary(self) -> str:
         total = self.hits + self.misses
         rate = 100.0 * self.hits / total if total else 0.0
-        return (f"base-mesh cache: {self.hits}/{total} ({rate:.1f}%), "
-                f"{self._bytes / 1024 ** 3:.2f} GiB")
+        return (f"base-mesh cache: {self.hits}/{total} ({rate:.1f}%)")
 
 
 def _dir_size(root: Path) -> int:

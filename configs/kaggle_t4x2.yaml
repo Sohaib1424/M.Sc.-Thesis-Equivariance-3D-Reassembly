@@ -24,7 +24,13 @@ data:
   # /kaggle/working has a 20 GB quota that ALSO holds your checkpoints. Entries
   # average ~437 KB, so an uncapped cache reaches the quota within the first
   # hour and then checkpoint saves start failing.
-  cache_max_gib: 8.0
+  # ONE budget shared by both caches, plus a free-space floor. /kaggle/working
+  # is 20 GB total and also holds the repo, the checkpoints and (if you put it
+  # there) the dataset. Caching stops while 4 GiB is still free, whatever
+  # consumed the rest -- a full disk makes CHECKPOINT WRITES fail, which is the
+  # one failure that costs a whole run.
+  cache_max_gib: 6.0
+  cache_min_free_gib: 4.0
   seed: 0
 
 model:
@@ -42,13 +48,24 @@ loss:
 optim:
   lr: 3.0e-4
   grad_clip: 5.0
+  # An "epoch" is 150 steps, not a pass over the data, so plateau patience is
+  # much more frequent than it looks. At the old patience of 5 the LR reached
+  # 1e-7 by roughly epoch 100 of 3000 and training stopped moving.
+  plateau_patience: 40
+  min_lr: 1.0e-6
 
 train:
-  # 6,000 vertices per scene at batch 16 is roughly the same GPU work as
-  # 22,500 at batch 4 -- same node count per step, four times the scenes.
-  # That is where most of the throughput comes from; see docs/TRAINING_BUDGET.md.
-  batch_size: 16
-  accum_steps: 1
+  # Sized on NODES ALONE, batch 16 looks free -- 16x6,000 is about the same
+  # node count as 4x22,500. It was not: stage-2 attention also scales with the
+  # number of FRAGMENTS in the batch, and real scenes carry 30-59 of them.
+  # Measured at batch 16: compute 2.95 s/batch against 0.83 at batch 4.
+  #
+  # Stage 2 now runs per scene rather than as one dense batch matrix, which
+  # removes the quadratic term. Batch 8 is the conservative setting until you
+  # have re-measured on your own card:
+  #   python scripts/profile_memory.py --sweep --fragments 40
+  batch_size: 8
+  accum_steps: 2
   steps_per_epoch: 150
   val_steps: 30
   amp: true
@@ -61,10 +78,18 @@ train:
   #                          can be re-run every session with no editing
   #   time_budget_hours      stops cleanly rather than being killed mid-epoch;
   #                          11.5 leaves room for the final checkpoint write
-  #   save_every: 1          a killed session then costs at most one epoch
+  #   save_every: 1
+  # Numbered generations on top of last.pt, oldest pruned. Cheap insurance:
+  # each file is ~5 MB at 418k parameters.
+  snapshot_every: 10
+  keep_snapshots: 3          a killed session then costs at most one epoch
   resume: auto
   time_budget_hours: 11.5
   save_every: 1
+  # Numbered generations on top of last.pt, oldest pruned. Cheap insurance:
+  # each file is ~5 MB at 418k parameters.
+  snapshot_every: 10
+  keep_snapshots: 3
   epochs: 3000
 
   max_consecutive_oom: 5

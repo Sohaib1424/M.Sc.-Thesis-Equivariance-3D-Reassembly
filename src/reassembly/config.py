@@ -41,11 +41,15 @@ class DataConfig:
     # once. None disables. On Kaggle use /kaggle/working/cache (writable and
     # persisted between sessions of the same notebook).
     cache_dir: Optional[str] = None
-    #: Cache size cap in GiB. Kaggle's /kaggle/working quota is 20 GB TOTAL and
-    #: also holds your checkpoints -- an unbounded cache fills it and makes
-    #: checkpoint writes fail, losing the run. Entries average ~437 KB at
-    #: decimate_to=6000, so 8 GiB is roughly 19,000 of them.
-    cache_max_gib: float = 8.0
+    #: Total cache budget in GiB, shared by BOTH caches (base meshes and
+    #: preprocessed scenes). Kaggle's /kaggle/working quota is 20 GB and also
+    #: holds the repository, the checkpoints, and possibly the dataset.
+    cache_max_gib: float = 6.0
+    #: Hard floor on FREE disk space. Caching stops while this much is still
+    #: available, whatever consumed the rest. This is the guarantee that
+    #: matters: a full disk does not merely stop the cache, it makes checkpoint
+    #: writes fail, which is the one failure that costs a whole run.
+    cache_min_free_gib: float = 4.0
     correspondence_tol: float = 1e-5
     num_workers: int = 2
     seed: int = 0
@@ -87,8 +91,16 @@ class OptimConfig:
     weight_decay: float = 1e-5
     grad_clip: float = 5.0
     scheduler: str = "plateau"   # plateau | cosine | none
-    plateau_patience: int = 5
+    #: Epochs without improvement before the LR is halved. An "epoch" here is
+    #: `steps_per_epoch` steps, not a pass over the data, so this is far more
+    #: frequent than it looks. At patience=5 over a 3000-epoch run the LR
+    #: reaches 1e-7 by about epoch 100 and training silently stops moving.
+    plateau_patience: int = 40
     plateau_factor: float = 0.5
+    #: Floor for the scheduler. Without one, repeated reductions drive the LR
+    #: below Adam's eps (1e-8), where updates stop having any effect at all --
+    #: indistinguishable, on a loss curve, from a model that cannot learn.
+    min_lr: float = 1.0e-6
     warmup_steps: int = 0
 
 
@@ -120,6 +132,12 @@ class TrainConfig:
     max_consecutive_oom: int = 5
     log_every: int = 1
     save_every: int = 1
+    #: Write a numbered snapshot every N epochs (0 disables). Unlike `last.pt`,
+    #: which is one file overwritten in place, these accumulate -- so a bad
+    #: checkpoint is not the only thing between you and starting over.
+    snapshot_every: int = 10
+    #: How many numbered snapshots to keep. Older ones are deleted.
+    keep_snapshots: int = 3
     seed: int = 0
 
 

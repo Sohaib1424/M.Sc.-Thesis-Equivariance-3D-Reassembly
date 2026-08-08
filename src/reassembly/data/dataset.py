@@ -43,11 +43,11 @@ from .correspondence import (
     derive_edge_clusters_for_scene,
     transfer_vertex_clusters,
 )
-from .cache import BaseMeshCache, ScenePreprocessCache
+from .cache import BaseMeshCache, DiskGuard, ScenePreprocessCache, free_gib
 from .decimate import decimate_scene, suggested_correspondence_tol
 from .features import get_features
 from .mesh_ops import extract_fractures_with_map
-from .scene_io import load_scene
+from .scene_io import load_base_mesh, load_scene
 from .splits import SceneIndex
 
 INPUT_SOURCES = ("full", "frac")
@@ -95,7 +95,8 @@ class BreakingBadDataset(Dataset):
         min_vertices_per_fragment: int = 32,
         fracture_pattern: Optional[str] = None,
         cache_dir: Optional[str] = None,
-        cache_max_gib: float = 8.0,
+        cache_max_gib: float = 6.0,
+        cache_min_free_gib: float = 4.0,
         max_retries: int = 8,
         nominal_length: int = 10_000,
         seed: int = 0,
@@ -114,12 +115,17 @@ class BreakingBadDataset(Dataset):
         self.decimate_to = decimate_to
         self.min_vertices_per_fragment = min_vertices_per_fragment
         self.fracture_pattern = fracture_pattern
-        self.cache = ScenePreprocessCache(
-            cache_dir, max_bytes=int(cache_max_gib * 1024 ** 3))
+        # ONE budget and ONE free-space floor shared by both caches. Kaggle's
+        # /kaggle/working is 20 GB TOTAL and also holds the repository, the
+        # checkpoints and possibly the dataset -- so the binding constraint is
+        # free space, not bytes this process happened to write.
+        self.disk_guard = DiskGuard(cache_dir, min_free_gib=cache_min_free_gib,
+                                    max_gib=cache_max_gib)
+        self.cache = ScenePreprocessCache(cache_dir, guard=self.disk_guard)
         # Keyed by scene alone, so it hits from the first repeat -- unlike the
         # (scene, fracture) cache, which with ~100 fractures per scene rarely
         # sees the same pair twice early in training.
-        self.base_cache = BaseMeshCache(cache_dir)
+        self.base_cache = BaseMeshCache(cache_dir, guard=self.disk_guard)
         self.max_retries = max_retries
         self.nominal_length = nominal_length
         self.seed = seed
@@ -183,7 +189,20 @@ class BreakingBadDataset(Dataset):
                 self.stats["scenes_loaded"] += 1
                 return self._build_sample_from_arrays(cached, scene_dir, rng)
 
+            # Parse the scene-invariant half at most ONCE: read it from the
+            # cache, or parse it here and populate the cache on the way past.
+            # Letting load_scene parse it and then parsing again to store would
+            # double the cold-cache cost, which is exactly the cost this is
+            # meant to remove.
             base = self.base_cache.load(str(scene_dir))
+            if base is None:
+                try:
+                    base = load_base_mesh(str(scene_dir))
+                    self.base_cache.store(str(scene_dir), *base)
+                except Exception:
+                    self.stats["scenes_rejected"] += 1
+                    continue
+
             try:
                 meshes = load_scene(str(scene_dir), fracture_id=fracture_id,
                                     rng=py_rng,
@@ -192,20 +211,6 @@ class BreakingBadDataset(Dataset):
             except Exception:
                 self.stats["scenes_rejected"] += 1
                 continue
-
-            if base is None:
-                # Populate on the way past. Reading it back costs 2.3 ms
-                # against 105 ms to reparse.
-                try:
-                    import igl
-                    from scipy.sparse import load_npz as _load_npz
-                    v, f = igl.read_triangle_mesh(
-                        os.path.join(str(scene_dir), "compressed_mesh.obj"))
-                    self.base_cache.store(
-                        str(scene_dir), v, f,
-                        _load_npz(os.path.join(str(scene_dir), "compressed_data.npz")))
-                except Exception:                            # noqa: BLE001
-                    pass                                     # caching is best-effort
 
             if len(meshes) < 2:
                 # A "scene" with one fragment has no cross-fragment structure

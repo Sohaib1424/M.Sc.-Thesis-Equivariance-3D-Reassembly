@@ -100,7 +100,11 @@ def measure(device, nodes, fragments, hidden, layers, heads, head_dim,
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--nodes", type=int, default=15000)
-    p.add_argument("--fragments", type=int, default=8)
+    p.add_argument("--fragments", type=int, default=40,
+                   help="Fragments PER SCENE. Real Breaking Bad scenes carry "
+                        "30-59; the old default of 8 made batch-size sweeps "
+                        "look far cheaper than they are, because stage-2 "
+                        "attention scales with fragment count, not just nodes.")
     p.add_argument("--hidden-channels", type=int, default=32)
     p.add_argument("--num-layers", type=int, default=3)
     p.add_argument("--heads", type=int, default=4)

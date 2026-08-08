@@ -66,7 +66,6 @@ def run_epoch(
     totals: Dict[str, float] = {}
     num_batches = 0
     skipped = 0
-    consecutive_oom = 0
     data_seconds = 0.0
     compute_seconds = 0.0
     max_nodes = 0
@@ -84,92 +83,115 @@ def run_epoch(
         data_seconds += time.perf_counter() - data_start
         compute_start = time.perf_counter()
 
-        # An entirely empty batch happens when every scene in it was rejected
-        # by the vertex budget. All ranks must still vote, or they desync.
+        # ---- vote BEFORE any work that issues a collective ----------------
+        #
+        # This ordering is the whole point. DistributedDataParallel all-reduces
+        # gradients during backward(), and NCCL matches collectives by ORDER,
+        # not by name. If one rank runs a backward that another skips, rank A's
+        # Nth collective is a gradient bucket while rank B's Nth is something
+        # else entirely -- they never match, and both sit until the watchdog
+        # fires. Observed as:
+        #
+        #   WorkNCCL(SeqNum=488, OpType=ALLREDUCE, NumelIn=289376)
+        #   ran for 600088 milliseconds before timing out
+        #
+        # 289,376 is a gradient bucket. An earlier version voted AFTER the
+        # backward, which cannot work: by then the desyncing collectives are
+        # already enqueued.
         local_ok = batch.get("graph") is not None
-        losses = None
-        nodes_here = 0
-
-        if local_ok:
-            try:
-                pbar.set_desc(f"{prefix} \u2192dev")
-                batch = _to_device(batch, device,
-                                   ("graph", "diffused_graph", "frac_graph",
-                                    "diff_frac_graph", "t_matrices"))
-
-                full_diffused = batch["diffused_graph"]
-                input_graph = select_input_graph(batch, cfg.data.input_source, diffused=True)
-                nodes_here = int(input_graph.x.shape[0])
-
-                model_inputs = build_model_inputs(input_graph)
-                targets = build_targets(batch["graph"], batch["t_matrices"],
-                                        input_graph=input_graph)
-
-                with torch.set_grad_enabled(train):
-                    pbar.set_desc(f"{prefix} fwd")
-                    with amp.autocast():
-                        outputs = model(**model_inputs)
-
-                    # Geometry predictions and losses stay in fp32: they feed
-                    # squared-distance terms where fp16 rounding is a real
-                    # error, and they are cheap relative to the backbone.
-                    R_pred = outputs["R_pred"].float()
-                    predicted = build_predictions(full_diffused, R_pred)
-
-                    pbar.set_desc(f"{prefix} loss")
-                    losses = loss_fn(
-                        dict(
-                            R_pred=R_pred,
-                            **predicted,
-                            vertex_embedding=outputs["vertex_embedding"].float(),
-                            edge_embedding=outputs["edge_embedding"].float(),
-                        ),
-                        targets,
-                    )
-
-                    if train:
-                        pbar.set_desc(f"{prefix} bwd")
-                        amp.backward(losses["total"] / cfg.train.accum_steps)
-
-            except RuntimeError as exc:
-                if not is_oom_error(exc):
-                    raise
-                local_ok = False
-                consecutive_oom += 1
-                if main:
-                    tqdm.write(
-                        f"!! OOM on {device} at {phase} step {step} "
-                        f"({nodes_here} nodes). {cuda_memory_summary(device)}"
-                    )
-                losses = None
-                release_cuda_memory()
-                if train:
-                    # Whatever partial gradient the failed backward left behind
-                    # is meaningless and would otherwise be applied at the next
-                    # optimizer step.
-                    optimizer.zero_grad(set_to_none=True)
-                if consecutive_oom >= cfg.train.max_consecutive_oom:
-                    raise RuntimeError(
-                        f"{consecutive_oom} consecutive OOMs -- the configuration does not fit "
-                        f"this GPU at all, rather than being unlucky on one scene. Lower "
-                        f"data.decimate_to / train.batch_size / model.hidden_channels, or "
-                        f"enable model.gradient_checkpointing."
-                    ) from exc
-
-        # Every rank votes, unconditionally: this is what stops a single rank's
-        # OOM from leaving the others blocked forever at the next collective.
         step_ok = all_ranks_agree(local_ok, device)
 
-        if train and step_ok and (step + 1) % cfg.train.accum_steps == 0:
+        if not step_ok:
+            # Every rank takes this branch together, so no collective is
+            # issued by anyone and the sequence stays aligned.
+            skipped += 1
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+            pbar.set_desc(f"{prefix} load")
+            data_start = time.perf_counter()
+            continue
+
+        losses = None
+        nodes_here = 0
+        try:
+            pbar.set_desc(f"{prefix} \u2192dev")
+            batch = _to_device(batch, device,
+                               ("graph", "diffused_graph", "frac_graph",
+                                "diff_frac_graph", "t_matrices"))
+
+            full_diffused = batch["diffused_graph"]
+            input_graph = select_input_graph(batch, cfg.data.input_source, diffused=True)
+            nodes_here = int(input_graph.x.shape[0])
+
+            model_inputs = build_model_inputs(input_graph)
+            targets = build_targets(batch["graph"], batch["t_matrices"],
+                                    input_graph=input_graph)
+
+            with torch.set_grad_enabled(train):
+                pbar.set_desc(f"{prefix} fwd")
+                with amp.autocast():
+                    outputs = model(**model_inputs)
+
+                # Geometry predictions and losses stay in fp32: they feed
+                # squared-distance terms where fp16 rounding is a real
+                # error, and they are cheap relative to the backbone.
+                R_pred = outputs["R_pred"].float()
+                predicted = build_predictions(full_diffused, R_pred)
+
+                pbar.set_desc(f"{prefix} loss")
+                losses = loss_fn(
+                    dict(
+                        R_pred=R_pred,
+                        **predicted,
+                        vertex_embedding=outputs["vertex_embedding"].float(),
+                        edge_embedding=outputs["edge_embedding"].float(),
+                    ),
+                    targets,
+                )
+
+                if train:
+                    pbar.set_desc(f"{prefix} bwd")
+                    # Skip the gradient all-reduce on accumulation micro-steps.
+                    # Without this, DDP synchronises on EVERY backward and
+                    # accum_steps multiplies communication for no benefit --
+                    # the gradients are not used until the step boundary.
+                    is_step_boundary = (step + 1) % cfg.train.accum_steps == 0
+                    if is_step_boundary or not hasattr(model, "no_sync"):
+                        amp.backward(losses["total"] / cfg.train.accum_steps)
+                    else:
+                        with model.no_sync():
+                            amp.backward(losses["total"] / cfg.train.accum_steps)
+
+        except RuntimeError as exc:
+            if not is_oom_error(exc):
+                raise
+            # An OOM here is NOT recoverable under DDP. Part of this rank's
+            # collectives for this step are already enqueued and there is no
+            # way to un-issue them, so the process group is permanently out of
+            # step with the others. Continuing would hang at the next
+            # collective and report a confusing NCCL timeout minutes later,
+            # far from the real cause. Fail here instead, with the cause.
+            release_cuda_memory()
+            raise RuntimeError(
+                f"CUDA OOM at {phase} step {step} ({nodes_here} nodes) on {device}.\n"
+                f"{cuda_memory_summary(device)}\n"
+                f"Under DDP this cannot be skipped -- gradient all-reduces for "
+                f"this step are already in flight on this rank, so the ranks "
+                f"can no longer agree on what comes next.\n"
+                f"Lower data.decimate_to ({cfg.data.decimate_to}), "
+                f"train.batch_size ({cfg.train.batch_size}), or "
+                f"data.max_vertices ({cfg.data.max_vertices}); or raise "
+                f"train.accum_steps to keep the effective batch while shrinking "
+                f"the per-step one."
+            ) from exc
+
+        if train and (step + 1) % cfg.train.accum_steps == 0:
             amp.step(optimizer, grad_clip=cfg.optim.grad_clip, parameters=model.parameters())
-            optimizer.zero_grad(set_to_none=True)
-        elif train and not step_ok:
             optimizer.zero_grad(set_to_none=True)
 
         compute_seconds += time.perf_counter() - compute_start
 
-        if step_ok and losses is not None:
-            consecutive_oom = 0
+        if losses is not None:
             for k, v in losses.items():
                 totals[k] = totals.get(k, 0.0) + float(v.detach())
             num_batches += 1
@@ -194,7 +216,8 @@ def run_epoch(
     else:
         metrics = {k: v / num_batches for k, v in totals.items()}
 
-    metrics = reduce_metrics(metrics, device)
+    # Explicit key list: identical on every rank by construction.
+    metrics = reduce_metrics(metrics, device, keys=METRIC_KEYS)
 
     if main:
         cache_note = ""

@@ -99,11 +99,20 @@ class VNGATModel(nn.Module):
         self.rotation_head = VNLinear(hidden_channels, 2)   # -> 2 vectors for Gram-Schmidt
 
         self.vertex_embed_head = InvariantEmbeddingHead(hidden_channels, embed_dim)
-        # Edge embeddings pool both endpoint node features plus the edge's own
-        # input vector channels (midpoint, two face normals), so they carry
-        # learned context AND raw local geometry.
+        # Edge embeddings pool the endpoint node features plus the edge's own
+        # vector channels (midpoint, two face normals).
+        #
+        # The endpoints are combined SYMMETRICALLY (sum, not concatenation).
+        # The edge-consistency loss requires the two copies of an interface
+        # edge -- one per touching fragment -- to produce the same descriptor,
+        # and edge order comes from trimesh's `edges_unique`, which sorts by
+        # vertex index. The two fragments index their vertices independently,
+        # so the same physical edge can be (5, 12) in one and (7, 30) in the
+        # other with the endpoints paired in the opposite order. Concatenating
+        # would make the descriptor order-dependent and ask the network to
+        # learn an invariance that costs nothing to build in.
         self.edge_embed_head = InvariantEmbeddingHead(
-            2 * hidden_channels + edge_vec_channels, embed_dim
+            hidden_channels + edge_vec_channels, embed_dim
         )
 
     def _stage(self, i, h, edge_index, edge_scalar, edge_vec,
@@ -175,7 +184,8 @@ class VNGATModel(nn.Module):
         else:
             src, dst, edge_vec_use = edge_index[0], edge_index[1], edge_vec
 
-        edge_input = torch.cat([h[src], h[dst], edge_vec_use], dim=1)
+        # h[src] + h[dst], not cat: symmetric under endpoint order (see above).
+        edge_input = torch.cat([h[src] + h[dst], edge_vec_use], dim=1)
         edge_embedding = self.edge_embed_head(edge_input)
 
         return {

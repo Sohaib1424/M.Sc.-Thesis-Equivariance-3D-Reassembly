@@ -5,6 +5,7 @@ Two things live here because both are about making a long run readable.
 """
 from __future__ import annotations
 
+import sys
 import warnings
 from typing import Dict, Optional, Sequence
 
@@ -92,12 +93,23 @@ class MetricTable:
         disable: bool = False,
         width: int = 8,
         log_every: int = 30,
+        progress_interval: float = 20.0,
     ):
         self.columns = list(columns)
         self.width = width
         self.disable = disable
+        # file=sys.stdout and mininterval: in a notebook, `!python script.py`
+        # is a subprocess whose stderr may not surface until it exits, so a bar
+        # on the default stream can leave a 16-minute epoch looking frozen.
+        # stdout is what the notebook streams live.
+        #
+        # mininterval throttles REDRAWS. In a pipe every redraw is a new line,
+        # so the default 0.1 s produces one line per batch. At 20 s it is a
+        # handful of lines per epoch -- enough to see progress, not enough to
+        # bury the epoch summary.
         self.bar = tqdm(iterable, desc=desc, total=total, disable=disable,
-                        leave=False, unit="batch", dynamic_ncols=True)
+                        leave=False, unit="batch", dynamic_ncols=True,
+                        file=sys.stdout, mininterval=progress_interval)
 
     def __iter__(self):
         return iter(self.bar)

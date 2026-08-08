@@ -108,7 +108,9 @@ def cluster_consistency_loss(embeddings: torch.Tensor, cluster_id: torch.Tensor)
     emb = embeddings[mask]
     cid = cluster_id[mask]
     _unique, inverse = torch.unique(cid, return_inverse=True)
-    num_clusters = int(inverse.max().item()) + 1
+    # _unique.numel(), not inverse.max().item(): .item() forces a GPU->CPU
+    # sync, and this runs twice per training step.
+    num_clusters = _unique.numel()
     D = emb.shape[-1]
 
     sums = torch.zeros(num_clusters, D, device=emb.device, dtype=emb.dtype)

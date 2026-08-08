@@ -291,10 +291,18 @@ def worker(rank: int, world_size: int, cfg: Config):
             # a gradient-connected zero when a batch has no shared vertices
             # instead of a detached constant. See training/losses.py.
             find_unused_parameters=False,
-            # Safe together with use_reentrant=False checkpointing, and it lets
-            # DDP skip its per-iteration graph traversal.
-            static_graph=True,
+            # static_graph tells DDP the autograd graph never changes, so it
+            # can precompute the reduction order. no_sync(), which the training
+            # loop uses to suppress reduction on accumulation micro-steps,
+            # deliberately changes WHEN reduction happens -- PyTorch documents
+            # the two as unsafe together, and the failure mode is silently
+            # wrong gradients rather than an error. So it is only enabled when
+            # there is no accumulation to suppress.
+            static_graph=(cfg.train.accum_steps == 1),
         )
+        if cfg.train.accum_steps > 1 and rank == 0:
+            print(f"accum_steps={cfg.train.accum_steps}: static_graph disabled "
+                  f"(incompatible with the no_sync used between micro-steps)")
 
     train_loader, val_loader = build_dataloaders(cfg)
     try:

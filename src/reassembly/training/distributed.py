@@ -24,18 +24,36 @@ unusually large scene and hit OOM) while the others did not, the failing rank
 dies and the survivors block forever at their next collective. The run appears
 to hang rather than fail.
 
-``all_ranks_agree`` fixes it for the case that actually happens here. Every
-rank votes on whether its own batch succeeded, the votes are all-reduced, and
-every rank then takes the same branch. A rank that OOMs makes ALL ranks skip
-that step together, so the collectives stay in lockstep and the run continues
-instead of hanging. That turns the single most likely cause of a mid-epoch
-hang into a logged, skipped batch.
+``all_ranks_agree`` handles the case that can be handled: a rank whose batch
+is unusable BEFORE any work begins. Every rank votes, the votes are
+all-reduced, and every rank takes the same branch.
+
+THE ORDERING IS THE ENTIRE MECHANISM. The vote must come before anything that
+issues a collective -- above all before ``backward()``, where DDP all-reduces
+gradients. NCCL matches collectives by ORDER, not by name, so a rank that runs
+a backward another skipped has a gradient bucket where its peer has something
+else. Both then block until the watchdog fires, minutes later, pointing at a
+collective rather than at the cause:
+
+    WorkNCCL(SeqNum=488, OpType=ALLREDUCE, NumelIn=289376)
+    ran for 600088 milliseconds before timing out
+
+An earlier version of the training loop voted AFTER the backward. That cannot
+work, and it produced exactly the timeout above.
+
+WHAT THIS CANNOT FIX
+--------------------
+An OOM raised DURING forward/backward. By then some of that rank's collectives
+are already enqueued, and there is no way to un-issue them. The ranks are
+permanently out of step, and pretending to "skip together" only defers the
+hang. The training loop therefore treats a mid-step OOM as fatal and says so,
+rather than continuing into a confusing NCCL timeout minutes later.
 """
 from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -58,18 +76,32 @@ def is_main_process() -> bool:
 
 
 def setup_distributed(rank: int, world_size: int, master_port: int = 12355,
-                      backend: Optional[str] = None) -> torch.device:
+                      backend: Optional[str] = None,
+                      timeout_minutes: float = 30.0) -> torch.device:
+    import datetime
+
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", str(master_port))
     if backend is None:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+
+    device = None
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{rank}")
+        # Bind the device BEFORE init_process_group so NCCL knows which GPU
+        # this rank owns. Doing it afterwards is what produces
+        # "barrier(): using the device under current context".
         torch.cuda.set_device(device)
-    else:
-        device = torch.device("cpu")
-    return device
+
+    kwargs = dict(backend=backend, rank=rank, world_size=world_size,
+                  timeout=datetime.timedelta(minutes=timeout_minutes))
+    try:
+        dist.init_process_group(device_id=device, **kwargs)
+    except TypeError:
+        # device_id landed in torch 2.3; older versions still work without it.
+        dist.init_process_group(**kwargs)
+
+    return device if device is not None else torch.device("cpu")
 
 
 def cleanup_distributed() -> None:
@@ -94,13 +126,23 @@ def all_ranks_agree(local_ok: bool, device: torch.device) -> bool:
     return bool(flag.item() > 0.5)
 
 
-def reduce_metrics(metrics: dict, device: torch.device) -> dict:
+def reduce_metrics(metrics: dict, device: torch.device,
+                   keys: Optional[Sequence[str]] = None) -> dict:
     """Average a metrics dict across ranks so printed numbers describe the
-    whole run, not whatever slice one process happened to see."""
+    whole run, not whatever slice one process happened to see.
+
+    ``keys`` fixes the tensor layout. Deriving it from ``metrics.keys()`` on
+    each rank is a latent desync: a rank that processed zero usable batches
+    reports a different key set from one that did, the all-reduce is then given
+    different sizes on different ranks, and NCCL blocks until the watchdog
+    fires. Passing an explicit, identical key list removes that possibility
+    rather than relying on the dicts happening to match.
+    """
     if not is_distributed():
         return metrics
-    keys = sorted(metrics.keys())
-    values = torch.tensor([metrics[k] for k in keys], device=device, dtype=torch.float64)
+    keys = list(keys) if keys is not None else sorted(metrics.keys())
+    values = torch.tensor([float(metrics.get(k, float("nan"))) for k in keys],
+                          device=device, dtype=torch.float64)
     dist.all_reduce(values, op=dist.ReduceOp.SUM)
     values /= get_world_size()
     return {k: float(v) for k, v in zip(keys, values)}

@@ -75,6 +75,20 @@ def scatter_mean_vectors(x: torch.Tensor, index: torch.Tensor, num_segments: int
 class VNDenseCrossAttention(nn.Module):
     """Dense equivariant multi-head cross-attention with an optional mask.
 
+    ONE batched matmul, masked, rather than a loop over scenes.
+
+    The mask makes the score matrix block-diagonal, so the cross-scene entries
+    are computed and thrown away -- quadratic in batch size rather than linear.
+    That looks wasteful, and an earlier version of this code "fixed" it by
+    running each scene as its own block. Measured on a real run that was **3.1x
+    SLOWER per sample** (0.575 s against 0.184 s): at 8 scenes x 3 layers,
+    doubled by gradient checkpointing, it traded one large GPU-saturating
+    matmul for ~48 small ones plus a device sync from iterating
+    `torch.unique()`.
+
+    Slots are few -- fragments x 8 -- so the wasted FLOPs are cheap and the
+    kernel-launch overhead is not. Keep it dense.
+
     Used only for stage 2, where both sides are the (small) set of virtual
     nodes. Also used by the tests as the reference the segment implementations
     are checked against.
@@ -266,31 +280,10 @@ class VirtualNodeCommunicationBlock(nn.Module):
         flat = slots.reshape(num_fragments * K, self.channels, 3)
         if fragment_scene_id is not None:
             slot_scene = fragment_scene_id.repeat_interleave(K)
-            # Run stage 2 ONE SCENE AT A TIME rather than building a dense
-            # (F*K, F*K) score matrix over the whole batch and masking it down
-            # to block-diagonal.
-            #
-            # The dense form is quadratic in BATCH SIZE, not just in scene
-            # size, because every scene's slots score against every other
-            # scene's before being masked away. Measured on a real run at ~30
-            # fragments per scene: batch 4 builds a 960x960 matrix, batch 16
-            # builds 3840x3840 -- 16x the work and memory for 4x the data, all
-            # of it discarded by the mask. That alone took compute from 0.83 to
-            # 2.95 s/batch.
-            #
-            # Per scene the cost is unchanged, so this is exactly the same
-            # computation, just without the cross-scene entries that were only
-            # ever going to be masked out.
-            outputs = []
-            for scene in torch.unique(slot_scene):
-                index = torch.nonzero(slot_scene == scene, as_tuple=True)[0]
-                block = flat.index_select(0, index)
-                outputs.append((index, self.global_attn(block, block)))
-            flat = flat.new_zeros(flat.shape[0], self.channels, 3)
-            for index, value in outputs:
-                flat = flat.index_copy(0, index, value)
+            mask = slot_scene.unsqueeze(1) == slot_scene.unsqueeze(0)
         else:
-            flat = self.global_attn(flat, flat)
+            mask = None
+        flat = self.global_attn(flat, flat, mask=mask)
         slots = flat.view(num_fragments, K, self.channels, 3)
 
         # Stage 3: downward broadcast, fused as an equivariant residual.

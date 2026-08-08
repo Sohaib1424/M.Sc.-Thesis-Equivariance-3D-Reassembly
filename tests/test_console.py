@@ -78,57 +78,86 @@ def test_epoch_line_survives_missing_metrics():
 
 
 # --------------------------------------------------------------------- output
-def test_piped_output_logs_rows_instead_of_redrawing(capsys):
-    """`!python script.py` in a notebook has no TTY. tqdm's in-place redraw
-    becomes one new line per update, and the stacked header/value bars do not
-    work at all -- the header prints once and every update lands beneath it."""
-    cols = ("total", "rot")
-    table = MetricTable(range(20), cols, log_every=5)
-    assert not table.interactive, "no TTY under pytest capture"
-
-    for i, _ in enumerate(table):
-        table.update_metrics({"total": 1.0 + i, "rot": 2.0 + i})
+# These replace an earlier set that tested a stacked multi-bar layout. That
+# layout was removed because Kaggle's notebook subprocess reports
+# `isatty() == True` while not supporting the cursor movement it needs, so the
+# header printed once and every update landed underneath it. One bar, rewritten
+# in place, is what every terminal and notebook handles.
+def test_uses_exactly_one_bar():
+    table = MetricTable(range(10), ("total", "rot"))
+    assert hasattr(table, "bar")
+    assert not hasattr(table, "header"), "the stacked layout should be gone"
+    assert not hasattr(table, "values")
     table.close()
 
-    lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
-    assert len(lines) == 5, f"expected header + 4 rows, got {len(lines)}"
-    assert "total" in lines[0] and "rot" in lines[0]
-    assert "5/20" in lines[1]
-    assert "20/20" in lines[-1]
+
+def test_iteration_yields_every_item():
+    table = MetricTable(range(7), ("total",))
+    assert list(table) == list(range(7))
+    table.close()
 
 
-def test_piped_output_writes_the_header_once(capsys):
-    table = MetricTable(range(30), ("total",), log_every=10)
+def test_metrics_go_into_the_bar_postfix_with_short_keys():
+    """Full column names do not fit on one line beside the bar; an overflowing
+    line wraps and looks like the bar is broken."""
+    table = MetricTable(range(3), ("total", "rot", "rot_deg"))
+    table.update_metrics({"total": 9.374, "rot": 5.857, "rot_deg": 123.37})
+    postfix = table.bar.postfix
+    table.close()
+
+    assert postfix is not None
+    text = postfix if isinstance(postfix, str) else str(postfix)
+    for short in ("tot", "rot", "deg"):
+        assert short in text, f"{short} missing from {text!r}"
+    assert "9.374" in text
+
+
+def test_small_and_large_values_use_scientific_notation():
+    table = MetricTable(range(3), ("embv", "total"))
+    table.update_metrics({"embv": 4.7e-5, "total": 12345.0})
+    text = str(table.bar.postfix)
+    table.close()
+    assert "e-" in text
+    assert "e+" in text or "1.2e" in text
+
+
+def test_missing_metrics_are_omitted_not_crashed():
+    table = MetricTable(range(3), ("total", "rot", "pos"))
+    table.update_metrics({"total": 1.0})          # rot and pos absent
+    table.close()
+
+
+def test_set_desc_updates_the_bar():
+    table = MetricTable(range(3), ("total",), desc="E000 train")
+    table.set_desc("E000 train bwd")
+    assert "bwd" in table.bar.desc
+    table.close()
+
+
+def test_disabled_table_produces_no_output(capsys):
+    table = MetricTable(range(10), ("total",), disable=True)
     for _ in table:
         table.update_metrics({"total": 1.0})
     table.close()
-    out = capsys.readouterr().out
-    assert out.count("step") == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
 
 
-def test_columns_line_up(capsys):
+def test_works_as_a_context_manager():
+    with MetricTable(range(4), ("total",)) as table:
+        for _ in table:
+            table.update_metrics({"total": 1.0})
+
+
+def test_epoch_table_is_where_the_columns_live():
+    """The aligned table moved to once-per-epoch, printed by
+    format_epoch_line, where no cursor trickery is involved."""
     cols = ("total", "rot", "pos")
-    table = MetricTable(range(10), cols, log_every=5)
-    for _ in table:
-        table.update_metrics({"total": 1.0, "rot": 22.5, "pos": 0.0001})
-    table.close()
-    lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
-    assert len({len(l) for l in lines}) == 1, "rows are not the same width"
-
-
-def test_disabled_table_prints_nothing(capsys):
-    table = MetricTable(range(10), ("total",), disable=True, log_every=1)
-    for _ in table:
-        table.update_metrics({"total": 1.0})
-    table.close()
-    assert capsys.readouterr().out == ""
-
-
-def test_set_desc_is_silent_when_piped(capsys):
-    """Four phase changes per batch would be pure noise in a log."""
-    table = MetricTable(range(5), ("total",), log_every=100)
-    for _ in table:
-        table.set_desc("fwd")
-        table.set_desc("bwd")
-    table.close()
-    assert "fwd" not in capsys.readouterr().out
+    text = format_epoch_line(7, {"total": 1.0, "rot": 2.0, "pos": 3.0},
+                             {"total": 1.5, "rot": 2.5, "pos": 3.5},
+                             cols, lr=3e-4, seconds=12.3)
+    lines = text.splitlines()
+    assert len(lines) == 4
+    assert len(lines[1]) == len(lines[2]) == len(lines[3])
+    for name in cols:
+        assert name in lines[1]

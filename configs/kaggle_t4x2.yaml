@@ -55,17 +55,14 @@ optim:
   min_lr: 1.0e-6
 
 train:
-  # Sized on NODES ALONE, batch 16 looks free -- 16x6,000 is about the same
-  # node count as 4x22,500. It was not: stage-2 attention also scales with the
-  # number of FRAGMENTS in the batch, and real scenes carry 30-59 of them.
-  # Measured at batch 16: compute 2.95 s/batch against 0.83 at batch 4.
-  #
-  # Stage 2 now runs per scene rather than as one dense batch matrix, which
-  # removes the quadratic term. Batch 8 is the conservative setting until you
-  # have re-measured on your own card:
-  #   python scripts/profile_memory.py --sweep --fragments 40
-  batch_size: 8
-  accum_steps: 2
+  # Measured per sample on real runs, which is the only fair comparison:
+  #   batch  4 -> 0.208 s compute/sample
+  #   batch 16 -> 0.184 s compute/sample   <- best
+  # Larger batches amortise kernel-launch overhead; peak memory at batch 16 was
+  # 6.74 GiB of the 16 GiB card. Longer EPOCHS at batch 16 are not a
+  # regression -- each epoch simply covers 4x the samples.
+  batch_size: 16
+  accum_steps: 1
   steps_per_epoch: 150
   val_steps: 30
   amp: true
@@ -78,17 +75,23 @@ train:
   #                          can be re-run every session with no editing
   #   time_budget_hours      stops cleanly rather than being killed mid-epoch;
   #                          11.5 leaves room for the final checkpoint write
-  #   save_every: 1
-  # Numbered generations on top of last.pt, oldest pruned. Cheap insurance:
-  # each file is ~5 MB at 418k parameters.
-  snapshot_every: 10
+  #   # last.pt is rewritten every 10 epochs, replacing the previous one.
+  # best.pt is written ONLY when validation improves, so a good model is never
+  # overwritten by a worse later one. Those are the two files that matter.
+  save_every: 10
+  # Numbered generations are off: last.pt every 10 epochs already gives you a
+  # rolling restore point, and extra files only compete for the 20 GB quota.
+  snapshot_every: 0
   keep_snapshots: 3          a killed session then costs at most one epoch
   resume: auto
   time_budget_hours: 11.5
-  save_every: 1
-  # Numbered generations on top of last.pt, oldest pruned. Cheap insurance:
-  # each file is ~5 MB at 418k parameters.
-  snapshot_every: 10
+  # last.pt is rewritten every 10 epochs, replacing the previous one.
+  # best.pt is written ONLY when validation improves, so a good model is never
+  # overwritten by a worse later one. Those are the two files that matter.
+  save_every: 10
+  # Numbered generations are off: last.pt every 10 epochs already gives you a
+  # rolling restore point, and extra files only compete for the 20 GB quota.
+  snapshot_every: 0
   keep_snapshots: 3
   epochs: 3000
 

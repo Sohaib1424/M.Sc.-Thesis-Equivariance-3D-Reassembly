@@ -204,44 +204,15 @@ def test_head_dim_must_divide_out_channels():
 # ---------------------------------------------------------------------------
 # Stage 2 must not be quadratic in BATCH size.
 # ---------------------------------------------------------------------------
-def test_stage2_per_scene_matches_dense_masked():
-    """The optimization must change cost, not output.
-
-    Stage 2 used to build one (F*K, F*K) score matrix across the whole batch
-    and mask it to block-diagonal -- quadratic in batch size, with every
-    cross-scene entry computed and then discarded. Running each scene as its
-    own block gives the same numbers: masked-away entries contribute nothing.
-    """
-    torch.manual_seed(11)
-    sizes = [5, 7, 6, 9, 4, 8]
-    fragment_id = torch.cat([torch.full((n,), i) for i, n in enumerate(sizes)]).long()
-    F, N = len(sizes), sum(sizes)
-    scene_id = torch.tensor([0, 0, 1, 1, 2, 2])
-
-    block = VirtualNodeCommunicationBlock(C, num_slots=K, heads=H).eval()
-    x = torch.randn(N, C, 3)
-    with torch.no_grad():
-        out = block(x, fragment_id, F, fragment_scene_id=scene_id)
-
-    # Reference: run each scene entirely on its own, which is what the
-    # block-diagonal mask was meant to express.
-    parts = torch.zeros_like(out)
-    for scene in (0, 1, 2):
-        frags = torch.nonzero(scene_id == scene, as_tuple=True)[0]
-        node_mask = torch.isin(fragment_id, frags)
-        local_fragment_id = torch.searchsorted(frags, fragment_id[node_mask])
-        with torch.no_grad():
-            parts[node_mask] = block(
-                x[node_mask], local_fragment_id, len(frags),
-                fragment_scene_id=torch.zeros(len(frags), dtype=torch.long),
-            )
-
-    assert torch.allclose(out, parts, atol=1e-5), (out - parts).abs().max()
-
-
 def test_stage2_output_is_independent_of_batch_composition():
     """A scene's result must not depend on which other scenes share its batch.
-    If it does, training and single-scene inference disagree."""
+
+    This is the invariant the block-diagonal mask exists to guarantee, and it
+    is what matters -- not how the masking is implemented. An earlier version
+    ran each scene as its own loop iteration to avoid the masked-away FLOPs;
+    that was 3.1x slower per sample (many small kernels instead of one large
+    one) and has been reverted. The mask stays; this test pins the behaviour
+    either implementation must satisfy."""
     torch.manual_seed(12)
     block = VirtualNodeCommunicationBlock(C, num_slots=K, heads=H).eval()
 

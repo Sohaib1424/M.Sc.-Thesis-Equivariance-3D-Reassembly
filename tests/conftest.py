@@ -68,3 +68,21 @@ def batch() -> SceneBatch:
         make_scene(((5, 9), (13, 27)), seed=2),
         make_scene(((9, 17), (6, 11), (8, 14), (12, 22)), seed=3),
     ])
+
+
+def test_no_duplicate_test_names():
+    """
+    Two functions with the same name in one module: Python keeps the LAST, so
+    the earlier one never runs. That silently reverted an updated assertion
+    back to a stale one, which then failed against correct code. Cheap to
+    check, easy to miss by eye.
+    """
+    import ast
+    from collections import Counter
+
+    for path in sorted(Path(__file__).parent.glob("test_*.py")):
+        tree = ast.parse(path.read_text())
+        names = [n.name for n in tree.body
+                 if isinstance(n, ast.FunctionDef) and n.name.startswith("test_")]
+        dupes = [n for n, c in Counter(names).items() if c > 1]
+        assert not dupes, f"{path.name} defines these twice: {dupes}"

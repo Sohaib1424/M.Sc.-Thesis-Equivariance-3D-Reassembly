@@ -156,3 +156,38 @@ def test_oom_detection_recognises_both_spellings():
     assert T._is_oom(RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB"))
     assert T._is_oom(RuntimeError("CUDA error: out of memory"))
     assert not T._is_oom(RuntimeError("shape mismatch"))
+
+
+# --------------------------------------------------------------------------
+# Device resolution
+# --------------------------------------------------------------------------
+def test_resolve_device_adds_a_missing_index():
+    """
+    `torch.device("cuda")` has no index and `torch.cuda.set_device` rejects it.
+    The single-GPU path passed the config string straight through, so
+    `--num_gpus 1` died with "Expected a torch.device with a specified index".
+    """
+    from vngat.training.distributed import resolve_device
+
+    if torch.cuda.is_available():
+        assert resolve_device("cuda", rank=0) == torch.device("cuda:0")
+        assert resolve_device("cuda", rank=1) == torch.device("cuda:1")
+        assert resolve_device("cuda:1", rank=0) == torch.device("cuda:1")  # explicit wins
+    else:
+        assert resolve_device("cuda") == torch.device("cpu")   # graceful fallback
+
+
+def test_resolve_device_passes_cpu_through():
+    from vngat.training.distributed import resolve_device
+
+    assert resolve_device("cpu") == torch.device("cpu")
+
+
+def test_resolved_device_is_accepted_by_set_device():
+    """The end-to-end property that actually broke."""
+    from vngat.training.distributed import resolve_device
+
+    device = resolve_device("cuda", rank=0)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)          # must not raise
+        assert torch.cuda.current_device() == device.index

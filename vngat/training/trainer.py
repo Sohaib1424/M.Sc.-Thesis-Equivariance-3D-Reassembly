@@ -428,7 +428,7 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
     if distributed:
         device = D.setup(rank, world_size, cfg.master_port)
     else:
-        device = torch.device(cfg.device if torch.cuda.is_available() or cfg.device == "cpu" else "cpu")
+        device = D.resolve_device(cfg.device, rank)
         if device.type == "cuda":
             torch.cuda.set_device(device)
 

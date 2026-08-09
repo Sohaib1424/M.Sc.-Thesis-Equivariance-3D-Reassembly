@@ -51,6 +51,27 @@ import torch
 import torch.distributed as dist
 
 
+def resolve_device(spec: str, rank: int = 0) -> torch.device:
+    """
+    Turn a device string from the config into a concrete `torch.device`.
+
+    `torch.device("cuda")` carries NO index, and `torch.cuda.set_device` rejects
+    it with "Expected a torch.device with a specified index or an integer, but
+    got: cuda". The DDP path never hit this because it builds `cuda:{rank}`
+    explicitly; the single-GPU path passed `cfg.device` straight through and
+    failed the moment anyone ran with `--num_gpus 1`.
+
+    Also degrades to CPU when CUDA is requested but unavailable, so a config
+    written for Kaggle still runs on a laptop.
+    """
+    device = torch.device(spec)
+    if device.type != "cuda":
+        return device
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    return device if device.index is not None else torch.device(f"cuda:{rank}")
+
+
 def setup(rank: int, world_size: int, master_port: int = 12355, timeout_minutes: int = 30) -> torch.device:
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", str(master_port))

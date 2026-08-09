@@ -106,16 +106,6 @@ def test_cluster_consistency_keeps_parameters_connected_when_empty():
     assert emb.grad is not None and torch.equal(emb.grad, torch.zeros_like(emb))
 
 
-def test_cluster_consistency_averages_within_clusters_first():
-    """A 100-member cluster must not dominate a 2-member one by size alone."""
-    big = torch.zeros(100, 2)
-    small = torch.tensor([[1.0, 0.0], [-1.0, 0.0]])
-    emb = torch.cat([big, small])
-    cid = torch.cat([torch.zeros(100, dtype=torch.long), torch.ones(2, dtype=torch.long)])
-    value = float(cluster_consistency_loss(emb, cid))
-    assert abs(value - 0.5) < 1e-5     # mean of (0.0, 1.0)
-
-
 def test_composite_loss_reports_every_component():
     loss_fn = CompositeLoss()
     F, V, E = 3, 40, 60

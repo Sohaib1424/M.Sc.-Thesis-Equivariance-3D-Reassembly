@@ -401,7 +401,7 @@ def _report_batch_failure(micro: Dict, device: torch.device, err: Exception) -> 
             except RuntimeError:
                 mem = " (memory stats unavailable -- CUDA context likely broken)"
         write(
-            f"!! batch failed on {device}: {type(err).__name__}. "
+            f"!! batch failed on {device}: {type(err).__name__}: {err}\n   "
             f"{micro['target'].num_nodes} nodes, {micro['target'].num_edges} edges, "
             f"{micro['target'].num_fragments} fragments, {micro['num_scenes']} scene(s){mem}"
         )

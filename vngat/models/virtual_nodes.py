@@ -219,7 +219,8 @@ class VirtualNodeBlock(nn.Module):
         logits = torch.einsum('nkhci,nhci->nkh', q_node, k_up) * self.scale
         alpha = segment_softmax(logits, node_frag, num_fragments)          # (N, K, H)
         slots = segment_sum(
-            alpha[..., None, None] * v_up.unsqueeze(1), node_frag, num_fragments
+            alpha.to(v_up.dtype)[..., None, None] * v_up.unsqueeze(1),
+            node_frag, num_fragments,
         )                                                                  # (F, K, H, Ch, 3)
 
         # ---- Stage 2: cross-fragment exchange, through invariants only ----
@@ -247,7 +248,10 @@ class VirtualNodeBlock(nn.Module):
         # Softmax over the K slots of this vertex's own fragment: a plain
         # softmax over dim 1 IS the fragment-scoped one, because dk_node was
         # gathered by fragment -- no mask needed at all.
-        down_alpha = torch.softmax(down_logits, dim=1)
+        down_alpha = torch.softmax(down_logits, dim=1).to(dv_node.dtype)
+        # Same reason as the gat layer: autocast returns softmax in float32, and
+        # `down_alpha * dv_node` is (N, K, heads, C_h, 3) -- the widest tensor
+        # in this block. Cast the weights so the product stays in half.
         context = (down_alpha[..., None, None] * dv_node).sum(dim=1).reshape(N, C, 3)
 
         out = x + self.down_out(context)

@@ -103,7 +103,11 @@ class VNGATLayer(nn.Module):
         logits = logits + self.edge_scalar_to_bias(edge_scalar)
         alpha = segment_softmax(logits, dst, N)                           # (E, H)
 
-        msg = (v.index_select(0, src) + edge_v) * alpha[..., None, None]
+        # `.to(v.dtype)`: autocast promotes the `.sum()` above to float32, so
+        # `alpha` comes back float32 and would promote `msg` with it -- and
+        # `msg` is (2E, heads, C_h, 3), the widest tensor in the layer. Casting
+        # the weights, not the values, keeps the big one in half precision.
+        msg = (v.index_select(0, src) + edge_v) * alpha.to(v.dtype)[..., None, None]
         out = segment_sum(msg, dst, N).reshape(N, self.out_channels, 3)
 
         out = self.lin_out(out)

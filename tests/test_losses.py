@@ -1,6 +1,7 @@
 """Composite loss terms, including the degeneracy fix and the DDP zero."""
 from __future__ import annotations
 
+import pytest
 import torch
 
 from conftest import random_rotation
@@ -108,3 +109,88 @@ def test_composite_loss_reports_every_component():
 def test_zero_weight_removes_a_term():
     loss_fn = CompositeLoss(w_pos=0.0)
     assert loss_fn.weights["pos"] == 0.0
+
+
+def test_cluster_consistency_survives_mixed_precision_inputs():
+    """
+    Half-precision embeddings must not crash or return NaN.
+
+    Regression guard for a crash that only appeared under AMP: autocast
+    promotes `pow` and `sum` to float32, so the per-point term came back Float
+    while the accumulator had been allocated from the (Half) embedding dtype,
+    and `index_add_` refused the pair.
+    """
+    emb = torch.randn(40, 8, dtype=torch.float16)
+    cid = torch.randint(-1, 5, (40,))
+    loss = cluster_consistency_loss(emb, cid)
+    assert torch.isfinite(loss).all()
+    assert loss.dtype == torch.float32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="autocast needs CUDA")
+def test_full_loss_runs_under_autocast():
+    """
+    The whole composite loss inside `torch.autocast`, which is how the trainer
+    calls it. None of the other tests exercise this path -- and the smoke
+    config sets amp: false, so it does not either.
+    """
+    from conftest import random_rotation
+
+    device = torch.device("cuda")
+    loss_fn = CompositeLoss()
+    F_, V, E = 3, 60, 90
+    R_gt = random_rotation(F_).to(device)
+    with torch.autocast("cuda", dtype=torch.float16):
+        outputs = {
+            "R_pred": R_gt.clone(),
+            "x_pred": torch.randn(V, 3, device=device),
+            "n_pred": torch.randn(V, 3, device=device),
+            "mid_pred": torch.randn(E, 3, device=device),
+            "n1_pred": torch.randn(E, 3, device=device),
+            "n2_pred": torch.randn(E, 3, device=device),
+            # half, exactly as the embedding heads produce under autocast
+            "vertex_embedding": torch.randn(V, 8, device=device).half(),
+            "edge_embedding": torch.randn(E, 8, device=device).half(),
+        }
+        targets = {
+            "R_gt": R_gt,
+            "x_gt": torch.randn(V, 3, device=device),
+            "n_gt": torch.randn(V, 3, device=device),
+            "mid_gt": torch.randn(E, 3, device=device),
+            "n1_gt": torch.randn(E, 3, device=device),
+            "n2_gt": torch.randn(E, 3, device=device),
+            "vertex_cluster_id": torch.randint(-1, 4, (V,), device=device),
+            "edge_cluster_id": torch.randint(-1, 4, (E,), device=device),
+        }
+        out = loss_fn(outputs, targets)
+    for key in ("total", "rot", "rot_deg", "pos", "node", "mid", "face", "emb_v", "emb_e"):
+        assert torch.isfinite(out[key]).all(), f"{key} not finite under autocast"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="autocast needs CUDA")
+def test_model_forward_and_backward_under_autocast(scene):
+    """Full forward + backward under AMP -- the exact trainer configuration."""
+    from vngat.models.vn_gat import VNGATModel
+    from vngat.training.bridge import build_model_inputs, build_predictions, build_targets
+    from conftest import random_rotation
+
+    device = torch.device("cuda")
+    graph = scene.to(device)
+    model = VNGATModel(hidden_channels=16, num_layers=2, num_vn_slots=3,
+                       heads=2, embed_dim=8).to(device)
+    A = random_rotation(graph.num_fragments).to(device)
+    diffused = graph.rotate_per_fragment(A)
+    loss_fn = CompositeLoss()
+
+    with torch.autocast("cuda", dtype=torch.float16):
+        out = model(**build_model_inputs(diffused))
+        merged = dict(R_pred=out["R_pred"],
+                      vertex_embedding=out["vertex_embedding"],
+                      edge_embedding=out["edge_embedding"],
+                      **build_predictions(diffused, out["R_pred"]))
+        losses = loss_fn(merged, build_targets(graph, A, diffused))
+    losses["total"].backward()
+
+    assert torch.isfinite(losses["total"]).all()
+    missing = [n for n, p in model.named_parameters() if p.grad is None]
+    assert not missing, f"parameters received no gradient (breaks DDP): {missing}"

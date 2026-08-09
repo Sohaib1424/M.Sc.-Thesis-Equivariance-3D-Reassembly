@@ -96,23 +96,36 @@ def cluster_consistency_loss(embeddings: torch.Tensor, cluster_id: torch.Tensor)
     if embeddings.numel() == 0 or not bool(mask.any()):
         return embeddings.sum() * 0.0
 
+    # Everything below runs in float32 when the input is half precision.
+    #
+    # NOT just a precision preference -- without it this function CRASHES under
+    # AMP. Autocast promotes both `pow` and `sum` to float32 (they are on
+    # torch's float32 cast list), so `per_point` comes back Float while a buffer
+    # allocated from `emb.dtype` is Half, and `index_add_` rejects the pair with
+    # "self (Half) and source (Float) must have the same scalar type". Deriving
+    # every buffer from one accumulation dtype removes the whole class of
+    # mismatch rather than patching the one call that happened to raise.
     emb = embeddings[mask]
+    acc = torch.float32 if emb.dtype in (torch.float16, torch.bfloat16) else emb.dtype
+    emb = emb.to(acc)
+
     cid = cluster_id[mask]
     _, inverse = torch.unique(cid, return_inverse=True)
     num_clusters = int(inverse.max().item()) + 1
     D = emb.shape[-1]
 
-    sums = torch.zeros(num_clusters, D, device=emb.device, dtype=emb.dtype)
-    counts = torch.zeros(num_clusters, device=emb.device, dtype=emb.dtype)
+    # Integer counts: exact, and never a float accumulation to get wrong.
+    counts = torch.bincount(inverse, minlength=num_clusters).clamp_min(1).to(acc)
+
+    sums = torch.zeros(num_clusters, D, device=emb.device, dtype=acc)
     sums.index_add_(0, inverse, emb)
-    counts.index_add_(0, inverse, torch.ones_like(inverse, dtype=emb.dtype))
-    centroids = sums / counts.clamp_min(1).unsqueeze(-1)
+    centroids = sums / counts.unsqueeze(-1)
 
-    per_point = ((emb - centroids[inverse]) ** 2).sum(dim=-1)
+    per_point = ((emb - centroids[inverse]) ** 2).sum(dim=-1).to(acc)
 
-    cluster_sums = torch.zeros(num_clusters, device=emb.device, dtype=emb.dtype)
+    cluster_sums = torch.zeros(num_clusters, device=emb.device, dtype=acc)
     cluster_sums.index_add_(0, inverse, per_point)
-    return (cluster_sums / counts.clamp_min(1)).mean()
+    return (cluster_sums / counts).mean()
 
 
 class CompositeLoss(nn.Module):

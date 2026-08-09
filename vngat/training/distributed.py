@@ -57,15 +57,23 @@ def setup(rank: int, world_size: int, master_port: int = 12355, timeout_minutes:
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     import datetime
 
-    dist.init_process_group(
+    device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
+    kwargs = dict(
         backend=backend, rank=rank, world_size=world_size,
         timeout=datetime.timedelta(minutes=timeout_minutes),
     )
-    if torch.cuda.is_available():
-        device = torch.device(f"cuda:{rank}")
+    # Binding the rank to its device up front lets NCCL pick the right one for
+    # barriers instead of guessing from the current context (which it warns
+    # about) and removes a class of device-mismatch hang.
+    if device.type == "cuda":
+        try:
+            dist.init_process_group(device_id=device, **kwargs)
+        except (TypeError, ValueError):      # torch < 2.3 has no device_id
+            dist.init_process_group(**kwargs)
+    else:
+        dist.init_process_group(**kwargs)
+    if device.type == "cuda":
         torch.cuda.set_device(device)
-    else:  # pragma: no cover
-        device = torch.device("cpu")
     return device
 
 

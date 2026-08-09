@@ -66,31 +66,59 @@ def face_normal_loss(
     return _mean(term1 + term2)
 
 
-def cluster_consistency_loss(embeddings: torch.Tensor, cluster_id: torch.Tensor) -> torch.Tensor:
+def cluster_consistency_loss(
+    embeddings: torch.Tensor,
+    cluster_id: torch.Tensor,
+    pull_margin: float = 0.5,
+    push_margin: float = 1.5,
+    push_weight: float = 1.0,
+    reg_weight: float = 1e-3,
+    max_push_clusters: int = 512,
+) -> torch.Tensor:
     """
-    Interface-embedding consistency: mean squared distance of each cluster
-    member to its own cluster centroid, averaged within a cluster first (so a
-    large cluster does not dominate purely by member count) and then across
-    clusters. Zero if and only if every member of every cluster has an
-    identical embedding.
+    Discriminative interface-embedding loss (De Brabandere et al., 2017):
 
-    WHY NOT THE DESIGN DOCUMENT'S FORMULA. The document writes
-    `sum_x || sum_{(f,v) in C_V(x)} z_v^(f) ||^2`, which is minimised by
-    embeddings that CANCEL rather than agree: two identical embeddings (3, -1)
-    and (3, -1) score 40, while two maximally opposed ones (5, 0) and (-5, 0)
-    score 0. It rewards exactly the wrong thing.
+        pull_k = mean_{i in k} relu(||z_i - c_k|| - pull_margin)^2
+        push   = mean_{a != b} relu(2*push_margin - ||c_a - c_b||)^2
+        reg    = mean_k ||c_k||
+        L      = mean_k pull_k + push_weight * push + reg_weight * reg
 
-    DDP NOTE. When a batch happens to contain no shared vertices/edges at all,
-    this returns `embeddings.sum() * 0` rather than a fresh constant zero.
-    Numerically identical, but it keeps the embedding heads' parameters
-    connected to the graph so they receive a (zero) gradient. Without it those
-    parameters intermittently receive no gradient at all, and
-    DistributedDataParallel raises
-    "Expected to have finished reduction in the prior iteration" and dies.
-    The usual workaround, `find_unused_parameters=True`, costs a full graph
-    traversal every single step; keeping the graph connected costs nothing and
-    also guarantees every rank builds the identical reduction buckets, which
-    is what stops ranks from deadlocking against each other.
+    TWO DEGENERACIES, BOTH OBSERVED, BOTH FIXED HERE
+    ------------------------------------------------
+    1. The design document's `|| sum_{(f,v) in C(x)} z ||^2` is minimised by
+       embeddings that CANCEL rather than agree: (3, -1) with (3, -1) scores
+       40, while (5, 0) with (-5, 0) scores 0. It rewards disagreement.
+
+    2. Replacing it with plain within-cluster variance fixes that but leaves a
+       worse one: variance is zero for ANY CONSTANT embedding. Emitting the
+       same vector everywhere is a global minimum that encodes no geometry.
+       This is not hypothetical -- it is what the first training run did,
+       driving both embedding terms from 0.0030/0.0257 to exactly 0.0000
+       within two epochs while every other term stayed at chance.
+
+    The `push` term is what removes (2): collapsing all centroids together
+    makes it maximal. The hinges matter too -- `pull_margin` stops the pull
+    term demanding infinite precision once a cluster is tight enough, and
+    `2*push_margin` stops the push term from separating clusters that are
+    already far apart, so gradient goes to the pairs that are actually
+    confusable.
+
+    Note the minimum is NOT zero: `reg` is only zero when centroids sit at the
+    origin, which `push` opposes. Judge this term by whether it FALLS, not by
+    whether it reaches zero -- and treat an exact 0.0000 as the collapse alarm.
+
+    Why the embeddings must be good, not merely present: at inference the
+    translation solver finds correspondences by mutual nearest neighbours in
+    this space. Collapsed embeddings make every point equidistant from every
+    other, so the matching -- and with it the entire assembly stage -- is noise.
+
+    Points marked -1 ("shared with nothing") are excluded from every term. They
+    are not currently pushed AWAY from interface clusters, so a non-interface
+    point can still land near one; that is a known limitation, not an oversight.
+
+    DDP: returns a graph-connected zero when a batch contains no shared points
+    at all, so the embedding heads always receive a gradient and every rank
+    builds identical reduction buckets.
     """
     mask = cluster_id >= 0
     if embeddings.numel() == 0 or not bool(mask.any()):
@@ -100,11 +128,11 @@ def cluster_consistency_loss(embeddings: torch.Tensor, cluster_id: torch.Tensor)
     #
     # NOT just a precision preference -- without it this function CRASHES under
     # AMP. Autocast promotes both `pow` and `sum` to float32 (they are on
-    # torch's float32 cast list), so `per_point` comes back Float while a buffer
-    # allocated from `emb.dtype` is Half, and `index_add_` rejects the pair with
-    # "self (Half) and source (Float) must have the same scalar type". Deriving
-    # every buffer from one accumulation dtype removes the whole class of
-    # mismatch rather than patching the one call that happened to raise.
+    # torch's float32 cast list), so a per-point term comes back Float while a
+    # buffer allocated from `emb.dtype` is Half, and `index_add_` rejects the
+    # pair with "self (Half) and source (Float) must have the same scalar
+    # type". Deriving every buffer from one accumulation dtype removes the
+    # whole class of mismatch rather than patching the one call that raised.
     emb = embeddings[mask]
     acc = torch.float32 if emb.dtype in (torch.float16, torch.bfloat16) else emb.dtype
     emb = emb.to(acc)
@@ -121,11 +149,30 @@ def cluster_consistency_loss(embeddings: torch.Tensor, cluster_id: torch.Tensor)
     sums.index_add_(0, inverse, emb)
     centroids = sums / counts.unsqueeze(-1)
 
-    per_point = ((emb - centroids[inverse]) ** 2).sum(dim=-1).to(acc)
+    # -- pull: members toward their own centroid, averaged WITHIN a cluster
+    #    first so a large cluster cannot dominate by member count alone.
+    dist = (emb - centroids[inverse]).norm(dim=-1)
+    per_point = torch.relu(dist - pull_margin).pow(2).to(acc)
+    pull_sum = torch.zeros(num_clusters, device=emb.device, dtype=acc)
+    pull_sum.index_add_(0, inverse, per_point)
+    pull = (pull_sum / counts).mean()
 
-    cluster_sums = torch.zeros(num_clusters, device=emb.device, dtype=acc)
-    cluster_sums.index_add_(0, inverse, per_point)
-    return (cluster_sums / counts).mean()
+    # -- push: centroids apart. Subsampled above `max_push_clusters` because
+    #    this is the only O(C^2) term and a dense scene can produce thousands
+    #    of clusters; a random subset each step is an unbiased estimate.
+    push = pull.new_zeros(())
+    if num_clusters > 1:
+        picked = centroids
+        if num_clusters > max_push_clusters:
+            sel = torch.randperm(num_clusters, device=emb.device)[:max_push_clusters]
+            picked = centroids[sel]
+        n = picked.shape[0]
+        pairwise = torch.cdist(picked, picked)
+        off_diagonal = ~torch.eye(n, dtype=torch.bool, device=picked.device)
+        push = torch.relu(2 * push_margin - pairwise[off_diagonal]).pow(2).mean()
+
+    reg = centroids.norm(dim=-1).mean()
+    return pull + push_weight * push + reg_weight * reg
 
 
 class CompositeLoss(nn.Module):
@@ -138,12 +185,16 @@ class CompositeLoss(nn.Module):
         w_face: float = 1.0,
         w_emb_v: float = 1.0,
         w_emb_e: float = 1.0,
+        emb_pull_margin: float = 0.5,
+        emb_push_margin: float = 1.5,
     ):
         super().__init__()
         self.weights = dict(
             rot=w_rot, pos=w_pos, node=w_node, mid=w_mid,
             face=w_face, emb_v=w_emb_v, emb_e=w_emb_e,
         )
+        self.emb_pull_margin = emb_pull_margin
+        self.emb_push_margin = emb_push_margin
 
     def forward(self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         rot_angles = geodesic_rotation_loss(outputs["R_pred"], targets["R_gt"])
@@ -154,8 +205,11 @@ class CompositeLoss(nn.Module):
         l_face = face_normal_loss(
             outputs["n1_pred"], targets["n1_gt"], outputs["n2_pred"], targets["n2_gt"]
         )
-        l_emb_v = cluster_consistency_loss(outputs["vertex_embedding"], targets["vertex_cluster_id"])
-        l_emb_e = cluster_consistency_loss(outputs["edge_embedding"], targets["edge_cluster_id"])
+        margins = dict(pull_margin=self.emb_pull_margin, push_margin=self.emb_push_margin)
+        l_emb_v = cluster_consistency_loss(
+            outputs["vertex_embedding"], targets["vertex_cluster_id"], **margins)
+        l_emb_e = cluster_consistency_loss(
+            outputs["edge_embedding"], targets["edge_cluster_id"], **margins)
 
         w = self.weights
         total = (

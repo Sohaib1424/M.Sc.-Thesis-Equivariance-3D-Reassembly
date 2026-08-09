@@ -25,13 +25,36 @@ def test_normal_losses_peak_at_opposite_directions():
     assert abs(float(node_normal_loss(-n, n)) - 2.0) < 1e-5
 
 
-def test_cluster_consistency_is_zero_only_when_members_agree():
-    emb = torch.tensor([[1.0, 2.0], [1.0, 2.0], [5.0, 5.0], [5.0, 5.0]])
+def test_cluster_consistency_prefers_tight_clusters():
+    tight = torch.tensor([[3.0, 0.0], [3.0, 0.0], [-3.0, 0.0], [-3.0, 0.0]])
+    sloppy = torch.tensor([[3.0, 2.0], [3.0, -2.0], [-3.0, 2.0], [-3.0, -2.0]])
     cid = torch.tensor([0, 0, 1, 1])
-    assert float(cluster_consistency_loss(emb, cid)) < 1e-8
+    assert float(cluster_consistency_loss(tight, cid)) < float(
+        cluster_consistency_loss(sloppy, cid))
 
-    emb2 = torch.tensor([[1.0, 0.0], [-1.0, 0.0]])
-    assert float(cluster_consistency_loss(emb2, torch.tensor([0, 0]))) > 0.5
+
+def test_collapsed_embeddings_are_penalised():
+    """
+    THE regression guard. A constant embedding drives within-cluster variance
+    to exactly zero, so a pull-only loss rates it perfect -- and the first real
+    training run duly collapsed both embedding terms to 0.0000 within two
+    epochs. The repulsion term must make collapse the WORST outcome, not the
+    best.
+    """
+    cid = torch.tensor([0, 0, 1, 1])
+    good = torch.tensor([[3.0, 0.0], [3.0, 0.0], [-3.0, 0.0], [-3.0, 0.0]])
+    collapsed = torch.zeros(4, 2)
+    assert float(cluster_consistency_loss(collapsed, cid)) > float(
+        cluster_consistency_loss(good, cid))
+
+
+def test_disabling_repulsion_reproduces_the_collapse_degeneracy():
+    """Pins the causal link, so the fix cannot be removed without a failure."""
+    cid = torch.tensor([0, 0, 1, 1])
+    good = torch.tensor([[3.0, 0.0], [3.0, 0.0], [-3.0, 0.0], [-3.0, 0.0]])
+    collapsed = torch.zeros(4, 2)
+    assert float(cluster_consistency_loss(collapsed, cid, push_margin=0.0)) <= float(
+        cluster_consistency_loss(good, cid, push_margin=0.0)) + 1e-3
 
 
 def test_cluster_consistency_rejects_the_cancellation_degeneracy():
@@ -53,8 +76,20 @@ def test_cluster_consistency_rejects_the_cancellation_degeneracy():
 
 def test_cluster_consistency_ignores_unshared_points():
     emb = torch.tensor([[1.0, 1.0], [1.0, 1.0], [99.0, -99.0]])
-    cid = torch.tensor([0, 0, -1])
-    assert float(cluster_consistency_loss(emb, cid)) < 1e-8
+    with_unshared = cluster_consistency_loss(emb, torch.tensor([0, 0, -1]))
+    without = cluster_consistency_loss(emb[:2], torch.tensor([0, 0]))
+    assert abs(float(with_unshared) - float(without)) < 1e-6
+
+
+def test_cluster_consistency_averages_within_clusters_first():
+    """A 100-member cluster must not dominate a 2-member one by size alone."""
+    geometry = [[3.0, 0.0], [-3.0, 0.0]]
+    small = torch.tensor([geometry[0]] * 2 + [geometry[1]] * 2)
+    big = torch.tensor([geometry[0]] * 100 + [geometry[1]] * 2)
+    cid_small = torch.tensor([0, 0, 1, 1])
+    cid_big = torch.tensor([0] * 100 + [1, 1])
+    assert abs(float(cluster_consistency_loss(small, cid_small))
+               - float(cluster_consistency_loss(big, cid_big))) < 1e-6
 
 
 def test_cluster_consistency_keeps_parameters_connected_when_empty():

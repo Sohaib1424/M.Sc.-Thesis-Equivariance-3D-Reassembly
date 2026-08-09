@@ -462,6 +462,7 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
     loss_fn = CompositeLoss(
         w_rot=cfg.w_rot, w_pos=cfg.w_pos, w_node=cfg.w_node, w_mid=cfg.w_mid,
         w_face=cfg.w_face, w_emb_v=cfg.w_emb_v, w_emb_e=cfg.w_emb_e,
+        emb_pull_margin=cfg.emb_pull_margin, emb_push_margin=cfg.emb_push_margin,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

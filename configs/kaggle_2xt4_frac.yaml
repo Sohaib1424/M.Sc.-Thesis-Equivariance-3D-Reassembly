@@ -32,6 +32,8 @@ w_mid: 1.0
 w_face: 1.0
 w_emb_v: 1.0
 w_emb_e: 1.0
+emb_pull_margin: 0.5
+emb_push_margin: 1.5
 
 # ---- optimisation ----
 epochs: 400

@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+checkpoints/
+data/
+*.pt
+*.png
+*.glb
+.ipynb_checkpoints/

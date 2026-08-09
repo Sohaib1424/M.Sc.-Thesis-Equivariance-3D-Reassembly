@@ -1,0 +1,70 @@
+# Baseline configuration. Every field maps 1:1 to vngat/config.py and can be
+# overridden on the command line, e.g.
+#   python -m scripts.train --config configs/default.yaml --num_layers 6
+
+# ---- data ----
+root_dir: data
+input_source: full          # 'full' or 'frac'
+fracture_pattern: fractured_
+val_frac: 0.1
+test_frac: 0.1
+split_seed: 0
+max_scenes: 0               # 0 = whole split
+correspondence: true
+correspondence_tol: 1.0e-05
+min_fragments: 2
+
+# ---- model ----
+hidden_channels: 64
+num_layers: 4
+num_vn_slots: 8
+heads: 4
+embed_dim: 32
+gram_bottleneck: 16
+norm: layer
+grad_checkpointing: false
+
+# ---- loss weights (all untuned at 1.0) ----
+w_rot: 1.0
+w_pos: 1.0
+w_node: 1.0
+w_mid: 1.0
+w_face: 1.0
+w_emb_v: 1.0
+w_emb_e: 1.0
+
+# ---- optimisation ----
+epochs: 200
+batch_size: 4
+micro_batch_scenes: 1
+steps_per_epoch: 50
+val_steps: 10
+lr: 0.0003
+weight_decay: 1.0e-05
+grad_clip: 1.0
+amp: true
+lr_patience: 8
+lr_factor: 0.5
+seed: 0
+
+# ---- dataloading ----
+num_workers: 2
+prefetch_factor: 4
+pin_memory: true
+persistent_workers: true
+
+# ---- runtime ----
+num_gpus: 2
+device: cuda
+master_port: 12355
+time_budget_hours: 11.0
+
+# ---- checkpointing ----
+checkpoint_dir: checkpoints
+save_every: 10
+resume: auto
+drive_folder_id: ''
+drive_credentials: ''
+
+log_every: 1
+tag: vngat

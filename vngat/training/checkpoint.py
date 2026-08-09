@@ -90,6 +90,17 @@ class CheckpointManager:
         force: bool = False,
     ) -> Dict[str, bool]:
         """Returns {'rolling': bool, 'best': bool} -- what was actually written."""
+        # Update best_val BEFORE the state dict is built, so BOTH files record
+        # it. Previously the rolling checkpoint was written first and captured
+        # the pre-update value: resuming from `checkpoint.pt` then restored
+        # best_val = inf, so the very first validation of the new session
+        # always looked like a new best and overwrote `best.pt` -- silently
+        # destroying the best model from the previous session, which is exactly
+        # what keeping `best.pt` separate is supposed to prevent.
+        improved_best = val_loss < self.best_val
+        if improved_best:
+            self.best_val = val_loss
+
         state = {
             "model": _unwrap(model).state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -122,9 +133,7 @@ class CheckpointManager:
                 f"current train={train_loss:.4f}/val={val_loss:.4f} on both)"
             )
 
-        if val_loss < self.best_val:
-            self.best_val = val_loss
-            state["best_val"] = val_loss
+        if improved_best:
             _atomic_save(state, self.local(BEST_NAME))
             wrote["best"] = True
 

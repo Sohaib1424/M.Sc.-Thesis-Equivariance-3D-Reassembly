@@ -55,6 +55,9 @@ _MESSAGE_FILTERS = [
     (r".*You are using `torch\.load` with `weights_only=False`.*", FutureWarning),
     # torch.cuda.amp.* -> torch.amp.* migration noise on torch>=2.4.
     (r".*`torch\.cuda\.amp\.(autocast|GradScaler)\(.*\)` is deprecated.*", FutureWarning),
+    # index_reduce_ is flagged beta by torch; it is used deliberately in
+    # vngat/models/segment_ops.py and its semantics are pinned by tests.
+    (r".*index_reduce\(\) is in beta.*", UserWarning),
     # scipy 1.15 renamed Rotation.random(random_state=) -> rng=; we use a
     # compat shim, but trimesh/other libs may still hit it.
     (r".*`random_state` is deprecated.*", DeprecationWarning),

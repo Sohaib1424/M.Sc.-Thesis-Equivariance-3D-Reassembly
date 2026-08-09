@@ -259,23 +259,49 @@ def predict_rotation(a1: torch.Tensor, a2: torch.Tensor, eps: float = 1e-8) -> t
     return gram_schmidt_frame(a1, a2, eps=eps).transpose(-1, -2)
 
 
-def geodesic_rotation_loss(R_pred: torch.Tensor, R_gt: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+def geodesic_rotation_loss(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
     """
-    Geodesic angle on SO(3): theta = arccos((tr(R_pred^T R_gt) - 1) / 2), in
-    radians, shape (...,).
+    Geodesic angle on SO(3) in radians, shape (...,).
 
-    Always computed in float32 regardless of autocast: arccos near +/-1 has
-    unbounded slope, and in float16 the trace's rounding error alone is enough
-    to push the argument outside [-1, 1].
+    Computed as `atan2(sin(theta), cos(theta))` rather than
+    `arccos((tr - 1) / 2)`, taking
 
-    The eps clamp means a numerically perfect prediction floors out around
-    sqrt(2*eps) ~ 6e-4 rather than reaching exactly 0. That is an expected
-    consequence of the clamp, not a bug, and is irrelevant to training since
-    gradients there are already negligible.
+        cos(theta) = (tr(R) - 1) / 2
+        sin(theta) = ||[R32 - R23, R13 - R31, R21 - R12]|| / 2
+
+    (For R = exp(theta K), R - R^T = 2 sin(theta) K with K the unit-axis skew
+    matrix, and theta lies in [0, pi] so sin(theta) >= 0 and the branch is
+    unambiguous.)
+
+    Two reasons this matters, both practical rather than cosmetic:
+
+    * ARCCOS NEEDS A CLAMP AND THE CLAMP IS A FLOOR. Guarding the domain with
+      `clamp(-1 + eps, 1 - eps)` means a numerically perfect prediction reports
+      `sqrt(2 * eps)` instead of zero -- about 0.026 degrees at eps = 1e-7,
+      before float32 noise in the trace roughly doubles it. `atan2` needs no
+      clamp and returns exactly 0 for a perfect prediction.
+
+    * ARCCOS'S GRADIENT DIVERGES EXACTLY WHERE TRAINING ENDS UP. d/dx arccos(x)
+      is -1/sqrt(1 - x^2), which blows up as the prediction converges and
+      cos(theta) approaches 1 -- so this term's gradient grows without bound
+      the better the model gets, and after clipping it crowds out every other
+      loss term. The atan2 form has a bounded, well-behaved gradient
+      everywhere.
+
+    Always evaluated in at least float32: near theta = 0 the trace is the
+    difference of numbers close to 3, and float16 has nothing left to resolve it
+    with.
     """
     R_pred = _at_least_float32(R_pred)
     R_gt = _at_least_float32(R_gt).to(R_pred.dtype)
     R_diff = torch.matmul(R_pred.transpose(-1, -2), R_gt)
+
     trace = R_diff.diagonal(dim1=-2, dim2=-1).sum(-1)
-    cos_theta = ((trace - 1) / 2).clamp(-1 + eps, 1 - eps)
-    return torch.acos(cos_theta)
+    cos_theta = (trace - 1) / 2
+    axis = torch.stack([
+        R_diff[..., 2, 1] - R_diff[..., 1, 2],
+        R_diff[..., 0, 2] - R_diff[..., 2, 0],
+        R_diff[..., 1, 0] - R_diff[..., 0, 1],
+    ], dim=-1)
+    sin_theta = axis.norm(dim=-1) / 2
+    return torch.atan2(sin_theta, cos_theta)

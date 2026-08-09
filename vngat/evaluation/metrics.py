@@ -39,14 +39,17 @@ def _at_least_float32(x: torch.Tensor) -> torch.Tensor:
     return x.float() if x.dtype in _HALF else x
 
 
-def geodesic_angle(R_pred: torch.Tensor, R_gt: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
-    """(F,) rotation angle in DEGREES between predicted and ground truth."""
-    R_pred = _at_least_float32(R_pred)
-    R_gt = _at_least_float32(R_gt).to(R_pred.dtype)
-    diff = torch.matmul(R_pred.transpose(-1, -2), R_gt)
-    trace = diff.diagonal(dim1=-2, dim2=-1).sum(-1)
-    cos = ((trace - 1) / 2).clamp(-1 + eps, 1 - eps)
-    return torch.acos(cos) * (180.0 / torch.pi)
+def geodesic_angle(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
+    """
+    (F,) rotation angle in DEGREES between predicted and ground truth.
+
+    Shares the `atan2(sin, cos)` formulation used by the training loss (see
+    `vngat.models.vn_layers.geodesic_rotation_loss`), so a perfect prediction
+    reports 0 rather than the ~0.03 degree floor an `arccos` clamp imposes.
+    """
+    from ..models.vn_layers import geodesic_rotation_loss
+
+    return geodesic_rotation_loss(R_pred, R_gt) * (180.0 / torch.pi)
 
 
 def matrix_to_euler_xyz(R: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
@@ -84,23 +87,39 @@ def translation_rmse(t_pred: torch.Tensor, t_gt: torch.Tensor) -> torch.Tensor:
     return (t_pred - t_gt).pow(2).mean(dim=-1).sqrt()
 
 
-def chamfer_distance(a: torch.Tensor, b: torch.Tensor, chunk: int = 4096) -> torch.Tensor:
+def chamfer_distance(a: torch.Tensor, b: torch.Tensor, chunk: int = 1024) -> torch.Tensor:
     """
     Symmetric Chamfer distance between two (N, 3) / (M, 3) point sets.
 
-    Chunked so a dense fragment does not allocate an N x M distance matrix.
+    Works in SQUARED distances throughout, in float64, rather than taking
+    `torch.cdist(...)` and squaring the result. Two reasons:
+
+    * `cdist` reaches for a matmul expansion of ||x - y||^2 for speed. On
+      identical points the expansion cancels to a residual of order 1e-7 in
+      float32, and the sqrt turns that into ~4e-4 -- so two IDENTICAL clouds
+      score ~2e-7 instead of 0. Squaring the distance immediately afterwards
+      just undoes the sqrt while keeping its error.
+    * Clamping the squared distance at zero removes the negative residuals the
+      expansion can produce, which would otherwise become NaN under a sqrt.
+
+    Chamfer here is compared against a Part-Accuracy threshold of 0.01, so
+    float64 leaves roughly thirteen orders of magnitude of headroom instead of
+    five. Chunked so a dense fragment never allocates an N x M matrix.
     """
     if a.numel() == 0 or b.numel() == 0:
         return torch.tensor(float("nan"), device=a.device)
+    a64, b64 = a.double(), b.double()
 
     def one_way(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        y_sq = (y * y).sum(-1)
         total = x.new_zeros(())
         for start in range(0, x.shape[0], chunk):
-            d = torch.cdist(x[start:start + chunk], y)
-            total = total + d.min(dim=1).values.pow(2).sum()
+            block = x[start:start + chunk]
+            d2 = (block * block).sum(-1, keepdim=True) + y_sq.unsqueeze(0) - 2.0 * (block @ y.T)
+            total = total + d2.clamp_min(0).amin(dim=1).sum()
         return total / x.shape[0]
 
-    return one_way(a, b) + one_way(b, a)
+    return (one_way(a64, b64) + one_way(b64, a64)).to(a.dtype)
 
 
 def per_fragment_chamfer(

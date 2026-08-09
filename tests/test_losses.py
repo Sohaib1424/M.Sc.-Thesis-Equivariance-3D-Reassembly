@@ -64,7 +64,7 @@ def test_cluster_consistency_keeps_parameters_connected_when_empty():
     """
     emb = torch.randn(5, 4, requires_grad=True)
     loss = cluster_consistency_loss(emb, torch.full((5,), -1))
-    assert float(loss) == 0.0
+    assert float(loss.detach()) == 0.0
     assert loss.requires_grad and loss.grad_fn is not None
     loss.backward()
     assert emb.grad is not None and torch.equal(emb.grad, torch.zeros_like(emb))

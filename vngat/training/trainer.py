@@ -232,6 +232,9 @@ def run_phase(
         micro_batches = _make_micro_batches(batch, cfg.micro_batch_scenes)
         if train:
             optimizer.zero_grad(set_to_none=True)
+        # A factory: `model.no_sync` and `nullcontext` are both callables that
+        # return a FRESH context manager, which the OOM ladder requires.
+        make_sync = model.no_sync if (train and isinstance(model, DDP)) else nullcontext
 
         for micro_idx, micro in enumerate(micro_batches):
             # EVERY real micro-step runs under no_sync -- including the last.
@@ -243,11 +246,8 @@ def run_phase(
             # than its peers and the job hangs until NCCL times out. Deferring
             # the reduction to a step that cannot fail makes the OOM ladder
             # genuinely recoverable instead of merely appearing to be.
-            sync_ctx = (
-                model.no_sync() if (train and isinstance(model, DDP)) else nullcontext()
-            )
             losses, recovered, used_fallback = _run_micro_step(
-                model, raw_model, loss_fn, micro, device, cfg, train, scaler, sync_ctx,
+                model, raw_model, loss_fn, micro, device, cfg, train, scaler, make_sync,
                 scale=1.0 / len(micro_batches),
             )
             oom_recoveries += int(recovered)
@@ -341,12 +341,22 @@ def _sync_gradients(model, loss_fn, device, cfg, scaler) -> None:
     scaler.scale(losses["total"] * 0.0).backward()
 
 
-def _run_micro_step(model, raw_model, loss_fn, micro, device, cfg, train, scaler, sync_ctx, scale):
+def _run_micro_step(model, raw_model, loss_fn, micro, device, cfg, train, scaler, make_sync, scale):
     """
     Forward/backward for one micro-batch, with a two-step OOM ladder:
       1. retry the same scene with gradient checkpointing on;
       2. if it still will not fit, substitute the dummy scene so this rank
          performs the same number of backward passes as its peers.
+
+    `make_sync` is a FACTORY, not a context manager. `DistributedDataParallel.
+    no_sync()` returns a `contextlib._GeneratorContextManager`, which deletes
+    its own args/kwds/func on `__enter__` and therefore cannot be entered
+    twice -- re-entering one raises
+    "'_GeneratorContextManager' object has no attribute 'args'". Since this
+    loop may enter it up to three times, a fresh instance has to be built per
+    attempt. (`nullcontext` IS reusable, which is why the single-instance
+    version worked everywhere except the one path that matters: DDP plus an
+    actual out-of-memory retry.)
     """
     recovered = False
     used_fallback = False
@@ -357,7 +367,7 @@ def _run_micro_step(model, raw_model, loss_fn, micro, device, cfg, train, scaler
             scene = _dummy_scene(device) if attempt == 2 else prepare_scene(micro, device)
             if attempt == 1:
                 raw_model.grad_checkpointing = True
-            with sync_ctx:
+            with make_sync():
                 if train:
                     losses = _forward_loss(model, loss_fn, scene, device, cfg.amp)
                     scaler.scale(losses["total"] * scale).backward()

@@ -88,11 +88,32 @@ def main(argv=None) -> int:
         for f in sorted(split_dir.rglob("*")):
             if f.is_file():
                 try:
-                    lines = f.read_text().splitlines()
+                    lines = f.read_text(encoding="utf-8-sig").splitlines()
                     head = lines[0] if lines else "<empty>"
                     print(f"  {f.relative_to(split_dir)!s:<40} {len(lines):>7,} lines | first: {head}")
+                    # repr() so hidden characters -- BOM, CR, stray whitespace,
+                    # unexpected leading components -- are actually visible.
+                    for raw in lines[:2]:
+                        print(f"      raw: {raw!r}")
                 except (UnicodeDecodeError, OSError):
                     print(f"  {f.relative_to(split_dir)!s:<40} (binary)")
+
+    # Whether the official split entries actually resolve to what is on disk.
+    if split_dir.is_dir():
+        try:
+            from vngat.data.splits import load_official_split
+
+            for subset in ("everyday_compressed", "artifact_compressed"):
+                if not (root / subset).is_dir():
+                    continue
+                for which in ("train", "val"):
+                    try:
+                        got = load_official_split(str(root), which, [subset])
+                        print(f"  resolves: {subset} {which} -> {len(got):,} scenes")
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  {subset} {which} FAILED: {str(exc).splitlines()[0]}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  could not test official splits: {type(exc).__name__}: {exc}")
 
     # What the project's own scanner sees, for comparison.
     print("\n=== what vngat.data.splits.list_scene_directories currently finds ===")

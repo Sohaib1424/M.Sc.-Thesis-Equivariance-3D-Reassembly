@@ -125,52 +125,75 @@ def load_official_split(
             f"use split_source='hash' if your copy lacks them."
         )
 
-    # Index the scenes actually on disk by path tail, so the lookup works
-    # regardless of how deeply a subset happens to nest.
+    # Index the scenes on disk by every path suffix of 1..3 components, and
+    # match split entries the same way, most specific first. Matching by
+    # SUFFIX rather than by a fixed prefix convention means the lookup does not
+    # care how a subset nests, nor what token the split file happens to lead
+    # with -- `everyday/Cat/<hash>`, `artifact/<id>` and any variant of either
+    # all resolve, because object ids are unique.
     scenes = list_scene_directories(root, subsets)
-    by_tail: dict = {}
+    by_suffix: dict = {}
     for scene in scenes:
         parts = scene.relative_to(base).parts
         for k in (1, 2, 3):
             if len(parts) >= k:
-                by_tail.setdefault("/".join(parts[-k:]), []).append(scene)
+                by_suffix.setdefault("/".join(parts[-k:]), []).append(scene)
 
     selected: List[Path] = []
-    missing = 0
+    unmatched: List[str] = []
     seen: set = set()
-    for listing in sorted(split_dir.glob(f"*.{split}.txt")):
-        for line in listing.read_text().splitlines():
+    listings = sorted(split_dir.glob(f"*.{split}.txt"))
+    total_entries = 0
+
+    for listing in listings:
+        for line in listing.read_text(encoding="utf-8-sig").splitlines():
             entry = line.strip().strip("/")
             if not entry:
                 continue
-            tail = "/".join(Path(entry).parts[1:])       # drop the subset token
-            matches = by_tail.get(tail, [])
-            if not matches:
-                missing += 1
+            total_entries += 1
+            entry_parts = Path(entry).parts
+            resolved = None
+            for k in (3, 2, 1):                      # most specific first
+                if len(entry_parts) < k:
+                    continue
+                matches = by_suffix.get("/".join(entry_parts[-k:]), [])
+                if len(matches) == 1:
+                    resolved = matches[0]
+                    break
+                if len(matches) > 1:
+                    raise ValueError(
+                        f"'{entry}' matches {len(matches)} directories on disk "
+                        f"({[str(m) for m in matches[:3]]}). Restrict `data_subsets` to a "
+                        f"single variant -- the vanilla and volume-constrained copies "
+                        f"share object ids, so both match the same split entry."
+                    )
+            if resolved is None:
+                unmatched.append(entry)
                 continue
-            if len(matches) > 1:
-                raise ValueError(
-                    f"'{tail}' matches {len(matches)} directories on disk "
-                    f"({[str(m) for m in matches[:3]]}). Restrict `data_subsets` to a "
-                    f"single variant -- the vanilla and volume-constrained copies share "
-                    f"object ids, so both match the same split entry."
-                )
-            resolved = matches[0]
             if resolved not in seen:
                 seen.add(resolved)
                 selected.append(resolved)
 
     if not selected:
+        disk_examples = sorted(k for k in by_suffix if "/" in k)[:3] or sorted(by_suffix)[:3]
         raise ValueError(
-            f"No scenes from {split_dir}/*.{split}.txt were found on disk under the "
-            f"selected subsets {list(subsets) if subsets else 'ALL'}."
+            f"No scenes from {split_dir}/*.{split}.txt matched anything on disk.\n"
+            f"  split files read : {[f.name for f in listings]}\n"
+            f"  entries parsed   : {total_entries}\n"
+            f"  scenes on disk   : {len(scenes)} under subsets "
+            f"{list(subsets) if subsets else 'ALL'}\n"
+            f"  example entries  : {unmatched[:3]}\n"
+            f"  example on disk  : {disk_examples}\n"
+            f"Compare the two: the object ids should be identical. If they are not, the "
+            f"split lists describe a different copy of the dataset -- use "
+            f"split_source='hash' instead."
         )
-    if missing:
+    if unmatched:
         # Expected when a subset was not downloaded (e.g. `other`, 4,050 objects).
         from ..utils.progress import write
 
-        write(f"  [split] {missing} entries in the official {split} lists are not on "
-              f"disk (subsets not downloaded); using the {len(selected)} that are.")
+        write(f"  [split] {len(unmatched)} of {total_entries} official {split} entries are "
+              f"not on disk (subsets not downloaded); using the {len(selected)} that are.")
     return sorted(selected)
 
 

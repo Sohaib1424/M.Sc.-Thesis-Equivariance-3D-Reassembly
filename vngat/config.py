@@ -19,6 +19,13 @@ class Config:
     # ---------------- data ----------------
     root_dir: str = "data"
     """Directory holding everyday_compressed/ and/or artifact_compressed/."""
+    data_subsets: str = "everyday_compressed,artifact_compressed"
+    """Comma-separated top-level directories under `root_dir` to draw scenes
+    from. Empty string means EVERY scene found anywhere under root_dir --
+    including the `volume_constrained-*` trees, which are a different fracture
+    generation mode and are excluded by default so results stay comparable to
+    the standard benchmark. Run `python -m scripts.inspect_data` to see what
+    your copy actually contains."""
     input_source: str = "full"
     """'full' = train on complete fragment meshes; 'frac' = on the pruned
     fracture surfaces only. Losses and metrics are always evaluated on the full

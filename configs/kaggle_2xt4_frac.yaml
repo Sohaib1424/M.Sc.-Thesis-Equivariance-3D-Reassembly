@@ -4,6 +4,7 @@
 
 # ---- data ----
 root_dir: data
+data_subsets: everyday_compressed,artifact_compressed
 input_source: frac         # pruned fracture surfaces only
 fracture_pattern: fractured_
 val_frac: 0.1

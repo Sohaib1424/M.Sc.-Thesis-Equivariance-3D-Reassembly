@@ -80,6 +80,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader, BreakingBadD
         test_frac=cfg.test_frac,
         split_seed=cfg.split_seed,
         max_scenes=cfg.max_scenes,
+        subsets=[x for x in cfg.data_subsets.split(',') if x.strip()] or None,
         fracture_pattern=cfg.fracture_pattern or None,
         input_source=cfg.input_source,
         with_correspondence=cfg.correspondence,
@@ -130,6 +131,15 @@ def build_model(cfg: Config, device: torch.device) -> VNGATModel:
 
 
 # ---------------------------------------------------------------------------
+def _first_non_finite_parameter(model) -> str | None:
+    """Name of the first parameter containing NaN/inf, or None."""
+    target = model.module if isinstance(model, DDP) else model
+    for name, param in target.named_parameters():
+        if not bool(torch.isfinite(param).all()):
+            return name
+    return None
+
+
 def _dummy_scene(device: torch.device) -> Dict:
     """
     A minimal 1-fragment, 2-vertex, 1-edge scene.
@@ -218,6 +228,7 @@ def run_phase(
     max_nodes = max_edges = 0
     oom_recoveries = 0
     fallback_steps = 0
+    nan_skips = 0
 
     phase = "train" if train else "val"
     data_start = time.perf_counter()
@@ -246,12 +257,17 @@ def run_phase(
             # than its peers and the job hangs until NCCL times out. Deferring
             # the reduction to a step that cannot fail makes the OOM ladder
             # genuinely recoverable instead of merely appearing to be.
-            losses, recovered, used_fallback = _run_micro_step(
+            losses, recovered, used_fallback, skipped = _run_micro_step(
                 model, raw_model, loss_fn, micro, device, cfg, train, scaler, make_sync,
                 scale=1.0 / len(micro_batches),
             )
             oom_recoveries += int(recovered)
             fallback_steps += int(used_fallback)
+            if skipped:
+                # A NaN in the accumulator would make every reported metric NaN
+                # for the rest of the epoch, hiding whether training recovered.
+                nan_skips += 1
+                continue
             for key in _LOSS_KEYS:
                 totals[key] += float(losses[key].detach())
             num_micro += 1
@@ -288,6 +304,7 @@ def run_phase(
         "max_edges": float(max_edges),
         "oom_recoveries": float(oom_recoveries),
         "fallback_steps": float(fallback_steps),
+        "nan_skips": float(nan_skips),
     }
     return metrics, diagnostics
 
@@ -370,12 +387,30 @@ def _run_micro_step(model, raw_model, loss_fn, micro, device, cfg, train, scaler
             with make_sync():
                 if train:
                     losses = _forward_loss(model, loss_fn, scene, device, cfg.amp)
+                    # Check BEFORE backward. A non-finite loss produces
+                    # non-finite gradients, and although GradScaler normally
+                    # skips such a step, letting it near the optimiser at all
+                    # risks poisoning the weights -- after which every
+                    # subsequent forward is NaN and the run silently burns
+                    # hours producing nothing. Skipping is safe for DDP here
+                    # because the gradient all-reduce is fired by a separate
+                    # placeholder step, so the collective count per optimiser
+                    # step does not depend on how many micro-steps ran.
+                    if not bool(torch.isfinite(losses["total"])):
+                        bad = [k for k, v in losses.items()
+                               if not bool(torch.isfinite(v).all())]
+                        write(f"  [nan] non-finite loss {bad} -- skipping this micro-step. "
+                              f"{micro['target'].num_nodes} nodes, "
+                              f"{micro['target'].num_fragments} fragments, "
+                              f"scenes {micro.get('scene_dirs')}")
+                        raw_model.grad_checkpointing = checkpoint_was
+                        return losses, recovered, used_fallback, True
                     scaler.scale(losses["total"] * scale).backward()
                 else:
                     with torch.no_grad():
                         losses = _forward_loss(model, loss_fn, scene, device, cfg.amp)
             raw_model.grad_checkpointing = checkpoint_was
-            return losses, recovered, used_fallback
+            return losses, recovered, used_fallback, False
         except RuntimeError as err:
             raw_model.grad_checkpointing = checkpoint_was
             if not _is_oom(err) or attempt == 2:
@@ -540,6 +575,9 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
                             train_diag["data_seconds"], train_diag["compute_seconds"]))
             write(table_row(epoch, "val", val_metrics,
                             val_diag["data_seconds"], val_diag["compute_seconds"]))
+            if train_diag["nan_skips"]:
+                write(f"  [nan] skipped {int(train_diag['nan_skips'])} micro-step(s) "
+                      f"this epoch with non-finite losses")
             history.append("train", train_metrics)
             history.append("val", val_metrics)
             history.append_meta(
@@ -548,12 +586,24 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
                 train_compute_seconds=train_diag["compute_seconds"],
                 max_nodes=train_diag["max_nodes"],
                 oom_recoveries=train_diag["oom_recoveries"],
+                nan_skips=train_diag["nan_skips"],
                 epoch_seconds=time.perf_counter() - wall_start,
             )
 
+        # Weights themselves, not just the reported loss. Once a parameter is
+        # NaN every later forward is NaN and the run produces nothing -- there
+        # is no recovery, so continuing wastes the remainder of the session.
+        # Checked once per epoch: ~200 tiny kernels, unmeasurable.
+        corrupted = _first_non_finite_parameter(model)
+        if corrupted is not None:
+            write(f"!! [nan] parameter '{corrupted}' is non-finite -- the model is unrecoverable.")
+            write(f"   Stopping at epoch {epoch}. The last good checkpoint is still in "
+                  f"{cfg.checkpoint_dir}; resume from it with a lower --lr, and see the "
+                  f"[nan] skip lines above for which scenes produced non-finite losses.")
+
         elapsed = time.perf_counter() - wall_start
         out_of_time = elapsed > budget_seconds
-        last_epoch = epoch + 1 >= cfg.epochs
+        last_epoch = epoch + 1 >= cfg.epochs or corrupted is not None
         # Vote BEFORE the checkpoint/exit decision so every rank leaves the
         # loop together. A rank that decided alone would strand the others.
         stop_now = not D.all_ranks_agree(not (out_of_time or last_epoch), device)

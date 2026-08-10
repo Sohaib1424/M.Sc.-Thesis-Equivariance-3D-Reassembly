@@ -211,9 +211,14 @@ def gram_schmidt_frame(a1: torch.Tensor, a2: torch.Tensor, eps: float = 1e-8) ->
     # angle. Small activations are exactly what an untrained network produces.
     # Clamping leaves the normalisation exact for every ||a|| >= eps and only
     # guards the genuinely degenerate zero-vector case.
-    b1 = a1 / a1.norm(dim=-1, keepdim=True).clamp_min(eps)
+    # `sqrt(sum + eps^2)` rather than `norm().clamp_min(eps)`: clamping leaves
+    # the gradient of `.norm()` undefined at the zero vector, and `a2_orth` is
+    # exactly zero whenever the two predicted channels are parallel -- which an
+    # untrained head does produce. Folding eps inside the sqrt is smooth
+    # everywhere and still exact to machine precision for any ||a|| >> eps.
+    b1 = a1 / torch.sqrt(a1.pow(2).sum(-1, keepdim=True) + eps * eps)
     a2_orth = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
-    b2 = a2_orth / a2_orth.norm(dim=-1, keepdim=True).clamp_min(eps)
+    b2 = a2_orth / torch.sqrt(a2_orth.pow(2).sum(-1, keepdim=True) + eps * eps)
     b3 = torch.cross(b1, b2, dim=-1)
     return torch.stack([b1, b2, b3], dim=-1)
 
@@ -303,5 +308,12 @@ def geodesic_rotation_loss(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Te
         R_diff[..., 0, 2] - R_diff[..., 2, 0],
         R_diff[..., 1, 0] - R_diff[..., 0, 1],
     ], dim=-1)
-    sin_theta = axis.norm(dim=-1) / 2
+    # NOT `axis.norm(dim=-1)`. `axis` is exactly zero whenever the residual
+    # rotation is symmetric -- theta = 0 (a perfect prediction) or theta = pi
+    # (the worst possible one) -- and torch's `.norm()` has an UNDEFINED
+    # gradient there, which propagates NaN into every weight on the next step
+    # and never recovers. Folding eps inside the sqrt makes the gradient 0 at
+    # the origin instead of NaN, while leaving the value untouched to ~1e-13
+    # relative for any axis of realistic magnitude.
+    sin_theta = torch.sqrt(axis.pow(2).sum(-1) + 1e-12) / 2
     return torch.atan2(sin_theta, cos_theta)

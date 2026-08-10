@@ -24,8 +24,8 @@ ROOT = Path(__file__).resolve().parent.parent
 MARKERS = [
     ("rotation convention (F^T, not F)",
      "vngat/models/vn_layers.py", "return gram_schmidt_frame(a1, a2, eps=eps).transpose(-1, -2)"),
-    ("Gram-Schmidt clamps the norm",
-     "vngat/models/vn_layers.py", "a1.norm(dim=-1, keepdim=True).clamp_min(eps)"),
+    ("Gram-Schmidt normalises safely",
+     "vngat/models/vn_layers.py", "a1.pow(2).sum(-1, keepdim=True) + eps * eps"),
     ("geodesic angle via atan2",
      "vngat/models/vn_layers.py", "torch.atan2(sin_theta, cos_theta)"),
     ("segment reductions accumulate in fp32",
@@ -58,6 +58,14 @@ MARKERS = [
      "vngat/training/drive.py", "def verify"),
     ("Drive pre-flight script",
      "scripts/check_drive.py", "storagequota"),
+    ("assumption-free dataset discovery",
+     "vngat/data/splits.py", "for dirpath, dirnames, filenames in os.walk"),
+    ("data_subsets in Config",
+     "vngat/config.py", "data_subsets"),
+    ("NaN-safe norms (zero-vector gradient)",
+     "vngat/models/vn_layers.py", "axis.pow(2).sum(-1) + 1e-12"),
+    ("non-finite loss guard",
+     "vngat/training/trainer.py", "def _first_non_finite_parameter"),
 ]
 
 

@@ -80,12 +80,13 @@ def test_oom_retry_rebuilds_the_sync_context(monkeypatch):
 
     monkeypatch.setattr(T, "_forward_loss", flaky)
 
-    losses, recovered, used_fallback = T._run_micro_step(
+    losses, recovered, used_fallback, skipped = T._run_micro_step(
         model, model, loss_fn, _micro(scene), torch.device("cpu"), cfg,
         True, scaler, single_use_sync, scale=1.0,
     )
     assert recovered is True
     assert used_fallback is False           # the scene itself succeeded on retry
+    assert skipped is False
     assert calls["n"] == 2
     assert torch.isfinite(losses["total"]).all()
 
@@ -108,7 +109,7 @@ def test_second_oom_falls_back_to_the_placeholder_step(monkeypatch):
 
     monkeypatch.setattr(T, "_forward_loss", flaky)
 
-    losses, recovered, used_fallback = T._run_micro_step(
+    losses, recovered, used_fallback, skipped = T._run_micro_step(
         model, model, loss_fn, _micro(scene), torch.device("cpu"), cfg,
         True, scaler, single_use_sync, scale=1.0,
     )
@@ -191,3 +192,36 @@ def test_resolved_device_is_accepted_by_set_device():
     if device.type == "cuda":
         torch.cuda.set_device(device)          # must not raise
         assert torch.cuda.current_device() == device.index
+
+
+def test_non_finite_loss_is_skipped_not_propagated(monkeypatch):
+    """
+    A NaN loss must never reach backward. Poisoned weights are unrecoverable --
+    every later forward is NaN -- so the run would keep going for hours
+    producing nothing.
+    """
+    model, loss_fn, cfg, scaler = _setup()
+    original = T._forward_loss
+
+    def nan_loss(*args, **kwargs):
+        out = original(*args, **kwargs)
+        out["total"] = out["total"] * float("nan")
+        return out
+
+    monkeypatch.setattr(T, "_forward_loss", nan_loss)
+    losses, recovered, used_fallback, skipped = T._run_micro_step(
+        model, model, loss_fn, _micro(make_scene(seed=21)), torch.device("cpu"),
+        cfg, True, scaler, nullcontext, scale=1.0,
+    )
+    assert skipped is True
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_non_finite_parameter_is_detected():
+    model, _, _, _ = _setup()
+    from vngat.training.trainer import _first_non_finite_parameter
+
+    assert _first_non_finite_parameter(model) is None
+    with torch.no_grad():
+        model.rotation_head.map.weight[0, 0] = float("nan")
+    assert _first_non_finite_parameter(model) == "rotation_head.map.weight"

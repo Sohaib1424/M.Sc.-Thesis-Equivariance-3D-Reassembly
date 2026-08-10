@@ -16,6 +16,7 @@ symptom.
 from __future__ import annotations
 
 import hashlib
+import os
 import random
 from functools import lru_cache
 from pathlib import Path
@@ -24,45 +25,60 @@ from typing import List, Optional, Sequence
 _SPLITS = ("train", "val", "test")
 
 
-def list_scene_directories(root: str = "data", layouts: Optional[Sequence[dict]] = None) -> List[Path]:
-    """
-    All leaf scene directories across both Breaking Bad sources.
+MESH_FILE = "compressed_mesh.obj"
+DATA_FILE = "compressed_data.npz"
 
-    `everyday_compressed` nests one level deeper (category/shape) than
-    `artifact_compressed` (shape), hence the per-source `depth`. Missing
-    sources are skipped silently so a partial download still works.
-    """
-    if layouts is None:
-        layouts = [
-            {"path": f"{root}/everyday_compressed/everyday_compressed", "depth": 1},
-            {"path": f"{root}/artifact_compressed/artifact_compressed", "depth": 0},
-            # Tolerate the un-nested layouts people end up with after manual
-            # extraction, so a valid dataset is never reported as "empty".
-            {"path": f"{root}/everyday_compressed", "depth": 1},
-            {"path": f"{root}/artifact_compressed", "depth": 0},
-            {"path": f"{root}", "depth": 0},
-        ]
 
-    seen: set = set()
-    all_dirs: List[Path] = []
-    for entry in layouts:
-        base = Path(entry["path"])
-        if not base.exists():
-            continue
-        for d in sorted(base.iterdir()):
-            if not d.is_dir():
-                continue
-            candidates = [s for s in sorted(d.iterdir()) if s.is_dir()] if entry["depth"] == 1 else [d]
-            for cand in candidates:
-                if _is_scene_dir(cand) and cand.resolve() not in seen:
-                    seen.add(cand.resolve())
-                    all_dirs.append(cand)
-    return all_dirs
+def list_scene_directories(
+    root: str = "data",
+    subsets: Optional[Sequence[str]] = None,
+) -> List[Path]:
+    """
+    Every scene directory under `root`, found by walking rather than guessing.
+
+    A scene directory is any directory containing both `compressed_mesh.obj`
+    and `compressed_data.npz`. The walk PRUNES as soon as one is identified:
+    each scene holds ~100 fracture sub-directories, so descending into them
+    would turn a ~10k-directory walk into a ~1M-directory one.
+
+    This replaces a hardcoded table of (path, nesting depth) pairs, which was
+    wrong in two ways at once: it enumerated only `everyday_compressed` and
+    `artifact_compressed`, so the `volume_constrained-*` trees a full release
+    ships were never looked at; and it assumed an exact nesting depth per
+    source, silently finding nothing when the guess missed. Both failures were
+    SILENT -- a wrong guess produced a plausible but too-small scene count with
+    no warning, which is precisely the kind of error that survives into a
+    thesis's methodology section.
+
+    `subsets` restricts to named top-level directories (e.g.
+    ("everyday_compressed", "artifact_compressed") for the standard benchmark).
+    None or empty means every scene found anywhere under `root`.
+    """
+    base = Path(root)
+    if not base.exists():
+        return []
+
+    wanted = {s.strip() for s in subsets if s and s.strip()} if subsets else None
+
+    found: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        names = set(filenames)
+        if MESH_FILE in names and DATA_FILE in names:
+            path = Path(dirpath)
+            dirnames[:] = []                       # never descend into fractures
+            if wanted is not None:
+                relative = path.relative_to(base)
+                if not relative.parts or relative.parts[0] not in wanted:
+                    continue
+            found.append(path)
+        else:
+            dirnames.sort()                        # deterministic traversal order
+    return sorted(found)
 
 
 def _is_scene_dir(path: Path) -> bool:
     """A scene directory holds the compressed base mesh + piece mapping."""
-    return (path / "compressed_mesh.obj").is_file() and (path / "compressed_data.npz").is_file()
+    return (path / MESH_FILE).is_file() and (path / DATA_FILE).is_file()
 
 
 def assign_split(name: str, val_frac: float, test_frac: float, seed: int) -> str:
@@ -84,6 +100,7 @@ def _scene_pool_cached(
     test_frac: float,
     split_seed: int,
     max_scenes: int,
+    subsets: tuple = (),
 ) -> tuple:
     """
     The list of eligible scene directories for one split.
@@ -93,11 +110,13 @@ def _scene_pool_cached(
     `__getitem__` would dominate loading time. This caches *paths only*: no
     mesh, feature, or tensor data is ever retained.
     """
-    all_dirs = list_scene_directories(root)
+    all_dirs = list_scene_directories(root, subsets or None)
     if not all_dirs:
         raise FileNotFoundError(
-            f"No Breaking Bad scene directories found under '{root}'. A scene directory is one "
-            f"containing both 'compressed_mesh.obj' and 'compressed_data.npz'."
+            f"No Breaking Bad scene directories found under '{root}'"
+            + (f" restricted to subsets {list(subsets)}" if subsets else "")
+            + f". A scene directory is one containing both '{MESH_FILE}' and '{DATA_FILE}'. "
+            f"Run `python -m scripts.inspect_data --root {root}` to see what is actually there."
         )
     if split is None:
         pool = all_dirs
@@ -124,8 +143,11 @@ def scene_pool(
     test_frac: float = 0.1,
     split_seed: int = 0,
     max_scenes: int = 0,
+    subsets: Optional[Sequence[str]] = None,
 ) -> tuple:
-    return _scene_pool_cached(root, split, val_frac, test_frac, split_seed, max_scenes)
+    return _scene_pool_cached(
+        root, split, val_frac, test_frac, split_seed, max_scenes, tuple(subsets or ()),
+    )
 
 
 def get_random_directory(
@@ -135,6 +157,9 @@ def get_random_directory(
     test_frac: float = 0.1,
     split_seed: int = 0,
     max_scenes: int = 0,
+    subsets: Optional[Sequence[str]] = None,
 ) -> Path:
     """Uniformly random scene directory from the requested split."""
-    return random.choice(scene_pool(root, split, val_frac, test_frac, split_seed, max_scenes))
+    return random.choice(
+        scene_pool(root, split, val_frac, test_frac, split_seed, max_scenes, subsets)
+    )

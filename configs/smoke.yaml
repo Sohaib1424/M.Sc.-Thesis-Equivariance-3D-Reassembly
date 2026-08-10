@@ -7,6 +7,7 @@ root_dir: data
 data_subsets: everyday_compressed,artifact_compressed
 input_source: full          # 'full' or 'frac'
 fracture_pattern: fractured_
+split_source: hash
 val_frac: 0.1
 test_frac: 0.1
 split_seed: 0

@@ -152,6 +152,26 @@ The Gram–Schmidt head normalises by a *clamped* norm rather than `norm + eps`,
 which keeps `R_pred` orthogonal to machine precision instead of drifting by
 `eps/‖a‖` — 3% at small activations, which is what an untrained network emits.
 
+## Benchmark protocol
+
+The Breaking Bad release ships its own partition in `data_split/*.txt`
+(everyday: 407 train / 91 val; artifact: 164 / 40). Published leaderboards are
+computed on that exact partition, so `split_source: official` is required for
+any number quoted against them; the hash split is for when those lists are
+absent. There is no official TEST split -- evaluate on `val`.
+
+GARF reports two tables: the main one on the volume-constrained version, and a
+supplementary one on the vanilla version "to align with the settings of
+previous methods". The vanilla Everyday table is the relevant comparison for
+this project, and the nearest baseline in it is SE(3)-Equiv at 79.30 degrees
+RMSE(R). GARF-mini -- trained, like this model, on the Everyday subset alone --
+reaches 10.41.
+
+`volume_constrained-*` contains the SAME objects under a different fracture
+mode, not additional shapes, which is why `data_subsets` excludes it by
+default: mixing the two variants would double-count objects and make the
+official split lists ambiguous.
+
 ## Known open items
 
 - No run to convergence yet; loss weights are all 1.0 and untuned.

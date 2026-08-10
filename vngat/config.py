@@ -33,6 +33,12 @@ class Config:
     fracture_pattern: str = "fractured_"
     """Restrict which fracture sub-directories are drawn (e.g. 'fractured_' to
     exclude the mode_* variants). Empty string = all of them."""
+    split_source: str = "hash"
+    """'official' uses the benchmark's own data_split/*.txt lists -- required if
+    results are to be compared against published numbers, since the leaderboard
+    is computed on that exact partition. It provides TRAIN and VAL only (no
+    test split). 'hash' is a deterministic three-way split of whatever is on
+    disk, useful when the official lists are absent."""
     val_frac: float = 0.1
     test_frac: float = 0.1
     split_seed: int = 0

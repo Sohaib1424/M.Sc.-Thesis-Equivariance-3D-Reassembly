@@ -65,6 +65,7 @@ class BreakingBadDataset(Dataset):
         split_seed: int = 0,
         max_scenes: int = 0,
         subsets: Optional[List[str]] = None,
+        split_source: str = "hash",
         fracture_pattern: Optional[str] = None,
         input_source: str = "full",
         with_correspondence: bool = True,
@@ -83,6 +84,7 @@ class BreakingBadDataset(Dataset):
         self.split_seed = split_seed
         self.max_scenes = max_scenes
         self.subsets = subsets
+        self.split_source = split_source
         self.fracture_pattern = fracture_pattern
         self.input_source = input_source
         self.with_correspondence = with_correspondence
@@ -99,7 +101,7 @@ class BreakingBadDataset(Dataset):
     def pool_size(self) -> int:
         return len(scene_pool(
             self.root_dir, self.split, self.val_frac, self.test_frac,
-            self.split_seed, self.max_scenes, self.subsets,
+            self.split_seed, self.max_scenes, self.subsets, self.split_source,
         ))
 
     # ------------------------------------------------------------------
@@ -110,6 +112,7 @@ class BreakingBadDataset(Dataset):
                 self.root_dir, split=self.split, val_frac=self.val_frac,
                 test_frac=self.test_frac, split_seed=self.split_seed,
                 max_scenes=self.max_scenes, subsets=self.subsets,
+                split_source=self.split_source,
             )
             try:
                 sample = self._build_sample(scene_dir)

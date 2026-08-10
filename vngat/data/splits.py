@@ -81,6 +81,99 @@ def _is_scene_dir(path: Path) -> bool:
     return (path / MESH_FILE).is_file() and (path / DATA_FILE).is_file()
 
 
+# --------------------------------------------------------------------------
+# Official Breaking Bad splits
+# --------------------------------------------------------------------------
+SPLIT_DIR = "data_split"
+
+
+def load_official_split(
+    root: str,
+    split: str,
+    subsets: Optional[Sequence[str]] = None,
+) -> List[Path]:
+    """
+    Scene directories listed in the benchmark's own `data_split/*.txt` files.
+
+    Use these rather than the hash split whenever results are to be compared
+    against published numbers: the leaderboard everyone quotes is computed on
+    this exact partition, and a different one makes the comparison invalid no
+    matter how carefully the model is trained.
+
+    Each line looks like `everyday/BeerBottle/<hash>` or `artifact/<id>`, i.e.
+    a subset token followed by the path tail. Objects are matched by that tail,
+    so the same list selects either the vanilla or the volume-constrained copy
+    depending on which one `subsets` admits.
+
+    The benchmark ships TRAIN and VAL only -- there is no official test split.
+    Asking for one raises rather than silently inventing a partition.
+    """
+    if split == "test":
+        raise ValueError(
+            "The Breaking Bad release provides no official test split (only "
+            "*.train.txt and *.val.txt). Evaluate on --split val to match the "
+            "published tables, or use split_source='hash' for a three-way split."
+        )
+    if split not in ("train", "val"):
+        raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+
+    base = Path(root)
+    split_dir = base / SPLIT_DIR
+    if not split_dir.is_dir():
+        raise FileNotFoundError(
+            f"{split_dir} not found. The official splits ship with the dataset; "
+            f"use split_source='hash' if your copy lacks them."
+        )
+
+    # Index the scenes actually on disk by path tail, so the lookup works
+    # regardless of how deeply a subset happens to nest.
+    scenes = list_scene_directories(root, subsets)
+    by_tail: dict = {}
+    for scene in scenes:
+        parts = scene.relative_to(base).parts
+        for k in (1, 2, 3):
+            if len(parts) >= k:
+                by_tail.setdefault("/".join(parts[-k:]), []).append(scene)
+
+    selected: List[Path] = []
+    missing = 0
+    seen: set = set()
+    for listing in sorted(split_dir.glob(f"*.{split}.txt")):
+        for line in listing.read_text().splitlines():
+            entry = line.strip().strip("/")
+            if not entry:
+                continue
+            tail = "/".join(Path(entry).parts[1:])       # drop the subset token
+            matches = by_tail.get(tail, [])
+            if not matches:
+                missing += 1
+                continue
+            if len(matches) > 1:
+                raise ValueError(
+                    f"'{tail}' matches {len(matches)} directories on disk "
+                    f"({[str(m) for m in matches[:3]]}). Restrict `data_subsets` to a "
+                    f"single variant -- the vanilla and volume-constrained copies share "
+                    f"object ids, so both match the same split entry."
+                )
+            resolved = matches[0]
+            if resolved not in seen:
+                seen.add(resolved)
+                selected.append(resolved)
+
+    if not selected:
+        raise ValueError(
+            f"No scenes from {split_dir}/*.{split}.txt were found on disk under the "
+            f"selected subsets {list(subsets) if subsets else 'ALL'}."
+        )
+    if missing:
+        # Expected when a subset was not downloaded (e.g. `other`, 4,050 objects).
+        from ..utils.progress import write
+
+        write(f"  [split] {missing} entries in the official {split} lists are not on "
+              f"disk (subsets not downloaded); using the {len(selected)} that are.")
+    return sorted(selected)
+
+
 def assign_split(name: str, val_frac: float, test_frac: float, seed: int) -> str:
     """Stable hash-bucket assignment for one directory name."""
     h = int(hashlib.md5(f"{seed}:{name}".encode()).hexdigest(), 16)
@@ -101,6 +194,7 @@ def _scene_pool_cached(
     split_seed: int,
     max_scenes: int,
     subsets: tuple = (),
+    split_source: str = "hash",
 ) -> tuple:
     """
     The list of eligible scene directories for one split.
@@ -110,6 +204,14 @@ def _scene_pool_cached(
     `__getitem__` would dominate loading time. This caches *paths only*: no
     mesh, feature, or tensor data is ever retained.
     """
+    if split_source == "official":
+        if split is None:
+            raise ValueError("split_source='official' requires an explicit split")
+        pool = load_official_split(root, split, subsets or None)
+        if max_scenes and max_scenes > 0:
+            pool = sorted(pool, key=lambda d: hashlib.md5(f"sub:{d.name}".encode()).hexdigest())[:max_scenes]
+        return tuple(pool)
+
     all_dirs = list_scene_directories(root, subsets or None)
     if not all_dirs:
         raise FileNotFoundError(
@@ -144,9 +246,11 @@ def scene_pool(
     split_seed: int = 0,
     max_scenes: int = 0,
     subsets: Optional[Sequence[str]] = None,
+    split_source: str = "hash",
 ) -> tuple:
     return _scene_pool_cached(
-        root, split, val_frac, test_frac, split_seed, max_scenes, tuple(subsets or ()),
+        root, split, val_frac, test_frac, split_seed, max_scenes,
+        tuple(subsets or ()), split_source,
     )
 
 
@@ -158,8 +262,10 @@ def get_random_directory(
     split_seed: int = 0,
     max_scenes: int = 0,
     subsets: Optional[Sequence[str]] = None,
+    split_source: str = "hash",
 ) -> Path:
     """Uniformly random scene directory from the requested split."""
     return random.choice(
-        scene_pool(root, split, val_frac, test_frac, split_seed, max_scenes, subsets)
+        scene_pool(root, split, val_frac, test_frac, split_seed, max_scenes,
+                   subsets, split_source)
     )

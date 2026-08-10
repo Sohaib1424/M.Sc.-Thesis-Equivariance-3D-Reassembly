@@ -66,6 +66,8 @@ MARKERS = [
      "vngat/models/vn_layers.py", "axis.pow(2).sum(-1) + 1e-12"),
     ("non-finite loss guard",
      "vngat/training/trainer.py", "def _first_non_finite_parameter"),
+    ("official Breaking Bad splits",
+     "vngat/data/splits.py", "def load_official_split"),
 ]
 
 

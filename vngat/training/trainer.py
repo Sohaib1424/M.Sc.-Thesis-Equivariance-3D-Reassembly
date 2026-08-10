@@ -81,6 +81,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader, BreakingBadD
         split_seed=cfg.split_seed,
         max_scenes=cfg.max_scenes,
         subsets=[x for x in cfg.data_subsets.split(',') if x.strip()] or None,
+        split_source=cfg.split_source,
         fracture_pattern=cfg.fracture_pattern or None,
         input_source=cfg.input_source,
         with_correspondence=cfg.correspondence,

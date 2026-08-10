@@ -41,10 +41,66 @@ def walk_scene_dirs(root: Path):
     return found
 
 
+def _debug_split(root: Path) -> None:
+    """
+    Show the matcher's inputs side by side.
+
+    Also prints which `splits.py` is actually imported and its hash: a stale
+    file that still LOOKS current is indistinguishable from a logic bug from
+    the outside, and unzip restores archived timestamps, which can leave a
+    cached .pyc in play.
+    """
+    import hashlib
+
+    from vngat.data import splits as splits_mod
+
+    module_path = Path(splits_mod.__file__)
+    digest = hashlib.md5(module_path.read_bytes()).hexdigest()[:12]
+    print("\n=== official-split matcher debug ===")
+    print(f"  module        : {module_path}")
+    print(f"  md5           : {digest}")
+    print(f"  suffix matcher: {'present' if 'by_suffix' in module_path.read_text() else 'ABSENT (stale file)'}")
+
+    for subset in ("everyday_compressed", "artifact_compressed"):
+        if not (root / subset).is_dir():
+            continue
+        scenes = splits_mod.list_scene_directories(str(root), [subset])
+        print(f"\n  --- {subset}: {len(scenes)} scenes under this subset ---")
+        if not scenes:
+            print("    filter returned NOTHING -- the subset name does not match the "
+                  "top-level directory")
+            continue
+        keys = set()
+        for scene in scenes:
+            parts = scene.relative_to(root).parts
+            for k in (1, 2, 3):
+                if len(parts) >= k:
+                    keys.add("/".join(parts[-k:]))
+        for scene in scenes[:2]:
+            parts = scene.relative_to(root).parts
+            print(f"    disk : {'/'.join(parts)}")
+            print(f"           keys -> {[('/'.join(parts[-k:])) for k in (1, 2) if len(parts) >= k]}")
+
+        stem = subset.replace("_compressed", "")
+        listing = root / "data_split" / f"{stem}.train.txt"
+        if not listing.is_file():
+            print(f"    no {listing.name}")
+            continue
+        for line in listing.read_text(encoding="utf-8-sig").splitlines()[:3]:
+            entry = line.strip().strip("/")
+            parts = Path(entry).parts
+            tried = [("/".join(parts[-k:]), "/".join(parts[-k:]) in keys)
+                     for k in (3, 2, 1) if len(parts) >= k]
+            print(f"    entry: {entry!r}")
+            print(f"           tried -> {tried}")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--root", default="data")
     p.add_argument("--show", type=int, default=3, help="Example paths per subset.")
+    p.add_argument("--debug_split", action="store_true",
+                   help="Dump the exact keys the official-split matcher builds and looks up.")
     args = p.parse_args(argv)
 
     root = Path(args.root)
@@ -111,9 +167,14 @@ def main(argv=None) -> int:
                         got = load_official_split(str(root), which, [subset])
                         print(f"  resolves: {subset} {which} -> {len(got):,} scenes")
                     except Exception as exc:  # noqa: BLE001
-                        print(f"  {subset} {which} FAILED: {str(exc).splitlines()[0]}")
+                        print(f"  {subset} {which} FAILED:")
+                        for detail in str(exc).splitlines():
+                            print(f"      {detail}")
         except Exception as exc:  # noqa: BLE001
             print(f"  could not test official splits: {type(exc).__name__}: {exc}")
+
+    if args.debug_split and split_dir.is_dir():
+        _debug_split(root)
 
     # What the project's own scanner sees, for comparison.
     print("\n=== what vngat.data.splits.list_scene_directories currently finds ===")

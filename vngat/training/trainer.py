@@ -471,6 +471,16 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
     scaler = make_scaler(device, cfg.amp)
 
     drive = DriveSync(cfg.drive_folder_id, cfg.drive_credentials, enabled=is_main)
+    if is_main and drive.enabled:
+        # One real round trip now. Authentication succeeding says nothing about
+        # whether writes land, and discovering otherwise at the first checkpoint
+        # means ten epochs of a multi-hour run were never mirrored.
+        if drive.verify():
+            write(f"  [drive] mirroring verified ({drive.credential_kind})")
+        else:
+            write("!! [drive] configured but NOT working -- training will continue with "
+                  "LOCAL checkpoints only.")
+            write("   Run `python -m scripts.check_drive --folder_id ... ` for the diagnosis.")
     manager = CheckpointManager(cfg.checkpoint_dir, cfg.save_every, drive, cfg.tag)
     history = History()
     start_epoch = 0

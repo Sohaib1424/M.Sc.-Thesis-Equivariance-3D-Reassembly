@@ -12,27 +12,33 @@ resumable.
 AUTHENTICATION -- read this before configuring
 ----------------------------------------------
 Kaggle has no `google.colab.drive` mount, so authentication has to be
-non-interactive. Two supported routes:
+non-interactive.
 
-1. SERVICE ACCOUNT (recommended).
-   a. Google Cloud console -> create a project -> enable the Drive API.
-   b. Create a service account, create a JSON key, download it.
-   c. In your own Drive, create a folder for checkpoints. Share it with the
-      service account's email address (the `client_email` field of the JSON),
-      giving Editor access.
-      This step is NOT optional: a service account has no Drive storage quota
-      of its own, so it can only write into a folder shared from a real
-      account. Skipping it produces a confusing
-      "storageQuotaExceeded" error on the first upload.
-   d. Copy the folder id out of its URL
-      (drive.google.com/drive/folders/<THIS_PART>) into `drive_folder_id`.
-   e. Paste the JSON into a Kaggle Secret (Add-ons -> Secrets), then pass its
-      name as `drive_credentials`.
+USE OAUTH USER CREDENTIALS, NOT A SERVICE ACCOUNT, unless you have a Google
+Workspace Shared Drive. Google removed the storage quota from service
+accounts: a file a service account creates is OWNED by that service account,
+which has 0 bytes, so every upload fails with `storageQuotaExceeded` -- even
+when the target folder is shared with it, and even though authentication
+succeeds. Sharing the folder does not change file ownership and does not fix
+this.
 
-2. OAUTH REFRESH TOKEN. Store a JSON containing `client_id`,
-   `client_secret` and `refresh_token` in the same place. Files then land in
-   your own Drive under your own quota. Obtain it once locally with any OAuth
-   flow for the `drive.file` scope.
+  * OAUTH (works with a personal Gmail account). Run
+    `python -m scripts.drive_oauth_setup` on a machine WITH A BROWSER; it
+    performs the consent flow once and prints a JSON blob containing
+    `client_id`, `client_secret` and `refresh_token`. Paste that into a Kaggle
+    Secret and pass the secret's label as `drive_credentials`. Files are owned
+    by you and count against your own storage.
+
+  * SERVICE ACCOUNT (only useful with a Workspace Shared Drive, where the
+    drive owns the files rather than the account). Share the Shared Drive with
+    the service account's `client_email` as Content manager, and use the
+    Shared Drive folder id.
+
+Either way, `drive_folder_id` comes from the folder URL:
+drive.google.com/drive/folders/<THIS_PART>
+
+`python -m scripts.check_drive` does a real upload/find/delete round trip and
+names the specific problem if one exists. Run it before a long job.
 
 Everything degrades gracefully: if Drive is not configured, or the libraries
 are missing, or a call fails, training continues with local-only checkpoints
@@ -94,6 +100,8 @@ class DriveSync:
     def __init__(self, folder_id: str = "", credentials: str = "", enabled: bool = True):
         self.folder_id = folder_id
         self.service = None
+        self.credential_kind: Optional[str] = None
+        self.last_error: Optional[str] = None
         self.enabled = bool(enabled and folder_id)
         if not self.enabled:
             return
@@ -104,8 +112,7 @@ class DriveSync:
             self.enabled = False
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def _build_service(credentials_spec: str):
+    def _build_service(self, credentials_spec: str):
         from googleapiclient.discovery import build
 
         blob = _load_credentials_blob(credentials_spec)
@@ -117,8 +124,10 @@ class DriveSync:
         if blob.get("type") == "service_account":
             from google.oauth2 import service_account
 
+            self.credential_kind = "service account"
             creds = service_account.Credentials.from_service_account_info(blob, scopes=_SCOPES)
         else:
+            self.credential_kind = "oauth (user account)"
             from google.oauth2.credentials import Credentials
 
             creds = Credentials(
@@ -163,7 +172,11 @@ class DriveSync:
                 ).execute()
             return True
         except Exception as exc:  # noqa: BLE001
-            write(f"  [drive] upload of {remote_name} failed: {type(exc).__name__}: {exc}")
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            write(f"  [drive] upload of {remote_name} failed: {self.last_error}")
+            if "storageQuotaExceeded" in str(exc):
+                write("  [drive] service accounts have no Drive storage of their own; sharing the "
+                      "folder does not help. Run `python -m scripts.check_drive` for the options.")
             return False
 
     def download(self, remote_name: str, local_path: str) -> bool:
@@ -187,6 +200,40 @@ class DriveSync:
         except Exception as exc:  # noqa: BLE001
             write(f"  [drive] download of {remote_name} failed: {type(exc).__name__}: {exc}")
             return False
+
+    def delete(self, remote_name: str) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            file_id = self._find(remote_name)
+            if not file_id:
+                return False
+            self.service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            return False
+
+    def verify(self) -> bool:
+        """
+        Real upload/find/delete round trip.
+
+        Authenticating proves nothing about whether writes will land -- the
+        common failure authenticates fine and only fails at the first upload.
+        Called once at trainer start so that failure surfaces immediately
+        rather than at the first checkpoint, ten epochs in.
+        """
+        if not self.enabled:
+            return False
+        import tempfile
+
+        probe = Path(tempfile.gettempdir()) / "vngat_drive_verify.txt"
+        probe.write_text("probe")
+        if not self.upload(str(probe), "vngat_probe.txt"):
+            return False
+        ok = self.exists("vngat_probe.txt")
+        self.delete("vngat_probe.txt")
+        return ok
 
     def exists(self, remote_name: str) -> bool:
         if not self.enabled:

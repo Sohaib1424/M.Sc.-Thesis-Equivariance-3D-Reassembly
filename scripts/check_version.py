@@ -54,6 +54,10 @@ MARKERS = [
      "tests/test_losses.py", "test_collapsed_embeddings_are_penalised"),
     ("OOM recovery tests",
      "tests/test_trainer_recovery.py", "test_oom_retry_rebuilds_the_sync_context"),
+    ("Drive round-trip verification",
+     "vngat/training/drive.py", "def verify"),
+    ("Drive pre-flight script",
+     "scripts/check_drive.py", "storagequota"),
 ]
 
 

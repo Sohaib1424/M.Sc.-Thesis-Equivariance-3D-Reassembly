@@ -69,110 +69,113 @@ def face_normal_loss(
 def cluster_consistency_loss(
     embeddings: torch.Tensor,
     cluster_id: torch.Tensor,
-    pull_margin: float = 0.5,
-    push_margin: float = 1.5,
+    pull_margin: float = 0.1,
+    push_margin: float = 0.5,
     push_weight: float = 1.0,
-    reg_weight: float = 1e-3,
     max_push_clusters: int = 512,
 ) -> torch.Tensor:
     """
-    Discriminative interface-embedding loss (De Brabandere et al., 2017):
+    Discriminative interface-embedding loss on the UNIT SPHERE.
+
+    Embeddings are L2-normalised first, then:
 
         pull_k = mean_{i in k} relu(||z_i - c_k|| - pull_margin)^2
         push   = mean_{a != b} relu(2*push_margin - ||c_a - c_b||)^2
-        reg    = mean_k ||c_k||
-        L      = mean_k pull_k + push_weight * push + reg_weight * reg
+        L      = mean_k pull_k + push_weight * push
 
-    TWO DEGENERACIES, BOTH OBSERVED, BOTH FIXED HERE
-    ------------------------------------------------
+    THREE DEGENERACIES, ALL OBSERVED IN TRAINING, ALL FIXED HERE
+    ------------------------------------------------------------
     1. The design document's `|| sum_{(f,v) in C(x)} z ||^2` is minimised by
-       embeddings that CANCEL rather than agree: (3, -1) with (3, -1) scores
-       40, while (5, 0) with (-5, 0) scores 0. It rewards disagreement.
+       embeddings that CANCEL rather than agree.
 
-    2. Replacing it with plain within-cluster variance fixes that but leaves a
-       worse one: variance is zero for ANY CONSTANT embedding. Emitting the
-       same vector everywhere is a global minimum that encodes no geometry.
-       This is not hypothetical -- it is what the first training run did,
-       driving both embedding terms from 0.0030/0.0257 to exactly 0.0000
-       within two epochs while every other term stayed at chance.
+    2. Plain within-cluster variance is zero for ANY CONSTANT embedding, so the
+       model collapsed to a single vector within two epochs, encoding nothing.
+       The `push` term fixes that.
 
-    The `push` term is what removes (2): collapsing all centroids together
-    makes it maximal. The hinges matter too -- `pull_margin` stops the pull
-    term demanding infinite precision once a cluster is tight enough, and
-    `2*push_margin` stops the push term from separating clusters that are
-    already far apart, so gradient goes to the pairs that are actually
-    confusable.
+    3. But `push` on UNNORMALISED embeddings has an escape hatch of its own:
+       separating clusters by inflating their magnitude is easier than
+       arranging them, and a weak norm penalty does not stop it. A real run
+       drove mean centroid norm to ~565 while emb_v still looked healthy at
+       0.56. Squaring anything that large overflows float16 (max 65504) to
+       inf, and the first inf/inf produces NaN -- which is exactly what
+       happened, in bursts, from epoch 19 onward.
 
-    Note the minimum is NOT zero: `reg` is only zero when centroids sit at the
-    origin, which `push` opposes. Judge this term by whether it FALLS, not by
-    whether it reaches zero -- and treat an exact 0.0000 as the collapse alarm.
+       Normalising removes the escape hatch by construction: every embedding
+       has norm 1, all distances lie in [0, 2], and no setting of the weights
+       can make the term large. It also bounds the loss to O(1), so the
+       embedding objective can no longer dominate the gradient budget --
+       measured at 63% of the total at initialisation before this change,
+       against rotation's 15%, which is why the rotation error sat at chance
+       while the embedding terms fell.
 
-    Why the embeddings must be good, not merely present: at inference the
-    translation solver finds correspondences by mutual nearest neighbours in
-    this space. Collapsed embeddings make every point equidistant from every
-    other, so the matching -- and with it the entire assembly stage -- is noise.
+       As a bonus it is the right space for the inference-time matcher, which
+       compares descriptors by distance.
 
-    Points marked -1 ("shared with nothing") are excluded from every term. They
-    are not currently pushed AWAY from interface clusters, so a non-interface
-    point can still land near one; that is a known limitation, not an oversight.
+    Because distances are bounded by 2, `push_margin` must be below 1.0; the
+    default 0.5 asks for a separation of 1.0 between centroids. The minimum is
+    not zero and need not be -- judge this term by whether it FALLS, and treat
+    an exact 0.0000 as the collapse alarm.
 
-    DDP: returns a graph-connected zero when a batch contains no shared points
-    at all, so the embedding heads always receive a gradient and every rank
-    builds identical reduction buckets.
+    Points marked -1 ("shared with nothing") are excluded from every term.
+
+    DDP: returns a graph-connected zero when a batch contains no shared points,
+    so the embedding heads always receive a gradient and every rank builds
+    identical reduction buckets.
     """
     mask = cluster_id >= 0
     if embeddings.numel() == 0 or not bool(mask.any()):
         return embeddings.sum() * 0.0
 
-    # Everything below runs in float32 when the input is half precision.
-    #
-    # NOT just a precision preference -- without it this function CRASHES under
-    # AMP. Autocast promotes both `pow` and `sum` to float32 (they are on
-    # torch's float32 cast list), so a per-point term comes back Float while a
-    # buffer allocated from `emb.dtype` is Half, and `index_add_` rejects the
-    # pair with "self (Half) and source (Float) must have the same scalar
-    # type". Deriving every buffer from one accumulation dtype removes the
-    # whole class of mismatch rather than patching the one call that raised.
+    # float32 whenever the input is half. NOT just precision: autocast promotes
+    # `pow` and `sum` to float32, so a buffer allocated from a Half embedding
+    # dtype would meet a Float source and `index_add_` would reject the pair.
     emb = embeddings[mask]
     acc = torch.float32 if emb.dtype in (torch.float16, torch.bfloat16) else emb.dtype
     emb = emb.to(acc)
+
+    # `sqrt(sum + eps)` rather than `.norm()`: the latter has an undefined
+    # gradient at the zero vector, which an untrained head can produce.
+    emb = emb / torch.sqrt(emb.pow(2).sum(-1, keepdim=True) + 1e-12)
 
     cid = cluster_id[mask]
     _, inverse = torch.unique(cid, return_inverse=True)
     num_clusters = int(inverse.max().item()) + 1
     D = emb.shape[-1]
 
-    # Integer counts: exact, and never a float accumulation to get wrong.
     counts = torch.bincount(inverse, minlength=num_clusters).clamp_min(1).to(acc)
-
     sums = torch.zeros(num_clusters, D, device=emb.device, dtype=acc)
     sums.index_add_(0, inverse, emb)
     centroids = sums / counts.unsqueeze(-1)
 
     # -- pull: members toward their own centroid, averaged WITHIN a cluster
     #    first so a large cluster cannot dominate by member count alone.
-    dist = (emb - centroids[inverse]).norm(dim=-1)
+    dist = torch.sqrt((emb - centroids[inverse]).pow(2).sum(-1) + 1e-12)
     per_point = torch.relu(dist - pull_margin).pow(2).to(acc)
     pull_sum = torch.zeros(num_clusters, device=emb.device, dtype=acc)
     pull_sum.index_add_(0, inverse, per_point)
     pull = (pull_sum / counts).mean()
 
-    # -- push: centroids apart. Subsampled above `max_push_clusters` because
-    #    this is the only O(C^2) term and a dense scene can produce thousands
-    #    of clusters; a random subset each step is an unbiased estimate.
+    # -- push: centroids apart. Subsampled above `max_push_clusters`: this is
+    #    the only O(C^2) term and a dense scene yields thousands of clusters,
+    #    so a random subset each step is an unbiased estimate.
     push = pull.new_zeros(())
     if num_clusters > 1:
         picked = centroids
         if num_clusters > max_push_clusters:
             sel = torch.randperm(num_clusters, device=emb.device)[:max_push_clusters]
             picked = centroids[sel]
+        # NOT `torch.cdist(picked, picked)`. Its diagonal is an exact zero
+        # distance, where the gradient is 0/0 -- cdist against itself is a
+        # documented NaN-gradient trap, and masking the diagonal out of the
+        # FORWARD does not stop the backward from producing it.
+        sq = picked.pow(2).sum(-1)
+        d2 = sq.unsqueeze(1) + sq.unsqueeze(0) - 2.0 * (picked @ picked.t())
+        pairwise = torch.sqrt(d2.clamp_min(0) + 1e-12)
         n = picked.shape[0]
-        pairwise = torch.cdist(picked, picked)
         off_diagonal = ~torch.eye(n, dtype=torch.bool, device=picked.device)
         push = torch.relu(2 * push_margin - pairwise[off_diagonal]).pow(2).mean()
 
-    reg = centroids.norm(dim=-1).mean()
-    return pull + push_weight * push + reg_weight * reg
+    return pull + push_weight * push
 
 
 class CompositeLoss(nn.Module):
@@ -185,8 +188,8 @@ class CompositeLoss(nn.Module):
         w_face: float = 1.0,
         w_emb_v: float = 1.0,
         w_emb_e: float = 1.0,
-        emb_pull_margin: float = 0.5,
-        emb_push_margin: float = 1.5,
+        emb_pull_margin: float = 0.1,
+        emb_push_margin: float = 0.5,
     ):
         super().__init__()
         self.weights = dict(

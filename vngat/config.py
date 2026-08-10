@@ -71,13 +71,13 @@ class Config:
     w_face: float = 1.0
     w_emb_v: float = 1.0
     w_emb_e: float = 1.0
-    emb_pull_margin: float = 0.5
+    emb_pull_margin: float = 0.1
     """Cluster members closer than this to their centroid are already good
-    enough; stops the pull term demanding infinite precision."""
-    emb_push_margin: float = 1.5
-    """Centroids further apart than 2x this are left alone; keeps gradient on
-    the pairs that are actually confusable. Set to 0 to disable repulsion --
-    which reproduces the embedding collapse it exists to prevent."""
+    enough. Embeddings are L2-normalised, so distances lie in [0, 2]."""
+    emb_push_margin: float = 0.5
+    """Centroids further apart than 2x this are left alone. Must be below 1.0,
+    since normalised embeddings cannot be more than 2 apart. Set to 0 to
+    disable repulsion -- which reproduces the collapse it exists to prevent."""
 
     # ---------------- optimisation ----------------
     epochs: int = 200

@@ -69,10 +69,24 @@ class VNLeakyReLU(nn.Module):
         q = self.map_to_dir(x)
         if q.shape[-2] != x.shape[-2]:
             q = q.expand_as(x)
-        dot = (x * q).sum(dim=-1, keepdim=True)
-        q_sq = (q * q).sum(dim=-1, keepdim=True).clamp_min(EPS)
-        proj = (dot / q_sq) * q
-        return torch.where(dot >= 0, x, x - (1 - self.negative_slope) * proj)
+        # float32 for the inner products. `x * q` is elementwise and NOT on
+        # autocast's promotion list, so in float16 any activation above ~256
+        # overflows to inf here -- before the sum that would have been promoted.
+        # `dot` and `q_sq` then both become inf and `dot / q_sq` is NaN. This is
+        # the overflow that took a real run down once the embedding loss had
+        # inflated activations; the loss is bounded now, but a nonlinearity
+        # should not be the thing that breaks if activations ever grow again.
+        # `_at_least_float32`, not `.float()`: an unconditional cast would
+        # DOWNCAST a float64 model, which is exactly what the equivariance
+        # tests run in, and would silently drop their residual from ~1e-15 to
+        # ~1e-7 -- making a real regression indistinguishable from noise.
+        xf = _at_least_float32(x)
+        qf = _at_least_float32(q)
+        dot = (xf * qf).sum(dim=-1, keepdim=True)
+        q_sq = (qf * qf).sum(dim=-1, keepdim=True).clamp_min(EPS)
+        proj = (dot / q_sq) * qf
+        out = torch.where(dot >= 0, xf, xf - (1 - self.negative_slope) * proj)
+        return out.to(x.dtype)
 
 
 class VNLayerNorm(nn.Module):

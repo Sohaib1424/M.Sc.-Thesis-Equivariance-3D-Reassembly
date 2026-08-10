@@ -410,6 +410,15 @@ def _run_micro_step(model, raw_model, loss_fn, micro, device, cfg, train, scaler
                 else:
                     with torch.no_grad():
                         losses = _forward_loss(model, loss_fn, scene, device, cfg.amp)
+                    # Validation has no backward to protect, but a single
+                    # non-finite micro-step still poisons the running average
+                    # and reports the WHOLE epoch as nan -- hiding whether the
+                    # rest of validation was fine.
+                    if not bool(torch.isfinite(losses["total"])):
+                        write(f"  [nan] non-finite validation loss on "
+                              f"{micro.get('scene_dirs')} -- excluded from the average")
+                        raw_model.grad_checkpointing = checkpoint_was
+                        return losses, recovered, used_fallback, True
             raw_model.grad_checkpointing = checkpoint_was
             return losses, recovered, used_fallback, False
         except RuntimeError as err:
@@ -577,8 +586,14 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
             write(table_row(epoch, "val", val_metrics,
                             val_diag["data_seconds"], val_diag["compute_seconds"]))
             if train_diag["nan_skips"]:
-                write(f"  [nan] skipped {int(train_diag['nan_skips'])} micro-step(s) "
-                      f"this epoch with non-finite losses")
+                skipped = int(train_diag["nan_skips"])
+                attempted = skipped + cfg.steps_per_epoch * cfg.batch_size // max(cfg.micro_batch_scenes, 1)
+                write(f"  [nan] skipped {skipped} micro-step(s) this epoch "
+                      f"({100.0 * skipped / max(attempted, 1):.1f}%) with non-finite losses")
+                if skipped > 0.2 * attempted:
+                    write("   A skip rate this high is systematic, not an unlucky scene. "
+                          "Most likely activation overflow under AMP: retry with --amp false "
+                          "to confirm, and lower --lr.")
             history.append("train", train_metrics)
             history.append("val", val_metrics)
             history.append_meta(

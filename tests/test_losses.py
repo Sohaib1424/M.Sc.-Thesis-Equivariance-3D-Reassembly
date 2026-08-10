@@ -26,50 +26,63 @@ def test_normal_losses_peak_at_opposite_directions():
 
 
 def test_cluster_consistency_prefers_tight_clusters():
-    tight = torch.tensor([[3.0, 0.0], [3.0, 0.0], [-3.0, 0.0], [-3.0, 0.0]])
-    sloppy = torch.tensor([[3.0, 2.0], [3.0, -2.0], [-3.0, 2.0], [-3.0, -2.0]])
+    tight = torch.tensor([[1.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [-1.0, 0.0]])
+    sloppy = torch.tensor([[1.0, 0.4], [1.0, -0.4], [-1.0, 0.4], [-1.0, -0.4]])
     cid = torch.tensor([0, 0, 1, 1])
     assert float(cluster_consistency_loss(tight, cid)) < float(
         cluster_consistency_loss(sloppy, cid))
 
 
 def test_collapsed_embeddings_are_penalised():
-    """
-    THE regression guard. A constant embedding drives within-cluster variance
-    to exactly zero, so a pull-only loss rates it perfect -- and the first real
-    training run duly collapsed both embedding terms to 0.0000 within two
-    epochs. The repulsion term must make collapse the WORST outcome, not the
-    best.
-    """
+    """A constant embedding drives within-cluster variance to zero, so a
+    pull-only loss rates it perfect -- and a real run duly collapsed both
+    embedding terms to 0.0000 within two epochs."""
     cid = torch.tensor([0, 0, 1, 1])
-    good = torch.tensor([[3.0, 0.0], [3.0, 0.0], [-3.0, 0.0], [-3.0, 0.0]])
-    collapsed = torch.zeros(4, 2)
+    good = torch.tensor([[1.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [-1.0, 0.0]])
+    collapsed = torch.ones(4, 2)
     assert float(cluster_consistency_loss(collapsed, cid)) > float(
         cluster_consistency_loss(good, cid))
 
 
-def test_disabling_repulsion_reproduces_the_collapse_degeneracy():
-    """Pins the causal link, so the fix cannot be removed without a failure."""
+def test_inflating_embedding_magnitude_does_not_help():
+    """
+    THE second-order regression guard. With unnormalised embeddings, `push`
+    could be satisfied by scaling everything up rather than arranging it, and a
+    real run drove mean centroid norm to ~565 -- past the point where squaring
+    overflows float16, which produced NaN losses in bursts from epoch 19.
+    Normalising makes the loss exactly scale-invariant.
+    """
     cid = torch.tensor([0, 0, 1, 1])
-    good = torch.tensor([[3.0, 0.0], [3.0, 0.0], [-3.0, 0.0], [-3.0, 0.0]])
-    collapsed = torch.zeros(4, 2)
+    small = torch.tensor([[1.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [-1.0, 0.0]])
+    huge = small * 500.0
+    assert abs(float(cluster_consistency_loss(small, cid))
+               - float(cluster_consistency_loss(huge, cid))) < 1e-6
+
+
+def test_loss_is_bounded():
+    """Bounded by construction, so this term cannot dominate the gradient
+    budget -- it was 63% of the total at initialisation before normalising."""
+    torch.manual_seed(0)
+    worst = torch.ones(64, 16)                      # everything identical
+    cid = torch.arange(64) % 8
+    assert float(cluster_consistency_loss(worst, cid)) <= 1.01
+
+
+def test_disabling_repulsion_reproduces_the_collapse_degeneracy():
+    cid = torch.tensor([0, 0, 1, 1])
+    good = torch.tensor([[1.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [-1.0, 0.0]])
+    collapsed = torch.ones(4, 2)
     assert float(cluster_consistency_loss(collapsed, cid, push_margin=0.0)) <= float(
         cluster_consistency_loss(good, cid, push_margin=0.0)) + 1e-3
 
 
 def test_cluster_consistency_rejects_the_cancellation_degeneracy():
-    """
-    The design document's `|| sum z ||^2` scores opposed embeddings BETTER
-    than identical ones. This loss must do the reverse.
-    """
+    """The design document's `|| sum z ||^2` scores opposed embeddings BETTER
+    than identical ones. This loss must do the reverse."""
     identical = torch.tensor([[3.0, -1.0], [3.0, -1.0]])
     opposed = torch.tensor([[5.0, 0.0], [-5.0, 0.0]])
     cid = torch.tensor([0, 0])
-
-    doc_identical = float(identical.sum(0).pow(2).sum())
-    doc_opposed = float(opposed.sum(0).pow(2).sum())
-    assert doc_opposed < doc_identical            # the degeneracy, demonstrated
-
+    assert float(opposed.sum(0).pow(2).sum()) < float(identical.sum(0).pow(2).sum())
     assert float(cluster_consistency_loss(identical, cid)) < float(
         cluster_consistency_loss(opposed, cid))
 
@@ -83,13 +96,11 @@ def test_cluster_consistency_ignores_unshared_points():
 
 def test_cluster_consistency_averages_within_clusters_first():
     """A 100-member cluster must not dominate a 2-member one by size alone."""
-    geometry = [[3.0, 0.0], [-3.0, 0.0]]
+    geometry = [[1.0, 0.0], [-1.0, 0.0]]
     small = torch.tensor([geometry[0]] * 2 + [geometry[1]] * 2)
     big = torch.tensor([geometry[0]] * 100 + [geometry[1]] * 2)
-    cid_small = torch.tensor([0, 0, 1, 1])
-    cid_big = torch.tensor([0] * 100 + [1, 1])
-    assert abs(float(cluster_consistency_loss(small, cid_small))
-               - float(cluster_consistency_loss(big, cid_big))) < 1e-6
+    assert abs(float(cluster_consistency_loss(small, torch.tensor([0, 0, 1, 1])))
+               - float(cluster_consistency_loss(big, torch.tensor([0] * 100 + [1, 1])))) < 1e-6
 
 
 def test_cluster_consistency_keeps_parameters_connected_when_empty():

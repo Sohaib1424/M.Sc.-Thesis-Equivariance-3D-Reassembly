@@ -117,6 +117,29 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader, BreakingBadD
     return DataLoader(train_set, **loader_kwargs), DataLoader(val_set, **loader_kwargs), train_set
 
 
+def build_scheduler(cfg: Config, optimizer):
+    """
+    Returns (scheduler, needs_metric).
+
+    `plateau` watches `lr_monitor` on VALIDATION -- by default `rot`, the
+    primary objective, not `total`. Watching the composite total is what killed
+    a real run: face + norm + rot made up 4.95 of a 5.40 total and none of them
+    moved, so every epoch registered as a plateau and the rate was halved nine
+    times, ending 512x below where it started while the log gave no sign.
+    """
+    kind = (cfg.lr_schedule or "plateau").lower()
+    if kind == "constant":
+        return None, False
+    if kind == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(cfg.epochs, 1), eta_min=cfg.lr_min), False
+    if kind == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=cfg.lr_factor, patience=cfg.lr_patience,
+            min_lr=cfg.lr_min), True
+    raise ValueError(f"lr_schedule must be 'plateau', 'cosine' or 'constant', got {kind!r}")
+
+
 def build_model(cfg: Config, device: torch.device) -> VNGATModel:
     model = VNGATModel(
         hidden_channels=cfg.hidden_channels,
@@ -486,6 +509,8 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
     model = build_model(cfg, device)
 
     if is_main:
+        write(f"chance level: geodesic 126.47 deg. For rotationally symmetric objects a "
+              f"per-fragment canonicaliser floors near 90 deg (axis learnable, azimuth not).")
         write(f"VN-GAT | {model.num_parameters():,} parameters | hidden={cfg.hidden_channels} "
               f"layers={cfg.num_layers} heads={cfg.heads} slots={cfg.num_vn_slots} norm={cfg.norm}")
         write(f"input_source={cfg.input_source} | train pool={train_set.pool_size} scenes | "
@@ -510,9 +535,7 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
         emb_pull_margin=cfg.emb_pull_margin, emb_push_margin=cfg.emb_push_margin,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=cfg.lr_factor, patience=cfg.lr_patience,
-    )
+    scheduler, scheduler_needs_metric = build_scheduler(cfg, optimizer)
     scaler = make_scaler(device, cfg.amp)
 
     drive = DriveSync(cfg.drive_folder_id, cfg.drive_credentials, enabled=is_main)
@@ -578,13 +601,19 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
             train_metrics = D.reduce_metrics(train_metrics, device)
             val_metrics = D.reduce_metrics(val_metrics, device)
 
-        scheduler.step(val_metrics["total"])
+        if scheduler is not None:
+            if scheduler_needs_metric:
+                monitored = val_metrics.get(cfg.lr_monitor, val_metrics["total"])
+                scheduler.step(monitored)
+            else:
+                scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
 
         if is_main:
             write(table_row(epoch, "train", train_metrics,
-                            train_diag["data_seconds"], train_diag["compute_seconds"]))
+                            train_diag["data_seconds"], train_diag["compute_seconds"], current_lr))
             write(table_row(epoch, "val", val_metrics,
-                            val_diag["data_seconds"], val_diag["compute_seconds"]))
+                            val_diag["data_seconds"], val_diag["compute_seconds"], current_lr))
             if train_diag["nan_skips"]:
                 skipped = int(train_diag["nan_skips"])
                 attempted = skipped + cfg.steps_per_epoch * cfg.batch_size // max(cfg.micro_batch_scenes, 1)
@@ -597,7 +626,7 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
             history.append("train", train_metrics)
             history.append("val", val_metrics)
             history.append_meta(
-                lr=optimizer.param_groups[0]["lr"],
+                lr=current_lr,
                 train_data_seconds=train_diag["data_seconds"],
                 train_compute_seconds=train_diag["compute_seconds"],
                 max_nodes=train_diag["max_nodes"],
@@ -631,8 +660,9 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
                 history.to_dict(), cfg.to_dict(),
                 force=stop_now,
             )
-            tags = [k for k, v in wrote.items() if v] or ["nothing (older was better on both)"]
-            write(f"  [ckpt] epoch {epoch}: wrote {', '.join(tags)}")
+            tags = [k for k, v in wrote.items() if v]
+            write(f"  [ckpt] epoch {epoch}: wrote {', '.join(tags)}"
+                  + ("" if wrote["rolling"] else "  (checkpoint.pt held: older better on both)"))
 
         if stop_now:
             if is_main and out_of_time:

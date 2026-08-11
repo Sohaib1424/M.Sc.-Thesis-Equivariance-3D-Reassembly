@@ -92,8 +92,20 @@ class Config:
     weight_decay: float = 1e-5
     grad_clip: float = 1.0
     amp: bool = True
-    lr_patience: int = 8
+    lr_schedule: str = "plateau"
+    """'plateau' (ReduceLROnPlateau), 'cosine' (CosineAnnealingLR over `epochs`),
+    or 'constant'."""
+    lr_monitor: str = "rot"
+    """Which validation term the plateau scheduler watches. 'rot' is the primary
+    objective. 'total' is dominated by terms that barely move -- face + norm +
+    rot were 4.95 of a 5.40 total in a real run, so the remaining signal was
+    noise, every epoch looked like a plateau, and the learning rate was halved
+    nine times down to 2e-6."""
+    lr_patience: int = 20
     lr_factor: float = 0.5
+    lr_min: float = 1e-5
+    """Floor for every schedule. Below this nothing moves, so a mis-triggered
+    decay wastes the session instead of merely slowing it."""
     seed: int = 0
 
     # ---------------- dataloading ----------------

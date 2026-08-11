@@ -31,7 +31,10 @@ from torch.utils.data import DataLoader  # noqa: E402
 from vngat.assembly.translation import assemble  # noqa: E402
 from vngat.config import Config  # noqa: E402
 from vngat.data.dataset import BreakingBadDataset, collate_fn  # noqa: E402
-from vngat.evaluation.metrics import aggregate, evaluate_scene  # noqa: E402
+from vngat.evaluation.metrics import (  # noqa: E402
+    CHANCE_EULER_RMSE_DEG, CHANCE_GEODESIC_DEG, SYMMETRY_FLOOR_EULER_RMSE_DEG,
+    SYMMETRY_FLOOR_GEODESIC_DEG, aggregate, evaluate_scene,
+)
 from vngat.models.vn_gat import VNGATModel  # noqa: E402
 from vngat.training.bridge import build_model_inputs, ground_truth_rotation, prepare_scene  # noqa: E402
 from vngat.utils.env import dataloader_worker_init, seed_everything  # noqa: E402
@@ -122,16 +125,56 @@ def evaluate(args) -> dict:
             )
             kwargs_extra = {"num_matches": float(matches.src_idx.numel())}
 
-        metrics = evaluate_scene(R_pred, R_gt, pa_threshold=args.pa_threshold, **kwargs)
+        metrics = evaluate_scene(R_pred, R_gt, pa_threshold=args.pa_threshold,
+                                 symmetry_axis=args.symmetry_axis, **kwargs)
         metrics.update(kwargs_extra)
+        # Second-to-last path component is the category for the everyday
+        # layout (.../everyday_compressed/<Category>/<hash>).
+        parts = Path(batch["scene_dirs"][0]).parts
+        metrics["_category"] = parts[-2] if len(parts) >= 2 else "unknown"
         per_scene.append(metrics)
         bar.update(1)
     bar.close()
 
-    summary = aggregate(per_scene)
+    summary = aggregate([{k: v for k, v in m.items() if not k.startswith("_")}
+                         for m in per_scene])
     write("\n=== results ===")
     for key in sorted(summary):
         write(f"  {key:<24} {summary[key]:.5f}")
+
+    # Reference levels, so a number can be read against something.
+    write("\n=== reference levels ===")
+    write(f"  chance, geodesic         {CHANCE_GEODESIC_DEG:.2f} deg")
+    write(f"  chance, Euler RMSE       {CHANCE_EULER_RMSE_DEG:.2f} deg")
+    write(f"  symmetry floor, geodesic {SYMMETRY_FLOOR_GEODESIC_DEG:.2f} deg   "
+          f"(axis learnable from one fragment, azimuth about it is not)")
+    write(f"  symmetry floor, Euler    {SYMMETRY_FLOOR_EULER_RMSE_DEG:.2f} deg")
+    if "geodesic_deg" in summary:
+        captured = (CHANCE_GEODESIC_DEG - summary["geodesic_deg"])
+        available = CHANCE_GEODESIC_DEG - SYMMETRY_FLOOR_GEODESIC_DEG
+        write(f"\n  captured {captured:.2f} of the {available:.2f} deg available "
+              f"above the symmetry floor ({100 * captured / available:.1f}%)")
+    if "tilt_deg" in summary:
+        write(f"\n  tilt (off the {args.symmetry_axis}-axis)  {summary['tilt_deg']:.2f} deg   "
+              f"-> ~90 means the axis itself is not learned; ~0 means it is")
+        write(f"  twist (about the axis)   {summary['twist_deg']:.2f} deg   "
+              f"-> stays ~90 if the azimuth is genuinely unidentifiable")
+
+    if args.by_category:
+        from collections import defaultdict
+
+        groups = defaultdict(list)
+        for m in per_scene:
+            groups[m["_category"]].append(m)
+        write("\n=== by category ===")
+        write(f"  {'category':<22}{'n':>5}{'geodesic':>11}{'tilt':>9}{'twist':>9}")
+        for cat in sorted(groups, key=lambda c: aggregate(
+                [{k: v for k, v in m.items() if not k.startswith('_')}
+                 for m in groups[c]]).get("geodesic_deg", 1e9)):
+            agg = aggregate([{k: v for k, v in m.items() if not k.startswith("_")}
+                             for m in groups[cat]])
+            write(f"  {cat:<22}{len(groups[cat]):>5}{agg.get('geodesic_deg', float('nan')):>11.2f}"
+                  f"{agg.get('tilt_deg', float('nan')):>9.2f}{agg.get('twist_deg', float('nan')):>9.2f}")
 
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -154,6 +197,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max_match_points", type=int, default=4096)
     p.add_argument("--solve_translation", type=lambda s: s.lower() in ("1", "true", "yes"), default=True)
     p.add_argument("--collision", action="store_true")
+    p.add_argument("--symmetry_axis", type=str, default="z", choices=["x", "y", "z"],
+                   help="Canonical up-axis of the meshes, for the tilt/twist split. "
+                        "Try all three if unsure -- only the right one shows the signature.")
+    p.add_argument("--by_category", action="store_true",
+                   help="Break results down by object category (Bottle, Bowl, ...). "
+                        "Symmetric categories scoring worse than asymmetric ones is "
+                        "direct evidence for the azimuth-ambiguity explanation.")
     p.add_argument("--out", type=str, default="")
     return p
 

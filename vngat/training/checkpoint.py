@@ -36,6 +36,7 @@ from ..utils.progress import write
 from .drive import DriveSync
 
 ROLLING_NAME = "checkpoint.pt"
+LAST_NAME = "last.pt"
 BEST_NAME = "best.pt"
 HISTORY_NAME = "history.json"
 
@@ -120,7 +121,18 @@ class CheckpointManager:
             },
         }
 
-        wrote = {"rolling": False, "best": False}
+        wrote = {"rolling": False, "best": False, "last": False}
+
+        # ALWAYS written, and it is what `resume` reads.
+        #
+        # The rolling checkpoint honours "replace unless the stored one is
+        # better on BOTH losses", which is deliberate -- but it means
+        # checkpoint.pt can freeze. In a real run it stuck at epoch 69 while
+        # training continued to epoch 100, so resuming would have silently
+        # thrown away 31 epochs. `last.pt` is the newest resumable state and
+        # carries no policy; `checkpoint.pt` and `best.pt` keep their meaning.
+        _atomic_save(state, self.local(LAST_NAME))
+        wrote["last"] = True
 
         if force or self.is_improvement(train_loss, val_loss):
             _atomic_save(state, self.local(ROLLING_NAME))
@@ -140,6 +152,7 @@ class CheckpointManager:
         _write_history(self.local(HISTORY_NAME), history)
 
         if self.drive is not None and self.drive.enabled:
+            self.drive.upload(str(self.local(LAST_NAME)), self._remote(LAST_NAME))
             if wrote["rolling"]:
                 self.drive.upload(str(self.local(ROLLING_NAME)), self._remote(ROLLING_NAME))
             if wrote["best"]:
@@ -157,15 +170,20 @@ class CheckpointManager:
             path = Path(resume)
             return path if path.is_file() else None
 
-        local = self.local(ROLLING_NAME)
+        # Prefer last.pt: it is always current, whereas checkpoint.pt may have
+        # been held back by the replace-unless-better policy.
+        local = self.local(LAST_NAME)
         if self.drive is not None and self.drive.enabled:
             # Prefer the remote copy: after a session restart the local
             # directory is empty, and if it is NOT empty the remote is at worst
             # the same epoch (it is uploaded immediately after every local save).
-            if self.drive.download(self._remote(ROLLING_NAME), str(local)):
-                write(f"  [ckpt] pulled {self._remote(ROLLING_NAME)} from Google Drive")
+            if self.drive.download(self._remote(LAST_NAME), str(local)):
+                write(f"  [ckpt] pulled {self._remote(LAST_NAME)} from Google Drive")
                 self.drive.download(self._remote(HISTORY_NAME), str(self.local(HISTORY_NAME)))
-        return local if local.is_file() else None
+        if local.is_file():
+            return local
+        fallback = self.local(ROLLING_NAME)      # runs predating last.pt
+        return fallback if fallback.is_file() else None
 
     def load(
         self,

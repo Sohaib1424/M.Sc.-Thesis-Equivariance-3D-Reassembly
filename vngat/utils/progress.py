@@ -96,6 +96,7 @@ _COLUMNS = [
     ("emb_e", 8),
     ("data_s", 8),
     ("comp_s", 8),
+    ("lr", 10),
 ]
 
 
@@ -104,7 +105,8 @@ def table_header() -> str:
     return head + "\n" + "-" * len(head)
 
 
-def table_row(epoch: int, phase: str, metrics: dict, data_s: float, comp_s: float) -> str:
+def table_row(epoch: int, phase: str, metrics: dict, data_s: float, comp_s: float,
+              lr: float | None = None) -> str:
     def fmt(key: str, width: int) -> str:
         value = metrics.get(key)
         if value is None:
@@ -125,5 +127,9 @@ def table_row(epoch: int, phase: str, metrics: dict, data_s: float, comp_s: floa
         fmt("emb_e", 8),
         f"{data_s:.1f}".rjust(8),
         f"{comp_s:.1f}".rjust(8),
+        # The learning rate belongs in the table, not only in history.json: a
+        # schedule that quietly decays to nothing looks exactly like a model
+        # that has stopped learning.
+        ("-" if lr is None else f"{lr:.2e}").rjust(10),
     ]
     return "".join(cells)

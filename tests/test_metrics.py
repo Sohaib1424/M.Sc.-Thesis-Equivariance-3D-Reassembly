@@ -80,3 +80,87 @@ def test_evaluate_scene_omits_translation_metrics_when_unavailable():
     metrics = evaluate_scene(R, R)
     assert "rmse_R_euler_deg" in metrics and "geodesic_deg" in metrics
     assert "rmse_T" not in metrics and "part_accuracy" not in metrics
+
+
+# --------------------------------------------------------------------------
+# Swing-twist decomposition
+# --------------------------------------------------------------------------
+def test_pure_axis_rotation_is_all_twist():
+    """A rotation about the symmetry axis must register as twist, not tilt."""
+    from vngat.evaluation.metrics import swing_twist_error
+
+    eye = torch.eye(3).unsqueeze(0)
+    for deg in (0.0, 30.0, 90.0, 179.0):
+        tilt, twist = swing_twist_error(eye, _rot_z(deg), axis="z")
+        assert float(tilt) < 0.01, f"{deg}: tilt should be 0, got {float(tilt)}"
+        assert abs(float(twist) - deg) < 0.05
+
+
+def test_off_axis_rotation_is_all_tilt():
+    from vngat.evaluation.metrics import swing_twist_error
+
+    def rot_x(deg):
+        t = math.radians(deg)
+        return torch.tensor([[1.0, 0.0, 0.0],
+                             [0.0, math.cos(t), -math.sin(t)],
+                             [0.0, math.sin(t), math.cos(t)]]).unsqueeze(0)
+
+    for deg in (20.0, 60.0):
+        tilt, twist = swing_twist_error(torch.eye(3).unsqueeze(0), rot_x(deg), axis="z")
+        assert abs(float(tilt) - deg) < 0.05
+        assert float(twist) < 0.05
+
+
+def test_tilt_has_no_arccos_floor():
+    """
+    The regime this metric exists to detect is tilt ~ 0. An `arccos` clamp
+    reports 0.026 deg there, which would be indistinguishable from a genuinely
+    small tilt.
+    """
+    from vngat.evaluation.metrics import swing_twist_error
+
+    tilt, _ = swing_twist_error(torch.eye(3).unsqueeze(0), torch.eye(3).unsqueeze(0))
+    assert float(tilt) < 1e-3
+
+
+def test_swing_twist_separates_the_two_failure_regimes():
+    """Uniform residual -> tilt ~ 90. Azimuth-only residual -> tilt ~ 0."""
+    from vngat.evaluation.metrics import swing_twist_error
+
+    torch.manual_seed(0)
+    n = 4000
+    q = torch.randn(n, 4)
+    q = q / q.norm(dim=-1, keepdim=True)
+    w, x, y, z = q.unbind(-1)
+    uniform = torch.stack([
+        torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
+        torch.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
+        torch.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1),
+    ], dim=-2)
+    eye = torch.eye(3).expand(n, 3, 3)
+
+    tilt_uniform, _ = swing_twist_error(eye, uniform)
+    phi = (torch.rand(n) * 2 - 1) * math.pi
+    c, s_ = torch.cos(phi), torch.sin(phi)
+    zeros, ones = torch.zeros(n), torch.ones(n)
+    azimuth_only = torch.stack([
+        torch.stack([c, -s_, zeros], -1),
+        torch.stack([s_, c, zeros], -1),
+        torch.stack([zeros, zeros, ones], -1),
+    ], dim=-2)
+    tilt_azimuth, twist_azimuth = swing_twist_error(eye, azimuth_only)
+
+    assert float(tilt_uniform.mean()) > 80
+    assert float(tilt_azimuth.mean()) < 0.01
+    assert 80 < float(twist_azimuth.mean()) < 100
+
+
+def test_reference_levels_are_consistent():
+    from vngat.evaluation.metrics import (
+        CHANCE_EULER_RMSE_DEG, CHANCE_GEODESIC_DEG,
+        SYMMETRY_FLOOR_EULER_RMSE_DEG, SYMMETRY_FLOOR_GEODESIC_DEG,
+    )
+
+    assert abs(CHANCE_GEODESIC_DEG - (90 + 2 / math.pi * 180 / math.pi)) < 0.1
+    assert SYMMETRY_FLOOR_GEODESIC_DEG < CHANCE_GEODESIC_DEG
+    assert SYMMETRY_FLOOR_EULER_RMSE_DEG < CHANCE_EULER_RMSE_DEG

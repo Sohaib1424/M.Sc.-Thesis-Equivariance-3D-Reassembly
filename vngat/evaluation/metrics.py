@@ -82,6 +82,94 @@ def euler_rmse(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
     return angles.pow(2).mean(dim=-1).sqrt()
 
 
+# Reference levels, for reading any rotation number against something.
+CHANCE_GEODESIC_DEG = 126.47
+"""Mean geodesic angle between a rotation and a Haar-uniform one: pi/2 + 2/pi."""
+CHANCE_EULER_RMSE_DEG = 83.20
+"""Mean Euler RMSE of a Haar-uniform residual (Monte Carlo, 5e5 samples)."""
+SYMMETRY_FLOOR_GEODESIC_DEG = 89.9
+"""Floor for a per-fragment canonicaliser on a surface of revolution: the axis
+is learnable from one fragment, the azimuth about it is not, so the residual is
+a uniform rotation about that axis. Most of the Breaking Bad Everyday subset
+(bottles, bowls, cups, vases, rings) is of this kind."""
+SYMMETRY_FLOOR_EULER_RMSE_DEG = 51.9
+
+
+def matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
+    """(..., 3, 3) -> (..., 4) as (w, x, y, z), via Shepperd's branch selection.
+
+    Branching on the largest of the four candidate terms avoids the
+    catastrophic cancellation the naive `w = sqrt(1 + trace)/2` form suffers
+    near 180 degrees.
+    """
+    R = _at_least_float32(R)
+    m = [[R[..., i, j] for j in range(3)] for i in range(3)]
+    trace = m[0][0] + m[1][1] + m[2][2]
+    cand = torch.stack([
+        1 + trace,
+        1 + m[0][0] - m[1][1] - m[2][2],
+        1 - m[0][0] + m[1][1] - m[2][2],
+        1 - m[0][0] - m[1][1] + m[2][2],
+    ], dim=-1)
+    quats = torch.stack([
+        torch.stack([1 + trace, m[2][1] - m[1][2], m[0][2] - m[2][0], m[1][0] - m[0][1]], -1),
+        torch.stack([m[2][1] - m[1][2], 1 + m[0][0] - m[1][1] - m[2][2], m[0][1] + m[1][0], m[0][2] + m[2][0]], -1),
+        torch.stack([m[0][2] - m[2][0], m[0][1] + m[1][0], 1 - m[0][0] + m[1][1] - m[2][2], m[1][2] + m[2][1]], -1),
+        torch.stack([m[1][0] - m[0][1], m[0][2] + m[2][0], m[1][2] + m[2][1], 1 - m[0][0] - m[1][1] + m[2][2]], -1),
+    ], dim=-2)
+    pick = cand.argmax(dim=-1, keepdim=True).unsqueeze(-1).expand(*cand.shape[:-1], 1, 4)
+    q = torch.gather(quats, -2, pick).squeeze(-2)
+    return q / torch.sqrt(q.pow(2).sum(-1, keepdim=True) + 1e-12)
+
+
+def swing_twist_error(
+    R_pred: torch.Tensor,
+    R_gt: torch.Tensor,
+    axis: str = "z",
+) -> tuple:
+    """
+    Split the residual rotation into TILT (swing) off a symmetry axis and TWIST
+    about it. Returns (tilt_deg, twist_deg), both (F,).
+
+    This is the measurement that decides whether the model is failing for a
+    fixable reason or a structural one. If the objects are surfaces of
+    revolution then the azimuth about their axis is not identifiable from a
+    single fragment, so a perfectly-trained per-fragment model would show
+    TILT -> 0 with TWIST staying uniform (mean 90 deg). Tilt still near 90 means
+    the model has not learned even the axis, and there is real headroom left.
+
+    `axis` names the canonical up-axis of the dataset's meshes. Verify it for
+    your copy rather than trusting the default -- run the evaluation with each
+    of 'x', 'y', 'z' and see which one shows the signature.
+    """
+    residual = torch.matmul(_at_least_float32(R_pred).transpose(-1, -2),
+                            _at_least_float32(R_gt).to(_at_least_float32(R_pred).dtype))
+    index = {"x": 0, "y": 1, "z": 2}[axis]
+    a = torch.zeros(3, device=residual.device, dtype=residual.dtype)
+    a[index] = 1.0
+
+    # tilt: how far the axis itself is rotated.
+    rotated_axis = torch.matmul(residual, a)
+    # atan2(|a x Ra|, a.Ra), not arccos(a.Ra): the clamp arccos needs to stay in
+    # domain is a floor -- it reports 0.026 deg for an exactly-zero tilt, which
+    # is precisely the regime this metric exists to detect.
+    cos_tilt = (rotated_axis * a).sum(-1)
+    sin_tilt = torch.sqrt(torch.cross(a.expand_as(rotated_axis), rotated_axis, dim=-1)
+                          .pow(2).sum(-1) + 1e-12)
+    tilt = torch.atan2(sin_tilt, cos_tilt)
+
+    # twist: the component of the residual about `a`, by swing-twist
+    # decomposition of the quaternion (robust where a matrix construction is
+    # degenerate at 180 degrees).
+    q = matrix_to_quaternion(residual)
+    w, v = q[..., 0], q[..., 1:]
+    proj = (v * a).sum(-1)
+    twist_norm = torch.sqrt(w * w + proj * proj + 1e-12)
+    twist_angle = 2.0 * torch.atan2(proj.abs(), w.abs().clamp_min(1e-12))
+    twist_angle = torch.where(twist_norm > 1e-6, twist_angle, torch.zeros_like(twist_angle))
+    return tilt * (180.0 / torch.pi), twist_angle * (180.0 / torch.pi)
+
+
 def translation_rmse(t_pred: torch.Tensor, t_gt: torch.Tensor) -> torch.Tensor:
     """(F,) per-fragment RMSE over the three translation components."""
     return (t_pred - t_gt).pow(2).mean(dim=-1).sqrt()
@@ -156,6 +244,7 @@ def evaluate_scene(
     t_pred: Optional[torch.Tensor] = None,
     t_gt: Optional[torch.Tensor] = None,
     pa_threshold: float = 0.01,
+    symmetry_axis: str = "z",
 ) -> Dict[str, float]:
     """
     All metrics for one scene. Translation-dependent entries are omitted
@@ -169,6 +258,9 @@ def evaluate_scene(
         "geodesic_median_deg": float(geodesic_angle(R_pred, R_gt).median()),
         "num_fragments": float(num_fragments),
     }
+    tilt, twist = swing_twist_error(R_pred, R_gt, axis=symmetry_axis)
+    metrics["tilt_deg"] = float(tilt.mean())
+    metrics["twist_deg"] = float(twist.mean())
     if t_pred is not None and t_gt is not None:
         metrics["rmse_T"] = float(translation_rmse(t_pred, t_gt).mean())
     if pred_points is not None and gt_points is not None and point_frag is not None:

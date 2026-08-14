@@ -45,9 +45,11 @@ def limit_blas_threads(num_threads: int = 1) -> None:
 # -- `category` must be a class, not a tuple -- and a tuple there is an easy
 # way to "fix" warnings while actually fixing nothing. One call per category.
 _MESSAGE_FILTERS = [
-    # trimesh emits these on meshes with degenerate/duplicate faces, which the
-    # Breaking Bad fracture surfaces legitimately contain.
-    (r".*invalid value encountered in (divide|true_divide).*", RuntimeWarning),
+    # NOTE: "invalid value encountered in divide" is NOT filtered here.
+    # It is trimesh's signal that a zero-area triangle produced a NaN normal,
+    # and silencing it hid a real data defect until it surfaced as NaN losses
+    # mid-training. `vngat.data.features._sanitise` repairs and COUNTS those
+    # values instead, and the dataset reports them per scene.
     (r".*divide by zero encountered.*", RuntimeWarning),
     (r".*Mean of empty slice.*", RuntimeWarning),
     # torch.load without weights_only (we always pass it explicitly, but some

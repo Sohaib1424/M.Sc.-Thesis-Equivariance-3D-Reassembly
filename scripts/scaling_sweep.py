@@ -48,8 +48,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def run_one(count: int, args) -> dict:
-    out_dir = Path(args.out_dir) / f"scale_{count:04d}"
+def run_one(count: int, args, seed: int = 0) -> dict:
+    out_dir = Path(args.out_dir) / f"scale_{count:04d}_seed{seed}"
     # Steps scale with object count so every object gets the same number of
     # updates in every run. Without this the comparison measures budget, not N.
     total_steps = args.steps_per_object * count
@@ -59,7 +59,7 @@ def run_one(count: int, args) -> dict:
         "--config", args.config,
         "--root_dir", args.root_dir,
         "--checkpoint_dir", str(out_dir),
-        "--tag", f"scale{count}",
+        "--tag", f"scale{count}s{seed}",
         "--resume", "none",
         "--max_scenes", str(count),
         "--data_subsets", args.data_subsets,
@@ -73,8 +73,10 @@ def run_one(count: int, args) -> dict:
         "--lr_schedule", "constant",
         "--num_gpus", str(args.num_gpus),
         "--save_every", str(epochs),
-        "--time_budget_hours", str(args.time_budget_hours),
+        "--seed", str(seed),
     ]
+    if args.time_budget_hours > 0:
+        cmd += ["--time_budget_hours", str(args.time_budget_hours)]
     print(f"\n{'=' * 70}\n  {count} objects | {epochs} epochs | "
           f"{epochs * args.steps_per_epoch} steps "
           f"({epochs * args.steps_per_epoch / count:.0f} per object)\n{'=' * 70}", flush=True)
@@ -96,8 +98,12 @@ def run_one(count: int, args) -> dict:
     mean_y = sum(tail_q) / len(tail_q)
     denom = sum((x - mean_x) ** 2 for x in xs) or 1.0
     slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, tail_q)) / denom
+    achieved = len(deg) * args.steps_per_epoch / count
     return {
         "objects": count,
+        "seed": seed,
+        "requested_steps_per_object": args.steps_per_object,
+        "truncated": achieved < 0.95 * args.steps_per_object,
         "final_train_deg": sum(tail) / len(tail),
         "best_train_deg": min(deg),
         "first_train_deg": deg[0],
@@ -124,24 +130,62 @@ def main(argv=None) -> int:
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--num_gpus", type=int, default=2)
-    p.add_argument("--time_budget_hours", type=float, default=0.5)
+    p.add_argument("--time_budget_hours", type=float, default=0.0,
+                   help="0 means no cap. A per-run wall-clock cap SILENTLY truncates the "
+                        "large-N runs, which reintroduces exactly the budget confound this "
+                        "script exists to remove -- a 0.5h cap once gave 8 objects 43%% and "
+                        "32 objects 12%% of the requested per-object budget.")
+    p.add_argument("--seeds", type=int, nargs="+", default=[0],
+                   help="Repeat every count with these seeds. Run-to-run spread on the "
+                        "2-object control has been observed at 33 vs 69 deg from identical "
+                        "settings, which is larger than the effect being measured, so a "
+                        "single seed per point cannot separate the hypotheses.")
     p.add_argument("--out", default="/kaggle/working/scaling/summary.json")
     args = p.parse_args(argv)
 
-    results = [run_one(c, args) for c in args.counts]
+    results = [run_one(c, args, seed) for c in args.counts for seed in args.seeds]
 
     print(f"\n{'=' * 70}\n  SCALING SUMMARY\n{'=' * 70}")
-    print(f"  {'objects':>8} {'steps/obj':>10} {'first':>9} {'best':>9} {'final':>9} {'tail slope':>11}")
+    print(f"  {'objects':>8} {'seed':>5} {'steps/obj':>10} {'first':>9} {'best':>9} "
+          f"{'final':>9} {'tail slope':>11}  flags")
     for r in results:
         if "error" in r:
             print(f"  {r['objects']:>8} {r['error']}")
             continue
-        print(f"  {r['objects']:>8} {r['steps_per_object']:>10.0f} {r['first_train_deg']:>9.2f} "
-              f"{r['best_train_deg']:>9.2f} {r['final_train_deg']:>9.2f} "
-              f"{r['tail_slope_deg_per_epoch']:>+11.2f}")
+        flags = []
+        if r["truncated"]:
+            flags.append(f"TRUNCATED (got {r['steps_per_object']:.0f} of "
+                         f"{r['requested_steps_per_object']} steps/obj)")
+        if r["tail_slope_deg_per_epoch"] < -0.3:
+            flags.append("still descending")
+        print(f"  {r['objects']:>8} {r['seed']:>5} {r['steps_per_object']:>10.0f} "
+              f"{r['first_train_deg']:>9.2f} {r['best_train_deg']:>9.2f} "
+              f"{r['final_train_deg']:>9.2f} {r['tail_slope_deg_per_epoch']:>+11.2f}  "
+              f"{'; '.join(flags)}")
 
     print("\n  reference: chance 126.47 deg | symmetry floor ~90 deg")
     good = [r for r in results if "error" not in r]
+    truncated = [r for r in good if r["truncated"]]
+    if truncated:
+        print(f"\n  INVALID: {len(truncated)} run(s) were truncated before reaching the "
+              f"requested per-object budget. Object count and budget are confounded in "
+              f"this result -- re-run with --time_budget_hours 0 (the default) or a "
+              f"larger cap before reading anything from it.")
+
+    # Between-seed spread, where it can be measured, versus the between-N effect.
+    by_count: dict = {}
+    for r in good:
+        by_count.setdefault(r["objects"], []).append(r["best_train_deg"])
+    spreads = [max(v) - min(v) for v in by_count.values() if len(v) > 1]
+    if spreads:
+        print(f"\n  between-seed spread at a fixed object count: "
+              f"{min(spreads):.1f} to {max(spreads):.1f} deg")
+        print("  Any difference across counts smaller than this is not measurable "
+              "with these repeats.")
+    elif len(args.seeds) == 1:
+        print("\n  NOTE: one seed per point, so there is no estimate of run-to-run "
+              "noise here. Pass --seeds 0 1 2 before drawing conclusions.")
+
     still_falling = [r for r in good if r["tail_slope_deg_per_epoch"] < -0.3]
     if still_falling:
         print(f"\n  CAUTION: {len(still_falling)} run(s) were still descending at the cutoff "

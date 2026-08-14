@@ -205,6 +205,11 @@ class BreakingBadDataset(Dataset):
              + np.random.standard_normal((num_frags, 3)) * max_dim * 0.5).astype(np.float32)
         )
 
+        repaired = sum(getattr(g, "num_repaired", 0) for g in target_frags)
+        if repaired:
+            write(f"  [data] repaired {repaired} non-finite feature value(s) in "
+                  f"{scene_dir.name} (degenerate triangles in the source mesh)")
+
         return {
             "target": target_graph,
             "input": input_graph,
@@ -213,6 +218,7 @@ class BreakingBadDataset(Dataset):
             "scene_dir": str(scene_dir),
             "load_seconds": time.perf_counter() - t0,
             "frac_fallbacks": frac_fallbacks,
+            "num_repaired": repaired,
             "meshes": meshes if self.keep_meshes else None,
         }
 
@@ -239,6 +245,7 @@ def collate_fn(samples: List[Dict]) -> Dict:
         "scene_dirs": [s["scene_dir"] for s in samples],
         "load_seconds": float(sum(s["load_seconds"] for s in samples)),
         "frac_fallbacks": int(sum(s["frac_fallbacks"] for s in samples)),
+        "num_repaired": int(sum(s.get("num_repaired", 0) for s in samples)),
         "num_scenes": len(samples),
         "meshes": [s["meshes"] for s in samples] if samples[0]["meshes"] is not None else None,
     }

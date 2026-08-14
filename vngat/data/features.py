@@ -76,6 +76,30 @@ def _adjacent_face_normals(mesh: trimesh.base.Trimesh, num_edges: int) -> tuple:
     return n1, n2
 
 
+def _sanitise(array: np.ndarray, name: str, scene: str = "") -> tuple:
+    """
+    Replace non-finite entries with 0 and report how many there were.
+
+    trimesh derives vertex and face normals by dividing a cross product by its
+    own length, so a ZERO-AREA (degenerate) triangle gives 0/0 = NaN. Breaking
+    Bad base meshes do contain such triangles: in one 8-object training run,
+    three specific objects produced NaN losses repeatedly, under several
+    different fracture patterns each, across forty epochs. The NaN was in the
+    DATA before the model ever saw it.
+
+    Zeroing is the right repair for a normal: a zero vector contributes nothing
+    to the dot products the losses take, which is the correct treatment for a
+    face that has no well-defined orientation. Silently dropping it would not
+    be -- hence the count, which the dataset surfaces.
+    """
+    bad = ~np.isfinite(array)
+    count = int(bad.sum())
+    if count:
+        array = array.copy()
+        array[bad] = 0.0
+    return array, count
+
+
 def get_features(
     mesh: trimesh.base.Trimesh,
     vertex_cluster_ids: Optional[np.ndarray] = None,
@@ -104,6 +128,12 @@ def get_features(
     else:
         normals = np.zeros((0, 3), dtype=np.float32)
 
+    # Degenerate triangles make trimesh emit NaN normals; repair before they
+    # reach a tensor. `pos` is checked too, cheaply, since a NaN vertex would
+    # be just as fatal and just as invisible.
+    pos, bad_pos = _sanitise(pos, "position")
+    normals, bad_normals = _sanitise(normals, "vertex normal")
+
     node_vec = torch.from_numpy(np.stack([pos, normals], axis=1))     # (V, 2, 3)
 
     if vertex_cluster_ids is None:
@@ -115,7 +145,7 @@ def get_features(
     num_e = int(edges_unique.shape[0])
 
     if num_e == 0:
-        return FragmentGraph(
+        empty = FragmentGraph(
             node_vec=node_vec,
             edge_index=torch.zeros((2, 0), dtype=torch.long),
             edge_len=torch.zeros((0, 1), dtype=torch.float32),
@@ -124,6 +154,8 @@ def get_features(
             vertex_cluster_id=v_clusters,
             edge_cluster_id=torch.zeros((0,), dtype=torch.long),
         )
+        empty.num_repaired = bad_pos + bad_normals
+        return empty
 
     u = edges_unique[:, 0]
     v = edges_unique[:, 1]
@@ -133,6 +165,11 @@ def get_features(
     edge_mid = ((p_u + p_v) * 0.5).astype(np.float32)
     n1, n2 = _adjacent_face_normals(mesh, num_e)
 
+    n1, bad_n1 = _sanitise(n1, "face normal 1")
+    n2, bad_n2 = _sanitise(n2, "face normal 2")
+    edge_mid, bad_mid = _sanitise(edge_mid, "edge midpoint")
+    edge_len, bad_len = _sanitise(edge_len, "edge length")
+
     edge_vec = torch.from_numpy(np.stack([edge_mid, n1, n2], axis=1))  # (E, 3, 3)
 
     if edge_cluster_ids is None:
@@ -140,7 +177,7 @@ def get_features(
     else:
         e_clusters = torch.from_numpy(np.asarray(edge_cluster_ids, dtype=np.int64))
 
-    return FragmentGraph(
+    graph = FragmentGraph(
         node_vec=node_vec,
         edge_index=torch.from_numpy(edges_unique.astype(np.int64)).t().contiguous(),
         edge_len=torch.from_numpy(edge_len),
@@ -149,3 +186,5 @@ def get_features(
         vertex_cluster_id=v_clusters,
         edge_cluster_id=e_clusters,
     )
+    graph.num_repaired = bad_pos + bad_normals + bad_n1 + bad_n2 + bad_mid + bad_len
+    return graph

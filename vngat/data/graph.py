@@ -47,6 +47,10 @@ class FragmentGraph:
     centroid: torch.Tensor          # (3,)       centroid subtracted from positions
     vertex_cluster_id: torch.Tensor  # (V,)
     edge_cluster_id: torch.Tensor    # (E,)
+    num_repaired: int = 0
+    """Non-finite feature entries replaced with zero when this fragment was
+    built -- see `vngat.data.features._sanitise`. Non-zero means the source
+    mesh has degenerate geometry."""
 
     @property
     def num_nodes(self) -> int:

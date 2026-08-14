@@ -72,3 +72,33 @@ def test_all_empty_input():
     assert cluster_shared_points([]) == []
     ids = cluster_shared_points([np.zeros((0, 3)), np.zeros((0, 3))])
     assert all(len(x) == 0 for x in ids)
+
+
+# --------------------------------------------------------------------------
+# Non-finite feature repair
+# --------------------------------------------------------------------------
+def test_sanitise_replaces_non_finite_and_counts():
+    """
+    Regression guard. trimesh divides a cross product by its own length to get
+    a normal, so a zero-area triangle yields 0/0 = NaN. Three specific Breaking
+    Bad objects produced NaN losses repeatedly in one training run, under
+    several different fracture patterns each -- the NaN was in the data before
+    the model saw it.
+    """
+    from vngat.data.features import _sanitise
+
+    array = np.array([[1.0, 2.0, np.nan], [np.inf, 0.0, 1.0], [1.0, 1.0, 1.0]])
+    repaired, count = _sanitise(array, "test")
+    assert count == 2
+    assert np.isfinite(repaired).all()
+    assert np.array_equal(repaired[2], array[2])       # clean rows untouched
+    assert repaired[0, 2] == 0.0 and repaired[1, 0] == 0.0
+
+
+def test_sanitise_leaves_clean_arrays_alone():
+    from vngat.data.features import _sanitise
+
+    clean = np.ones((4, 3))
+    repaired, count = _sanitise(clean, "test")
+    assert count == 0
+    assert np.array_equal(repaired, clean)

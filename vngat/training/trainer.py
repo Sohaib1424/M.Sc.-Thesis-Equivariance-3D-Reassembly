@@ -585,6 +585,13 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
     budget_seconds = cfg.time_budget_hours * 3600.0
 
     for epoch in range(start_epoch, cfg.epochs):
+        # Linear warmup, applied before any scheduler step so the two do not
+        # fight over param_groups.
+        if cfg.lr_warmup_epochs > 0 and epoch < cfg.lr_warmup_epochs:
+            warm = (epoch + 1) / cfg.lr_warmup_epochs
+            for group in optimizer.param_groups:
+                group["lr"] = cfg.lr * (0.1 + 0.9 * warm)
+
         bar.reset(total=total_steps)
         bar.set_description(f"epoch {epoch}")
 
@@ -601,7 +608,7 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
             train_metrics = D.reduce_metrics(train_metrics, device)
             val_metrics = D.reduce_metrics(val_metrics, device)
 
-        if scheduler is not None:
+        if scheduler is not None and epoch >= cfg.lr_warmup_epochs:
             if scheduler_needs_metric:
                 monitored = val_metrics.get(cfg.lr_monitor, val_metrics["total"])
                 scheduler.step(monitored)

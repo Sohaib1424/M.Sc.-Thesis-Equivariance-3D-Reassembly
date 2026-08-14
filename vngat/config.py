@@ -104,6 +104,11 @@ class Config:
     lr_patience: int = 20
     lr_factor: float = 0.5
     lr_min: float = 1e-5
+    lr_warmup_epochs: int = 0
+    """Linearly ramp the learning rate from lr/10 over this many epochs. A
+    scaling run at a flat 1e-3 destabilised at epoch 24 -- the embedding loss
+    doubled and rotation error regressed with it -- which a warmup makes less
+    likely. 0 disables."""
     """Floor for every schedule. Below this nothing moves, so a mis-triggered
     decay wastes the session instead of merely slowing it."""
     seed: int = 0

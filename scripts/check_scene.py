@@ -119,6 +119,92 @@ class _Null:
     def __exit__(self, *a): return False
 
 
+def _locate(args, model, device) -> int:
+    """
+    Name the first module whose output goes non-finite, and show how activation
+    magnitude grows through the network on the way there.
+
+    Static reasoning found one overflow site and missed others; a forward hook
+    on every module answers the question directly instead.
+    """
+    from vngat.data.io import random_rotation_matrices
+
+    records: list = []
+
+    def hook(name):
+        def fn(_module, inputs, output):
+            tensors = [t for t in (output if isinstance(output, tuple) else (output,))
+                       if torch.is_tensor(t)]
+            if not tensors:
+                return
+            worst = max(float(t.detach().abs().max()) if t.numel() else 0.0 for t in tensors)
+            finite = all(bool(torch.isfinite(t).all()) for t in tensors)
+            in_max = max((float(t.detach().abs().max())
+                          for t in inputs if torch.is_tensor(t) and t.numel()), default=0.0)
+            records.append((name, type(_module).__name__, in_max, worst, finite))
+        return fn
+
+    handles = [m.register_forward_hook(hook(n)) for n, m in model.named_modules() if n]
+
+    print(f"scene : {args.scene}")
+    print(f"trials: {args.trials}\n")
+    found = False
+    for trial in range(args.trials):
+        records.clear()
+        meshes = load_random_scene(args.scene, fracture_pattern="fractured_")
+        if len(meshes) < 2:
+            continue
+        v_clu, e_clu = compute_scene_correspondence(meshes)
+        graph = merge_fragments(
+            [get_features(m, vc, ec) for m, vc, ec in zip(meshes, v_clu, e_clu)]).to(device)
+        rot = torch.from_numpy(
+            random_rotation_matrices(graph.num_fragments).astype(np.float32)).to(device)
+        diffused = graph.rotate_per_fragment(rot)
+
+        ctx = (torch.autocast("cuda", dtype=torch.float16)
+               if (args.amp and device.type == "cuda") else _Null())
+        with ctx, torch.no_grad():
+            out = model(**build_model_inputs(diffused))
+
+        bad = [r for r in records if not r[4]]
+        if not bad:
+            peak = max(r[3] for r in records)
+            print(f"  trial {trial:>3}: ok    frags={graph.num_fragments:>3} "
+                  f"nodes={graph.num_nodes:>6} peak|activation|={peak:>12.1f}")
+            continue
+
+        found = True
+        first = bad[0]
+        idx = records.index(first)
+        print(f"\n  trial {trial}: NON-FINITE  frags={graph.num_fragments} "
+              f"nodes={graph.num_nodes}")
+        print(f"  first non-finite module: {first[0]}  ({first[1]})")
+        print(f"    input max |x| = {first[2]:.1f}   output max |y| = {first[3]:.1f}")
+        print("\n  the ten modules leading up to it:")
+        print(f"    {'module':<44}{'type':<18}{'in max':>12}{'out max':>12}")
+        for name, kind, in_max, out_max, ok in records[max(0, idx - 10):idx + 1]:
+            flag = "" if ok else "   <-- FIRST NON-FINITE"
+            print(f"    {name:<44}{kind:<18}{in_max:>12.1f}{out_max:>12.1f}{flag}")
+        break
+
+    for h in handles:
+        h.remove()
+
+    if not found:
+        print("\nNo non-finite output in any trial. If training still fails, the weights "
+              "used here are not the ones that fail -- pass the checkpoint saved closest "
+              "to the failing epoch.")
+        return 0
+    print("""
+  READ:
+    output max is far larger than input max  -> that module is the amplifier
+    inputs already enormous (>10000)         -> the growth is upstream; the
+                                                magnitude column shows where
+    inputs modest but output non-finite      -> a genuine bug in that module
+""")
+    return 1
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--scene", required=True, help="Path to one scene directory.")
@@ -128,13 +214,45 @@ def main(argv=None) -> int:
     p.add_argument("--device", default="cuda")
     p.add_argument("--amp", type=lambda s: s.lower() in ("1", "true", "yes"), default=True)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--checkpoint", type=str, default="",
+                   help="Trained weights. WITHOUT THIS the check is close to meaningless "
+                        "for an overflow bug: a freshly initialised model has activations "
+                        "of order 1 and cannot overflow float16 no matter what the geometry "
+                        "is. The failure only appears once training has grown the weights.")
+    p.add_argument("--locate", action="store_true",
+                   help="Install forward hooks and report the FIRST module whose output "
+                        "goes non-finite, with the activation magnitude profile leading "
+                        "up to it.")
     args = p.parse_args(argv)
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
-    model = VNGATModel().to(device).eval()
+    if args.checkpoint:
+        state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        cfg = state.get("config") or {}
+        model = VNGATModel(
+            hidden_channels=cfg.get("hidden_channels", 64),
+            num_layers=cfg.get("num_layers", 4),
+            num_vn_slots=cfg.get("num_vn_slots", 8),
+            heads=cfg.get("heads", 4),
+            embed_dim=cfg.get("embed_dim", 32),
+            gram_bottleneck=cfg.get("gram_bottleneck", 16),
+            norm=cfg.get("norm", "layer"),
+        ).to(device)
+        model.load_state_dict(state["model"])
+        print(f"loaded checkpoint from epoch {state.get('epoch')}")
+        param_max = max(float(p.abs().max()) for p in model.parameters())
+        print(f"largest parameter magnitude: {param_max:.2f}")
+    else:
+        model = VNGATModel().to(device)
+        print("WARNING: no --checkpoint. An untrained model has O(1) activations and "
+              "cannot reproduce an overflow. Pass --checkpoint to make this meaningful.")
+    model.eval()
     loss_fn = CompositeLoss()
+
+    if args.locate:
+        return _locate(args, model, device)
 
     print(f"scene : {args.scene}")
     print(f"device: {device} | amp: {args.amp} | trials: {args.trials}\n")

@@ -428,9 +428,24 @@ def _run_micro_step(model, raw_model, loss_fn, micro, device, cfg, train, scaler
                     # placeholder step, so the collective count per optimiser
                     # step does not depend on how many micro-steps ran.
                     if not bool(torch.isfinite(losses["total"])):
+                        # Retry in FULL PRECISION before giving up on the scene.
+                        #
+                        # The failure is an activation-magnitude overflow: it
+                        # appears only once training has grown the weights, and
+                        # it lands on whichever scene is drawn at the time, not
+                        # on a fixed set of bad meshes. Recomputing the same
+                        # step in float32 costs one extra forward/backward on a
+                        # small fraction of steps and KEEPS THE DATA, instead of
+                        # silently excluding whole objects from training.
+                        if cfg.amp:
+                            losses = _forward_loss(model, loss_fn, scene, device, amp=False)
+                        if bool(torch.isfinite(losses["total"])):
+                            scaler.scale(losses["total"] * scale).backward()
+                            raw_model.grad_checkpointing = checkpoint_was
+                            return losses, recovered, True, False
                         bad = [k for k, v in losses.items()
                                if not bool(torch.isfinite(v).all())]
-                        write(f"  [nan] non-finite loss {bad} -- skipping this micro-step. "
+                        write(f"  [nan] non-finite loss {bad} in float32 too -- skipping. "
                               f"{micro['target'].num_nodes} nodes, "
                               f"{micro['target'].num_fragments} fragments, "
                               f"scenes {micro.get('scene_dirs')}")
@@ -444,6 +459,9 @@ def _run_micro_step(model, raw_model, loss_fn, micro, device, cfg, train, scaler
                     # non-finite micro-step still poisons the running average
                     # and reports the WHOLE epoch as nan -- hiding whether the
                     # rest of validation was fine.
+                    if not bool(torch.isfinite(losses["total"])) and cfg.amp:
+                        with torch.no_grad():
+                            losses = _forward_loss(model, loss_fn, scene, device, amp=False)
                     if not bool(torch.isfinite(losses["total"])):
                         write(f"  [nan] non-finite validation loss on "
                               f"{micro.get('scene_dirs')} -- excluded from the average")
@@ -628,6 +646,9 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
                             train_diag["data_seconds"], train_diag["compute_seconds"], current_lr))
             write(table_row(epoch, "val", val_metrics,
                             val_diag["data_seconds"], val_diag["compute_seconds"], current_lr))
+            if train_diag["fallback_steps"]:
+                write(f"  [amp] {int(train_diag['fallback_steps'])} step(s) recomputed in "
+                      f"float32 after a half-precision overflow (data kept)")
             if train_diag["nan_skips"]:
                 skipped = int(train_diag["nan_skips"])
                 attempted = skipped + cfg.steps_per_epoch * cfg.batch_size // max(cfg.micro_batch_scenes, 1)

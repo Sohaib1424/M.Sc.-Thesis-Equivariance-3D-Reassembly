@@ -29,6 +29,18 @@ import torch
 _HALF = (torch.float16, torch.bfloat16)
 
 
+def at_least_float32(x: torch.Tensor) -> torch.Tensor:
+    """
+    Promote half precision to float32; leave float32/float64 untouched.
+
+    Used wherever a product must not overflow. An unconditional `.float()`
+    would DOWNCAST a float64 model -- which the equivariance tests run in --
+    and silently drop their residual from ~1e-15 to ~1e-8, making a real
+    regression indistinguishable from noise.
+    """
+    return x.float() if x.dtype in _HALF else x
+
+
 def _accum_dtype(dtype: torch.dtype) -> torch.dtype:
     """
     Accumulate in float32 whenever the data is half precision.
@@ -110,6 +122,14 @@ def segment_softmax(logits: torch.Tensor, index: torch.Tensor, num_segments: int
         return logits
     out_dtype = logits.dtype
     work = logits.to(_accum_dtype(out_dtype))
+    # Clamp before the max-shift. The shift is what makes softmax stable, but
+    # it is also what turns a single +inf into NaN: max becomes inf, and
+    # inf - inf = NaN, which then propagates to every downstream feature.
+    # Callers compute their scores in float32 so an inf should not arrive here
+    # at all; this bounds the damage if one ever does, degrading to a hard
+    # argmax instead of destroying the run.
+    finite_max = torch.finfo(work.dtype).max / 8
+    work = work.clamp(-finite_max, finite_max)
     maxima = segment_max(work.detach(), index, num_segments)
     exp = (work - maxima.index_select(0, index)).exp()
     denom = segment_sum(exp, index, num_segments).index_select(0, index)
@@ -132,6 +152,10 @@ def blockwise_softmax(logits: torch.Tensor, block_id: torch.Tensor) -> torch.Ten
     mask = block_id.unsqueeze(0) == block_id.unsqueeze(-1)          # (Q, Q)
     while mask.dim() < logits.dim():
         mask = mask.unsqueeze(1)
+    # Same reasoning as segment_softmax: bound the logits so a stray inf cannot
+    # make torch.softmax return NaN for the whole block.
+    finite_max = torch.finfo(logits.dtype).max / 8
+    bounded = logits.clamp(-finite_max, finite_max)
     neg = torch.finfo(logits.dtype).min / 4
-    masked = logits.masked_fill(~mask, neg)
+    masked = bounded.masked_fill(~mask, neg)
     return torch.softmax(masked, dim=-1)

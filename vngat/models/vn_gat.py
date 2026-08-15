@@ -125,6 +125,22 @@ class VNGATModel(nn.Module):
         rot_vecs = self.rotation_head(pooled)                   # (F, 2, 3)
         R_pred = predict_rotation(rot_vecs[:, 0], rot_vecs[:, 1])
 
+        # Conditioning of the Gram-Schmidt head, as an invariant scalar.
+        #
+        # The frame is built by orthogonalising channel 2 against channel 1, so
+        # when the two are collinear the orthogonal residual vanishes and both
+        # the frame and its gradient become ill-conditioned. A run that stalls
+        # is expected to show |cos| near 1; a healthy one stays well below.
+        # Two seeds of an otherwise identical 8-object run ended 74 deg apart
+        # (30.9 vs 104.7), and this is the cheapest measurement that separates
+        # "bad basin" from "still descending".
+        with torch.no_grad():
+            a1 = rot_vecs[:, 0].float()
+            a2 = rot_vecs[:, 1].float()
+            n1 = a1.norm(dim=-1).clamp_min(1e-12)
+            n2 = a2.norm(dim=-1).clamp_min(1e-12)
+            head_cos = ((a1 * a2).sum(-1) / (n1 * n2)).abs().mean()
+
         vertex_embedding = self.vertex_embed_head(h)
         edge_embedding = self.edge_embed_head(
             symmetric_edge_features(h, edge_index, edge_vec)
@@ -133,6 +149,7 @@ class VNGATModel(nn.Module):
         return {
             "node_features": h,
             "R_pred": R_pred,
+            "head_cos": head_cos,
             "vertex_embedding": vertex_embedding,
             "edge_embedding": edge_embedding,
         }

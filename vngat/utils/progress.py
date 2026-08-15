@@ -96,6 +96,7 @@ _COLUMNS = [
     ("emb_e", 8),
     ("data_s", 8),
     ("comp_s", 8),
+    ("hcos", 7),
     ("lr", 10),
 ]
 
@@ -127,6 +128,7 @@ def table_row(epoch: int, phase: str, metrics: dict, data_s: float, comp_s: floa
         fmt("emb_e", 8),
         f"{data_s:.1f}".rjust(8),
         f"{comp_s:.1f}".rjust(8),
+        fmt("head_cos", 7),
         # The learning rate belongs in the table, not only in history.json: a
         # schedule that quietly decays to nothing looks exactly like a model
         # that has stopped learning.

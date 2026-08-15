@@ -38,7 +38,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .segment_ops import segment_softmax, segment_sum
+from .segment_ops import at_least_float32, segment_softmax, segment_sum
 from .vn_layers import VNLeakyReLU, VNLinear, make_norm
 
 
@@ -99,8 +99,21 @@ class VNGATLayer(nn.Module):
 
         q_i = q.index_select(0, dst)
         k_j = k.index_select(0, src)
-        logits = (q_i * k_j).sum(dim=(-1, -2)) * self.attn_scale          # (E, H) invariant
-        logits = logits + self.edge_scalar_to_bias(edge_scalar)
+        # float32 for the SCORE, and specifically for the elementwise product.
+        #
+        # `.sum` is on autocast's float32 list, but the product `q_i * k_j` is
+        # not: it runs in float16 and overflows to inf once both operands pass
+        # ~256 (256^2 > 65504). Promoting the sum afterwards cannot help,
+        # because the inf is already in the tensor. `segment_softmax` then
+        # subtracts the per-segment max for stability, and inf - inf = NaN --
+        # after which every downstream feature is NaN, which is precisely the
+        # observed failure: R_pred and both embedding heads go non-finite
+        # together, so all nine loss terms report NaN at once.
+        #
+        # The score is one scalar per edge per head, so widening it is cheap;
+        # the (E, H, C_h, 3) value tensors stay in half precision.
+        logits = (at_least_float32(q_i) * at_least_float32(k_j)).sum(dim=(-1, -2)) * self.attn_scale
+        logits = logits + at_least_float32(self.edge_scalar_to_bias(edge_scalar))
         alpha = segment_softmax(logits, dst, N)                           # (E, H)
 
         # `.to(v.dtype)`: autocast promotes the `.sum()` above to float32, so

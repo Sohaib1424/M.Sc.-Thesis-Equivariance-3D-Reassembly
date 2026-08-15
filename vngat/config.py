@@ -104,11 +104,15 @@ class Config:
     lr_patience: int = 20
     lr_factor: float = 0.5
     lr_min: float = 1e-5
-    lr_warmup_epochs: int = 0
-    """Linearly ramp the learning rate from lr/10 over this many epochs. A
-    scaling run at a flat 1e-3 destabilised at epoch 24 -- the embedding loss
-    doubled and rotation error regressed with it -- which a warmup makes less
-    likely. 0 disables."""
+    lr_warmup_epochs: int = 5
+    """Linearly ramp the learning rate from lr/10 over this many epochs.
+
+    On by default because initialisation, not object count, is the dominant
+    source of variance in this model: three seeds of an identical 8-object run
+    finished at 30.9, 54.3 and 104.7 degrees, with the worst reaching a plateau
+    by epoch 20 and never leaving it in the following 140. A warmup does not
+    guarantee escape, but it is the cheapest measure that reduces how much the
+    early, largest updates depend on the draw. 0 disables."""
     """Floor for every schedule. Below this nothing moves, so a mis-triggered
     decay wastes the session instead of merely slowing it."""
     seed: int = 0

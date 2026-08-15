@@ -272,3 +272,87 @@ def test_gradient_checkpointing_matches_plain_forward(scene):
     model.grad_checkpointing = True
     b = model(**kwargs)["R_pred"]
     assert torch.allclose(a, b, atol=1e-5)
+
+
+# --------------------------------------------------------------------------
+# Half-precision overflow
+# --------------------------------------------------------------------------
+def test_attention_scores_survive_large_activations():
+    """
+    THE regression guard for the NaN that stopped real training runs.
+
+    Autocast puts `.sum` on its float32 list but NOT the elementwise product
+    feeding it, so `q * k` ran in float16 and overflowed to inf once both
+    operands passed ~256 (256^2 > 65504). `segment_softmax` then subtracts the
+    per-segment max for stability, and inf - inf = NaN -- after which R_pred and
+    both embedding heads are NaN together, which is exactly the signature seen
+    in training (all nine loss terms failing at once).
+    """
+    from vngat.models.segment_ops import at_least_float32
+
+    big = torch.full((64, 48), 400.0, dtype=torch.float16)
+    naive = (big * big).sum(-1)
+    assert torch.isinf(naive).any(), "expected fp16 overflow in the naive product"
+
+    safe = (at_least_float32(big) * at_least_float32(big)).sum(-1)
+    assert torch.isfinite(safe).all()
+
+
+def test_at_least_float32_preserves_double():
+    """An unconditional `.float()` would downcast float64 and silently drop the
+    equivariance tests' residual from ~1e-15 to ~1e-8."""
+    from vngat.models.segment_ops import at_least_float32
+
+    assert at_least_float32(torch.zeros(2, dtype=torch.float16)).dtype == torch.float32
+    assert at_least_float32(torch.zeros(2, dtype=torch.float32)).dtype == torch.float32
+    assert at_least_float32(torch.zeros(2, dtype=torch.float64)).dtype == torch.float64
+
+
+def test_gat_layer_finite_with_large_inputs():
+    """End-to-end: a half-precision layer must not emit NaN on large inputs."""
+    from vngat.models.gat_layer import VNGATLayer
+
+    torch.manual_seed(0)
+    layer = VNGATLayer(2, 8, heads=2)
+    n, e = 40, 90
+    x = torch.randn(n, 2, 3) * 500.0
+    edge_index = torch.randint(0, n, (2, e))
+    edge_len = torch.rand(e, 1) * 100
+    edge_vec = torch.randn(e, 3, 3) * 500.0
+    out = layer(x, edge_index, edge_len, edge_vec)
+    assert torch.isfinite(out).all()
+
+
+def test_layernorm_does_not_collapse_on_large_inputs():
+    """
+    In half precision a channel norm above ~256 squares to inf, the RMS becomes
+    inf and the scale collapses to zero -- silently ZEROING the features instead
+    of normalising them. That is not NaN, so nothing downstream flags it.
+    """
+    from vngat.models.vn_layers import VNLayerNorm
+
+    layer = VNLayerNorm(6)
+    out = layer(torch.randn(20, 6, 3, dtype=torch.float16) * 400.0)
+    assert torch.isfinite(out).all()
+    assert float(out.abs().max()) > 0, "features were zeroed, not normalised"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="autocast needs CUDA")
+def test_full_model_finite_under_autocast_with_large_activations(scene):
+    """The whole forward pass under real AMP, with inputs scaled to the regime
+    that used to overflow."""
+    device = torch.device("cuda")
+    graph = scene.to(device)
+    model = VNGATModel(hidden_channels=16, num_layers=4, num_vn_slots=4,
+                       heads=2, embed_dim=8).to(device).eval()
+    graph.node_vec.mul_(300.0)
+    graph.edge_vec.mul_(300.0)
+    with torch.autocast("cuda", dtype=torch.float16), torch.no_grad():
+        out = model(
+            node_vec=graph.node_vec, edge_index=graph.edge_index,
+            edge_len=graph.edge_len, edge_vec=graph.edge_vec,
+            node_frag=graph.node_frag, num_fragments=graph.num_fragments,
+            frag_scene=graph.frag_scene,
+        )
+    for key, value in out.items():
+        assert torch.isfinite(value).all(), f"{key} went non-finite under AMP"

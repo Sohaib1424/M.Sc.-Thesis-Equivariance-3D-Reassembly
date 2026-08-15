@@ -49,7 +49,8 @@ from .checkpoint import CheckpointManager
 from .drive import DriveSync
 from .history import History
 
-_LOSS_KEYS = ("total", "rot", "rot_deg", "pos", "node", "mid", "face", "emb_v", "emb_e")
+_LOSS_KEYS = ("total", "rot", "rot_deg", "pos", "node", "mid", "face", "emb_v", "emb_e",
+              "head_cos")
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,8 @@ def _forward_loss(model, loss_fn, scene: Dict, device: torch.device, amp: bool):
         )
         targets = build_targets(scene["clean_target"], scene["rot"], scene["diffused_input"])
         losses = loss_fn(merged, targets)
+        losses = dict(losses)
+        losses["head_cos"] = outputs["head_cos"]
     return losses
 
 
@@ -253,6 +256,7 @@ def run_phase(
     oom_recoveries = 0
     fallback_steps = 0
     nan_skips = 0
+    nan_scenes: Dict[str, int] = {}
 
     phase = "train" if train else "val"
     data_start = time.perf_counter()
@@ -291,6 +295,8 @@ def run_phase(
                 # A NaN in the accumulator would make every reported metric NaN
                 # for the rest of the epoch, hiding whether training recovered.
                 nan_skips += 1
+                for name in micro.get("scene_dirs", []):
+                    nan_scenes[name] = nan_scenes.get(name, 0) + 1
                 continue
             for key in _LOSS_KEYS:
                 totals[key] += float(losses[key].detach())
@@ -329,6 +335,7 @@ def run_phase(
         "oom_recoveries": float(oom_recoveries),
         "fallback_steps": float(fallback_steps),
         "nan_skips": float(nan_skips),
+        "nan_scenes": nan_scenes,
     }
     return metrics, diagnostics
 
@@ -509,8 +516,8 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
     model = build_model(cfg, device)
 
     if is_main:
-        write(f"chance level: geodesic 126.47 deg. For rotationally symmetric objects a "
-              f"per-fragment canonicaliser floors near 90 deg (axis learnable, azimuth not).")
+        write("chance level: geodesic 126.47 deg. A matched-budget scaling run reached "
+              "30.9 deg on 8 objects, so there is no known structural floor above that.")
         write(f"VN-GAT | {model.num_parameters():,} parameters | hidden={cfg.hidden_channels} "
               f"layers={cfg.num_layers} heads={cfg.heads} slots={cfg.num_vn_slots} norm={cfg.norm}")
         write(f"input_source={cfg.input_source} | train pool={train_set.pool_size} scenes | "
@@ -626,6 +633,16 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
                 attempted = skipped + cfg.steps_per_epoch * cfg.batch_size // max(cfg.micro_batch_scenes, 1)
                 write(f"  [nan] skipped {skipped} micro-step(s) this epoch "
                       f"({100.0 * skipped / max(attempted, 1):.1f}%) with non-finite losses")
+                # Name the repeat offenders. Dropping a step is safe for the
+                # optimiser but NOT neutral for the data: if the same scenes
+                # fail every epoch they are effectively excluded from training,
+                # which is a silent bias rather than a transient loss.
+                worst = sorted(train_diag["nan_scenes"].items(), key=lambda kv: -kv[1])[:3]
+                for name, hits in worst:
+                    write(f"     {hits}x  {name}")
+                if worst and worst[0][1] > 1:
+                    write("   Repeat offenders are effectively excluded from training. "
+                          "Diagnose one with: python -m scripts.check_scene --scene <path>")
                 if skipped > 0.2 * attempted:
                     write("   A skip rate this high is systematic, not an unlucky scene. "
                           "Most likely activation overflow under AMP: retry with --amp false "

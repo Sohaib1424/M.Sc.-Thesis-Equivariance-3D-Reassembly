@@ -85,7 +85,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .segment_ops import blockwise_softmax, segment_mean, segment_softmax, segment_sum
+from .segment_ops import (
+    at_least_float32, blockwise_softmax, segment_mean, segment_softmax, segment_sum,
+)
 from .vn_layers import VNInvariant, VNLeakyReLU, VNLinear, make_norm
 
 
@@ -165,7 +167,9 @@ class VirtualNodeBlock(nn.Module):
     def _exchange(self, q, k, v, frag_scene, K):
         """
         Scaled dot-product attention over INVARIANT slot tokens, restricted to
-        slots of the same scene.
+        slots of the same scene. Scores are computed in float32 -- see the note
+        in `VNGATLayer.forward` for why the elementwise product must not run in
+        half precision.
 
         Evaluated one contiguous scene-block at a time. The masked-dense
         alternative still ALLOCATES the full batch-wide (Q, H, Q) score matrix
@@ -175,14 +179,15 @@ class VirtualNodeBlock(nn.Module):
         sizes = self._scene_block_sizes(frag_scene, K)
 
         def attend(qs, ks, vs):
-            logits = torch.einsum('qhd,khd->qhk', qs, ks) * self.token_scale
-            return torch.einsum('qhk,khd->qhd', torch.softmax(logits, dim=-1), vs)
+            logits = torch.einsum('qhd,khd->qhk', at_least_float32(qs), at_least_float32(ks)) * self.token_scale
+            alpha = torch.softmax(logits, dim=-1).to(vs.dtype)
+            return torch.einsum('qhk,khd->qhd', alpha, vs)
 
         if sizes is None:
             return attend(q, k, v)
         if sizes == "non_contiguous":
-            logits = torch.einsum('qhd,khd->qhk', q, k) * self.token_scale
-            alpha = blockwise_softmax(logits, frag_scene.repeat_interleave(K))
+            logits = torch.einsum('qhd,khd->qhk', at_least_float32(q), at_least_float32(k)) * self.token_scale
+            alpha = blockwise_softmax(logits, frag_scene.repeat_interleave(K)).to(v.dtype)
             return torch.einsum('qhk,khd->qhd', alpha, v)
 
         out, start = [], 0
@@ -216,7 +221,7 @@ class VirtualNodeBlock(nn.Module):
         v_up = self.up_v(x).reshape(N, H, Ch, 3)
 
         q_node = q_up.index_select(0, node_frag)                           # (N, K, H, Ch, 3)
-        logits = torch.einsum('nkhci,nhci->nkh', q_node, k_up) * self.scale
+        logits = torch.einsum('nkhci,nhci->nkh', at_least_float32(q_node), at_least_float32(k_up)) * self.scale
         alpha = segment_softmax(logits, node_frag, num_fragments)          # (N, K, H)
         slots = segment_sum(
             alpha.to(v_up.dtype)[..., None, None] * v_up.unsqueeze(1),
@@ -244,7 +249,7 @@ class VirtualNodeBlock(nn.Module):
 
         dk_node = dk.index_select(0, node_frag)                            # (N, K, H, Ch, 3)
         dv_node = dv.index_select(0, node_frag)
-        down_logits = torch.einsum('nhci,nkhci->nkh', dq, dk_node) * self.scale
+        down_logits = torch.einsum('nhci,nkhci->nkh', at_least_float32(dq), at_least_float32(dk_node)) * self.scale
         # Softmax over the K slots of this vertex's own fragment: a plain
         # softmax over dim 1 IS the fragment-scoped one, because dk_node was
         # gathered by fragment -- no mask needed at all.

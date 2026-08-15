@@ -88,10 +88,20 @@ CHANCE_GEODESIC_DEG = 126.47
 CHANCE_EULER_RMSE_DEG = 83.20
 """Mean Euler RMSE of a Haar-uniform residual (Monte Carlo, 5e5 samples)."""
 SYMMETRY_FLOOR_GEODESIC_DEG = 89.9
-"""Floor for a per-fragment canonicaliser on a surface of revolution: the axis
-is learnable from one fragment, the azimuth about it is not, so the residual is
-a uniform rotation about that axis. Most of the Breaking Bad Everyday subset
-(bottles, bowls, cups, vases, rings) is of this kind."""
+"""Error a per-fragment canonicaliser would show if the azimuth about an
+object's symmetry axis were unrecoverable: the residual would be a uniform
+rotation about that axis.
+
+MEASURED AND REFUTED as a floor for this task. A scaling run on 8 Everyday
+objects (bottles, cups, mirrors -- surfaces of revolution) reached 30.90 deg
+training error, far below this value. The argument fails because a FRAGMENT of
+a symmetric object is not itself symmetric: its fracture boundary is jagged and
+unique, so the azimuth is recoverable from the fragment even though it would
+not be from the intact surface. The intact object's symmetry does not transfer
+to its pieces.
+
+Kept as a reference line for reading results -- crossing it is evidence that
+per-fragment azimuth is being resolved -- NOT as a predicted ceiling."""
 SYMMETRY_FLOOR_EULER_RMSE_DEG = 51.9
 
 

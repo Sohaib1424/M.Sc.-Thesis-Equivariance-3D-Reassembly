@@ -13,19 +13,17 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from .segment_ops import at_least_float32
+
 EPS = 1e-6
 _HALF = (torch.float16, torch.bfloat16)
 
 
 def _at_least_float32(x: torch.Tensor) -> torch.Tensor:
-    """
-    Promote half precision to float32, but leave float64 alone.
-
-    An unconditional `.float()` would silently DOWNCAST a float64 model -- which
-    the equivariance tests run in, precisely because they need the extra digits
-    -- and would then raise on any float64 tensor it was combined with.
-    """
-    return x.float() if x.dtype in _HALF else x
+    """Alias of `segment_ops.at_least_float32`, re-exported so this module's
+    callers do not need a second import. Defined once there so the rule cannot
+    drift between files."""
+    return at_least_float32(x)
 
 
 class VNLinear(nn.Module):
@@ -115,10 +113,16 @@ class VNLayerNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(channels))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = x.norm(dim=-1)                                    # (..., C) invariant
+        # float32 for the norm and its square. In half precision a channel norm
+        # above ~256 squares to inf, the RMS becomes inf, and the scale collapses
+        # to zero -- silently ZEROING the features rather than normalising them.
+        # That is not NaN, so nothing downstream flags it; the layer just stops
+        # carrying information.
+        xf = _at_least_float32(x)
+        norm = torch.sqrt(xf.pow(2).sum(-1) + 1e-12)             # (..., C) invariant
         rms = norm.pow(2).mean(dim=-1, keepdim=True).clamp_min(self.eps).sqrt()
-        scale = (self.weight / rms).unsqueeze(-1)                # (..., C, 1)
-        return x * scale
+        scale = (_at_least_float32(self.weight) / rms).unsqueeze(-1)
+        return (xf * scale).to(x.dtype)
 
 
 class VNBatchNorm(nn.Module):
@@ -137,11 +141,11 @@ class VNBatchNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
-        flat = x.reshape(-1, shape[-2], 3)
-        norm = flat.norm(dim=-1) + EPS
-        norm_bn = self.bn(norm)
+        flat = _at_least_float32(x).reshape(-1, shape[-2], 3)
+        norm = torch.sqrt(flat.pow(2).sum(-1) + 1e-12) + EPS      # fp32, see VNLayerNorm
+        norm_bn = self.bn(norm.to(self.bn.weight.dtype)).to(norm.dtype)
         out = flat / norm.unsqueeze(-1) * norm_bn.unsqueeze(-1)
-        return out.reshape(shape)
+        return out.reshape(shape).to(x.dtype)
 
 
 def make_norm(kind: str, channels: int) -> nn.Module:
@@ -182,9 +186,12 @@ class VNInvariant(nn.Module):
         return self.bottleneck * self.bottleneck
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.project(x)
+        z = _at_least_float32(self.project(x))
+        # The Gram matrix is a product of activations with themselves, so it
+        # overflows in half precision at half the magnitude a mixed product
+        # would. It is O(bottleneck^2) per entity and small by design.
         gram = torch.matmul(z, z.transpose(-1, -2))
-        return gram.flatten(start_dim=-2)
+        return gram.flatten(start_dim=-2).to(x.dtype)
 
 
 # ---------------------------------------------------------------------------

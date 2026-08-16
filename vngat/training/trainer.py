@@ -541,6 +541,10 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
         write(f"input_source={cfg.input_source} | train pool={train_set.pool_size} scenes | "
               f"world_size={world_size} | batch={cfg.batch_size} (micro={cfg.micro_batch_scenes}) | "
               f"amp={cfg.amp}")
+        if cfg.amp:
+            write("!! amp=True: a controlled comparison found half precision both unstable "
+                  "(non-finite losses on 6 of 8 objects from epoch 66) and WORSE than fp32 "
+                  "(54.3 vs 43.2 deg). Use --amp false unless you have a specific reason.")
 
     if distributed:
         model = DDP(

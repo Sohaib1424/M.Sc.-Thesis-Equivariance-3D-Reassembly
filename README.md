@@ -144,6 +144,28 @@ setup steps in `vngat/training/drive.py`, especially sharing the folder with
 the service account, without which uploads fail with `storageQuotaExceeded`.
 Re-running the same command with `resume: auto` continues where it left off.
 
+## Precision: train in fp32, not AMP
+
+Measured, not assumed. Same seed, same configuration, only precision differing,
+on 8 objects:
+
+| epoch | AMP (fp16) | fp32 |
+|---|---|---|
+| 62 | 79.11 | 74.06 |
+| 70 | 85.24 | 62.82 |
+| 85 | 65.84 | **43.18** |
+
+AMP produced non-finite losses from epoch 66 onward on six of the eight
+training objects, silently excluding them; fp32 ran 90 epochs with none. And
+the corruption preceded the visible NaN -- fp32 was already 5-19 degrees ahead
+at epochs 62-65.
+
+Cost is ~10-20% wall clock, not the ~2x one might expect: this model is
+dominated by scatter/gather and many small matmuls rather than the large GEMMs
+tensor cores accelerate. Peak memory goes from ~1.8 GB to ~4 GB.
+
+`amp` therefore defaults to False, and the trainer warns if it is turned on.
+
 ## Numerical notes
 
 Segment reductions accumulate in float32 even under AMP: they run over whole

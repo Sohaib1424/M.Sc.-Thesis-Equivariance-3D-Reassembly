@@ -46,7 +46,7 @@ val_steps: 10
 lr: 0.0003
 weight_decay: 1.0e-05
 grad_clip: 1.0
-amp: true
+amp: false
 lr_schedule: plateau
 lr_monitor: rot
 lr_patience: 20

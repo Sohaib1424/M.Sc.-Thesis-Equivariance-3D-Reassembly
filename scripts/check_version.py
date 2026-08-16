@@ -64,6 +64,8 @@ MARKERS = [
      "scripts/check_scene.py", "MODEL under AMP only"),
     ("NaN locator with trained weights",
      "scripts/check_scene.py", "def _locate"),
+    ("fp32 is the default precision",
+     "vngat/config.py", "amp: bool = False"),
     ("fp32 retry before skipping a step",
      "vngat/training/trainer.py", "in float32 too -- skipping"),
     ("non-finite feature repair",

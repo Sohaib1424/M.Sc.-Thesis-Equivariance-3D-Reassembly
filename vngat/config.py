@@ -91,7 +91,31 @@ class Config:
     lr: float = 3e-4
     weight_decay: float = 1e-5
     grad_clip: float = 1.0
-    amp: bool = True
+    amp: bool = False
+    """Mixed precision. OFF by default -- MEASURED, not assumed.
+
+    A controlled comparison (same seed, same config, only precision differing)
+    on 8 objects found half precision both unstable and WORSE:
+
+        epoch    AMP     fp32
+           62   79.11    74.06
+           70   85.24    62.82
+           85   65.84    43.18
+        best  54.26 in 160 epochs   43.18 in 90 epochs
+
+    AMP also produced non-finite losses from epoch 66 onward, on six of the
+    eight training objects, which excluded them from training. fp32 ran 90
+    epochs with none.
+
+    The gradient corruption preceded the visible NaN: fp32 was already 5-19 deg
+    ahead at epochs 62-65, before any overflow was reported.
+
+    Cost is ~10-20% wall clock, not the ~2x one might expect, because this
+    model is dominated by scatter/gather and many small matmuls rather than the
+    large GEMMs tensor cores accelerate. Peak memory roughly doubles, from
+    ~1.8 GB to ~4 GB, which a 16 GB T4 absorbs.
+
+    Set True only with a reason, and watch for `[amp]` fp32-retry lines."""
     lr_schedule: str = "plateau"
     """'plateau' (ReduceLROnPlateau), 'cosine' (CosineAnnealingLR over `epochs`),
     or 'constant'."""

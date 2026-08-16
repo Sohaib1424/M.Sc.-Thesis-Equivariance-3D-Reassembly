@@ -334,7 +334,7 @@ def test_layernorm_does_not_collapse_on_large_inputs():
     layer = VNLayerNorm(6)
     out = layer(torch.randn(20, 6, 3, dtype=torch.float16) * 400.0)
     assert torch.isfinite(out).all()
-    assert float(out.abs().max()) > 0, "features were zeroed, not normalised"
+    assert float(out.detach().abs().max()) > 0, "features were zeroed, not normalised"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="autocast needs CUDA")

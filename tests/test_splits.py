@@ -104,3 +104,58 @@ def test_missing_root_returns_empty(tmp_path):
     from vngat.data.splits import list_scene_directories
 
     assert list_scene_directories(str(tmp_path / "nope")) == []
+
+
+def _build_official(tmp_path, nested: bool):
+    """`nested=True` reproduces the release's data_split/data_split/ layout."""
+    objects = [("BeerBottle", "2927d6c8438f6e24fe6460d8d9bd16c6"),
+               ("BeerBottle", "3f91158956ad7db0322747720d7d37e8"),
+               ("Mug", "412289ded0359b326802d3678aa9d56b")]
+    for category, obj in objects:
+        d = tmp_path / "everyday_compressed" / "everyday_compressed" / category / obj
+        (d / "fractured_0").mkdir(parents=True)
+        (d / "compressed_mesh.obj").write_text("")
+        (d / "compressed_data.npz").write_text("")
+    split_dir = tmp_path / "data_split" / ("data_split" if nested else "")
+    split_dir.mkdir(parents=True, exist_ok=True)
+    (split_dir / "everyday.train.txt").write_text(
+        "\n".join(f"everyday/{c}/{o}" for c, o in objects[:2]))
+    (split_dir / "everyday.val.txt").write_text(
+        f"everyday/{objects[2][0]}/{objects[2][1]}")
+    return objects
+
+
+def test_official_split_found_when_nested_one_level_deeper(tmp_path):
+    """
+    Regression guard. The release ships the lists at
+    data/data_split/data_split/everyday.train.txt -- nested exactly as
+    everyday_compressed/everyday_compressed/ is. A non-recursive glob found
+    nothing and raised "matched anything on disk" with zero entries parsed,
+    which reads like a format mismatch rather than a lookup that never opened a
+    file.
+    """
+    from vngat.data.splits import load_official_split
+
+    _build_official(tmp_path, nested=True)
+    assert len(load_official_split(str(tmp_path), "train", ["everyday_compressed"])) == 2
+    assert len(load_official_split(str(tmp_path), "val", ["everyday_compressed"])) == 1
+
+
+def test_official_split_also_found_when_flat(tmp_path):
+    from vngat.data.splits import load_official_split
+
+    _build_official(tmp_path, nested=False)
+    assert len(load_official_split(str(tmp_path), "train", ["everyday_compressed"])) == 2
+
+
+def test_missing_split_files_say_so_explicitly(tmp_path):
+    """An empty data_split must not be reported as an id mismatch."""
+    import pytest as _pytest
+
+    from vngat.data.splits import load_official_split
+
+    _build_official(tmp_path, nested=True)
+    for f in (tmp_path / "data_split").rglob("*.txt"):
+        f.unlink()
+    with _pytest.raises(ValueError, match="No \\*.train.txt files found"):
+        load_official_split(str(tmp_path), "train", ["everyday_compressed"])

@@ -104,6 +104,8 @@ MARKERS = [
      "vngat/training/trainer.py", "def _first_non_finite_parameter"),
     ("official Breaking Bad splits",
      "vngat/data/splits.py", "def load_official_split"),
+    ("split lists found when nested",
+     "vngat/data/splits.py", 'split_dir.rglob(f"*.{split}.txt")'),
 ]
 
 

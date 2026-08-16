@@ -142,7 +142,14 @@ def load_official_split(
     selected: List[Path] = []
     unmatched: List[str] = []
     seen: set = set()
-    listings = sorted(split_dir.glob(f"*.{split}.txt"))
+    # rglob, not glob. The release nests the lists one level deeper --
+    # data/data_split/data_split/everyday.train.txt -- exactly as it does with
+    # everyday_compressed/everyday_compressed/. A non-recursive glob found
+    # nothing there and raised "matched anything on disk" with zero entries
+    # parsed, which reads like a format mismatch rather than a lookup that
+    # never opened a file. Searching recursively removes the assumption, the
+    # same way `list_scene_directories` does for the scenes themselves.
+    listings = sorted(split_dir.rglob(f"*.{split}.txt"))
     total_entries = 0
 
     for listing in listings:
@@ -173,6 +180,15 @@ def load_official_split(
             if resolved not in seen:
                 seen.add(resolved)
                 selected.append(resolved)
+
+    if not listings:
+        present = sorted(p.name for p in split_dir.rglob("*.txt"))[:6]
+        raise ValueError(
+            f"No *.{split}.txt files found anywhere under {split_dir}.\n"
+            f"  .txt files present: {present or 'none'}\n"
+            f"Expected names like 'everyday.{split}.txt'. If the directory is empty, "
+            f"the split lists were not downloaded -- use split_source='hash'."
+        )
 
     if not selected:
         disk_examples = sorted(k for k in by_suffix if "/" in k)[:3] or sorted(by_suffix)[:3]

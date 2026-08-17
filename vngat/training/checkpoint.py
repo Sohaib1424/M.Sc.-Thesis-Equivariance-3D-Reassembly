@@ -106,6 +106,7 @@ class CheckpointManager:
             "model": _unwrap(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "scheduler_type": type(scheduler).__name__ if scheduler is not None else None,
             "scaler": scaler.state_dict() if scaler is not None else None,
             "epoch": epoch,
             "train_loss": train_loss,
@@ -200,7 +201,24 @@ class CheckpointManager:
         if optimizer is not None and state.get("optimizer"):
             optimizer.load_state_dict(state["optimizer"])
         if scheduler is not None and state.get("scheduler"):
-            scheduler.load_state_dict(state["scheduler"])
+            # Only restore scheduler state when the TYPE still matches.
+            #
+            # `LRScheduler.load_state_dict` is `self.__dict__.update(...)`, so
+            # feeding a ReduceLROnPlateau state into a CosineAnnealingLR does
+            # not raise -- it injects `patience`, `num_bad_epochs`, `best` and,
+            # critically, `last_epoch` into a scheduler that means something
+            # different by them. The rate then follows a curve nobody chose.
+            # Changing --lr_schedule on resume is a legitimate thing to want
+            # (the plateau scheduler was decaying on a flat validation metric),
+            # so start the new schedule cleanly and say so.
+            saved_type = state.get("scheduler_type")
+            current_type = type(scheduler).__name__
+            if saved_type in (None, current_type):
+                scheduler.load_state_dict(state["scheduler"])
+            else:
+                write(f"  [ckpt] scheduler changed {saved_type} -> {current_type}; "
+                      f"starting the new schedule fresh rather than loading "
+                      f"incompatible state")
         if scaler is not None and state.get("scaler"):
             scaler.load_state_dict(state["scaler"])
 

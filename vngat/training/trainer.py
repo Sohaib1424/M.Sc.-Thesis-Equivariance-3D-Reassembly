@@ -602,6 +602,13 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
         if is_main:
             write(f"  [ckpt] resumed from {resume_path} at epoch {start_epoch} "
                   f"(best val {manager.best_val:.4f})")
+            remaining = cfg.epochs - start_epoch
+            if remaining <= 0:
+                write(f"!! --epochs {cfg.epochs} is a TOTAL and this checkpoint is already "
+                      f"at epoch {start_epoch}. Nothing will run. Raise --epochs.")
+            else:
+                write(f"  [ckpt] --epochs {cfg.epochs} is a TOTAL, so {remaining} epoch(s) "
+                      f"remain from here")
     elif is_main and cfg.resume not in ("", "none", "None"):
         write("  [ckpt] no checkpoint found -- starting from scratch")
 

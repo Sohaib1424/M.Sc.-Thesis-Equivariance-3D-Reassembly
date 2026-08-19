@@ -214,7 +214,16 @@ class CheckpointManager:
             saved_type = state.get("scheduler_type")
             current_type = type(scheduler).__name__
             if saved_type in (None, current_type):
+                # `T_max` lives inside the scheduler state, so restoring it
+                # blindly makes --epochs unable to change the cosine period on
+                # resume. Keep the horizon the CALLER asked for.
+                wanted = getattr(scheduler, "T_max", None)
                 scheduler.load_state_dict(state["scheduler"])
+                restored = getattr(scheduler, "T_max", None)
+                if wanted is not None and restored is not None and wanted != restored:
+                    scheduler.T_max = wanted
+                    write(f"  [ckpt] cosine T_max {restored} -> {wanted} "
+                          f"(--epochs wins over the saved horizon)")
             else:
                 write(f"  [ckpt] scheduler changed {saved_type} -> {current_type}; "
                       f"starting the new schedule fresh rather than loading "

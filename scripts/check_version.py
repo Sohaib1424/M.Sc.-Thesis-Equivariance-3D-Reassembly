@@ -104,6 +104,8 @@ MARKERS = [
      "vngat/training/trainer.py", "def _first_non_finite_parameter"),
     ("official Breaking Bad splits",
      "vngat/data/splits.py", "def load_official_split"),
+    ("cosine anneals once, does not cycle",
+     "vngat/training/trainer.py", "phase = min(epoch, t_max)"),
     ("scheduler state guarded by type",
      "vngat/training/checkpoint.py", "scheduler_type"),
     ("split lists found when nested",

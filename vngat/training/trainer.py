@@ -132,8 +132,23 @@ def build_scheduler(cfg: Config, optimizer):
     if kind == "constant":
         return None, False
     if kind == "cosine":
-        return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(cfg.epochs, 1), eta_min=cfg.lr_min), False
+        # CosineAnnealingLR is PERIODIC: it falls to eta_min at last_epoch =
+        # T_max, then CLIMBS BACK toward the base rate over the next T_max
+        # steps. A real run resumed past its original horizon did exactly that
+        # -- the rate went from 1.0e-5 back up to 6.9e-4 over 75 epochs and the
+        # loss rose with it. Wrapping it in a lambda that clamps the phase at
+        # T_max makes it anneal once and stay down, which is what "cosine
+        # schedule" is normally taken to mean.
+        import math
+
+        t_max = max(cfg.epochs, 1)
+        floor = cfg.lr_min / max(cfg.lr, 1e-12)
+
+        def cosine_once(epoch: int) -> float:
+            phase = min(epoch, t_max) / t_max          # clamped: never rises again
+            return floor + (1.0 - floor) * (1.0 + math.cos(math.pi * phase)) / 2.0
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_once), False
     if kind == "plateau":
         return torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=cfg.lr_factor, patience=cfg.lr_patience,

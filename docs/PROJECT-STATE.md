@@ -11,12 +11,13 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 278 tests, clean under `-W error` |
+| Pipeline | **built** — 283 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
 | Training | **built** — loops, checkpoints, schedule, metrics, 2-GPU |
 | Trained result | **none yet** — nothing has been run on the real dataset |
+| First preflight | found a train/val split overlap and an OOM; both fixed |
 
 ---
 
@@ -304,7 +305,7 @@ normal ordering · fracture patches / sampling / budgeting · cross-fragment
 correspondence · SE(3) perturbation · visualiser · exhaustive extraction pass ·
 three analysis scripts · **Vector Neuron primitives · segment reductions ·
 intra-fragment VN-GAT · cross-fragment attention · the composite loss · feature
-construction and batch collate · the backbone and rotation head**. 278 tests,
+construction and batch collate · the backbone and rotation head**. 283 tests,
 no skips.
 
 **Not built** — the translation solver (stage two).

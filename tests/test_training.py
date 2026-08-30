@@ -734,3 +734,101 @@ def test_limit_spans_the_split_instead_of_taking_a_prefix():
     strided = [items[i] for i in dict.fromkeys(keep.tolist())]
     assert len({obj for obj, _ in strided}) == 40, "one mode from every object"
     assert strided == sorted(strided), "and still deterministic and ordered"
+
+
+# --------------------------------------------------------------------------
+# The two problems a real preflight found
+# --------------------------------------------------------------------------
+
+def test_split_matching_keeps_the_category():
+    """
+    A real dataset put 16 objects in both train and val. The cause: split files
+    list `everyday/<category>/<object>`, and matching used the object name
+    alone. Object directory names are not unique across categories, so a name
+    present in both lists put the *same* scene in both splits -- and the
+    resulting validation score is better than the honest one, so it reads as
+    success rather than as an error.
+    """
+    from reassembly.data.paths import Scene, filter_by_split, split_key
+
+    assert split_key("everyday/BeerBottle/f1ea".split("/")) == ("BeerBottle", "f1ea")
+    assert split_key("f1ea".split("/")) == ("f1ea",)
+    assert split_key("data/everyday/Bowl/x.obj".split("/")) == ("Bowl", "x")
+
+    # Two genuinely different objects that share a directory name.
+    a = Scene(Path("/d/everyday/BeerBottle/f1ea"), "everyday", "BeerBottle", "f1ea")
+    b = Scene(Path("/d/everyday/Mug/f1ea"), "everyday", "Mug", "f1ea")
+
+    train = filter_by_split([a, b], "train", official={("BeerBottle", "f1ea")})
+    val = filter_by_split([a, b], "val", official={("Mug", "f1ea")})
+    assert [s.object_key for s in train] == ["everyday/BeerBottle/f1ea"]
+    assert [s.object_key for s in val] == ["everyday/Mug/f1ea"]
+    assert not ({s.object_key for s in train} & {s.object_key for s in val})
+
+
+def test_split_matching_still_accepts_bare_names():
+    """Some split files list objects without a category; those must still work."""
+    from reassembly.data.paths import Scene, filter_by_split
+
+    scene = Scene(Path("/d/artifact/obj1"), "artifact", "", "obj1")
+    assert filter_by_split([scene], "train", official={("obj1",)}) == [scene]
+
+
+def test_the_split_projections_are_algebraically_the_concatenation():
+    """
+    `VNGraphAttention` applies its key and value maps as a sum of separate
+    projections rather than one map over a concatenation. That is exact --
+    `VNLinear` has no bias, so `W [a;b;c] == W_a a + W_b b + W_c c` -- and it
+    avoids materialising the concatenation, which measured 2961 -> 2091 MB of
+    retained activations per layer on a 488k-edge batch.
+    """
+    from reassembly.nn.gat import VNGraphAttention
+    from reassembly.nn.vn import VNLinear
+
+    channels, edge_channels, heads, head_dim = 16, 3, 4, 8
+    layer = VNGraphAttention(channels, edge_channels, heads, head_dim).to(torch.float64)
+
+    wide = VNLinear(2 * channels + edge_channels, heads * head_dim).to(torch.float64)
+    with torch.no_grad():
+        wide.weight.copy_(torch.cat([layer.key_src.weight, layer.key_dst.weight,
+                                     layer.key_edge.weight], dim=1))
+
+    n, e = 40, 150
+    x = torch.randn(n, channels, 3, dtype=torch.float64)
+    edge_index = torch.randint(0, n, (2, e))
+    edge_attr = torch.randn(e, edge_channels, 3, dtype=torch.float64)
+    src, dst = edge_index[0], edge_index[1]
+
+    split = layer.key_src(x)[src] + layer.key_dst(x)[dst] + layer.key_edge(edge_attr)
+    concatenated = wide(torch.cat([x[src], x[dst], edge_attr], dim=-2))
+    assert torch.allclose(split, concatenated, atol=1e-12)
+
+
+def test_splitting_a_layer_preserves_its_initialisation_scale():
+    """
+    Each piece of a split layer keeps the fan-in of the whole. Without that,
+    splitting silently rescales the initialisation -- a change that looks like
+    nothing and shifts every downstream activation.
+    """
+    from reassembly.nn.vn import VNLinear
+
+    torch.manual_seed(0)
+    wide = torch.stack([VNLinear(35, 32).weight.std() for _ in range(40)]).mean()
+    piece = torch.stack([VNLinear(16, 32, fan_in=35).weight.std()
+                         for _ in range(40)]).mean()
+    assert piece.item() == pytest.approx(wide.item(), rel=0.05)
+
+    unscaled = torch.stack([VNLinear(16, 32).weight.std() for _ in range(40)]).mean()
+    assert unscaled.item() > 1.3 * wide.item(), "without fan_in it would differ"
+
+
+def test_preflight_reports_the_largest_batch_that_fits():
+    """
+    "Out of memory" leaves the useful question unanswered. The number wanted is
+    the largest batch the card takes, and it costs seconds to measure.
+    """
+    from reassembly.training import _halvings
+
+    assert _halvings(4) == [4, 2, 1]
+    assert _halvings(8) == [8, 4, 2, 1]
+    assert _halvings(1) == [1]

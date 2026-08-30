@@ -127,7 +127,7 @@ tests still pass and the network tests skip.
 git clone <this-repo> && cd <this-repo>
 python -m venv .venv && source .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest                                        # 262 passed
+python -m pytest                                        # 283 passed
 ```
 
 Installing is optional — `pytest.ini` sets `pythonpath = src .` and each script
@@ -277,7 +277,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             278 tests, no skips
+tests/                             283 tests, no skips
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and

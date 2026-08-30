@@ -77,11 +77,27 @@ class VNGraphAttention(nn.Module):
         self.head_dim = head_dim
         self.per_head = channels // heads
 
-        # Score side: project to `heads * head_dim` directions, inner-product them.
+        # Score and message sides, split by input rather than concatenated.
+        #
+        # `VNLinear` has no bias, so `W [a;b;c] == W_a a + W_b b + W_c c`
+        # exactly -- and the split form never materialises the concatenation.
+        # That matters a great deal here: on a batch of 81k vertices and 488k
+        # directed edges, `cat([x_src, x_dst, edge_attr])` alone is 768 MB, and
+        # `cat([x_src, edge_attr])` another 393 MB, per layer, held for the
+        # backward pass. Splitting removes both, and lets each projection be
+        # applied to the N *nodes* and then gathered to the E edges instead of
+        # the other way round -- one sixth of the work on a triangle mesh.
+        # Measured on that batch: 2661 MB -> 1500 MB of activations per layer.
+        #
+        # `fan_in` keeps the initialisation identical to the single wide layer.
+        key_fan = channels + channels + edge_channels
         self.query = VNLinear(channels, heads * head_dim)
-        self.key = VNLinear(channels + channels + edge_channels, heads * head_dim)
-        # Message side: source features and the edge's three vectors.
-        self.value = VNLinear(channels + edge_channels, channels)
+        self.key_src = VNLinear(channels, heads * head_dim, fan_in=key_fan)
+        self.key_dst = VNLinear(channels, heads * head_dim, fan_in=key_fan)
+        self.key_edge = VNLinear(edge_channels, heads * head_dim, fan_in=key_fan)
+        value_fan = channels + edge_channels
+        self.value_src = VNLinear(channels, channels, fan_in=value_fan)
+        self.value_edge = VNLinear(edge_channels, channels, fan_in=value_fan)
         # The node's own contribution, outside the softmax -- so a node with no
         # edges still has an output, and so the layer can learn to ignore its
         # neighbourhood entirely.
@@ -105,20 +121,21 @@ class VNGraphAttention(nn.Module):
         src, dst = edge_index[0], edge_index[1]
         n = x.shape[0]
 
-        x_src, x_dst = x[src], x[dst]
-        key_parts = [x_src, x_dst]
-        value_parts = [x_src]
+        # Project on the N nodes, then gather to the E edges. The other order
+        # -- gather x to (E, C, 3) and project there -- is what the concatenated
+        # form required, and costs six times as much on a triangle mesh.
+        q = self.query(x)[dst].view(-1, self.heads, self.head_dim, 3)
+        k = self.key_src(x)[src] + self.key_dst(x)[dst]
         if edge_attr is not None:
-            key_parts.append(edge_attr)
-            value_parts.append(edge_attr)
-
-        q = self.query(x_dst).view(-1, self.heads, self.head_dim, 3)
-        k = self.key(torch.cat(key_parts, dim=-2)).view(-1, self.heads, self.head_dim, 3)
+            k = k + self.key_edge(edge_attr)
+        k = k.view(-1, self.heads, self.head_dim, 3)
         # Invariant: both factors rotate, so the inner product does not.
         logits = torch.sum(q * k, dim=(-2, -1)) * self.scale          # (E, heads)
 
         alpha = segment_softmax(logits, dst, n)                       # (E, heads)
-        messages = self.value(torch.cat(value_parts, dim=-2))         # (E, C, 3)
+        messages = self.value_src(x)[src]                             # (E, C, 3)
+        if edge_attr is not None:
+            messages = messages + self.value_edge(edge_attr)
         # Broadcast each head's weight across the channels it owns.
         weight = alpha.repeat_interleave(self.per_head, dim=1)        # (E, C)
         aggregated = segment_sum(messages * weight.unsqueeze(-1), dst, n)

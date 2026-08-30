@@ -610,7 +610,7 @@ filter in the loader.
 
 `reassembly.nn`, with `tests/test_nn_equivariance.py`, `tests/test_losses.py`
 and `tests/test_model.py`, plus `tests/test_training.py` for the engine.
-278 tests total, clean under `-W error`.
+283 tests total, clean under `-W error`.
 
 `torch` installs from the **default** PyPI index. The earlier failure was
 `download.pytorch.org` being blocked, not torch being unavailable — so
@@ -994,3 +994,49 @@ equally, so the scatter about each cluster centroid does not move. It is
 unidentifiable for stage two as well, since a global shift leaves every pairwise
 distance untouched. The bias was removed: a parameter that cannot be learned
 would otherwise show up as a dead gradient in every check forever.
+
+### Two bugs the first real preflight found
+
+Both on a 1,006-object local dataset, in the three minutes before a session
+would have started.
+
+**16 objects appeared in both train and val.** `load_official_split` took
+`Path(line).name` — the object directory name, discarding the category.
+Breaking Bad lists `everyday/<category>/<object>` and object directory names
+are *not* unique across categories, so a name present in both lists put the
+same scene in both splits. That is the worst shape a bug can take: validation
+becomes partly a memorisation test, so the number it produces is **better** than
+the honest one and reads as success. Matching is now on `(category, object)`,
+with a per-entry fallback for split files that list bare names, and
+`BreakingBadScenes` raises if any pair of splits still intersects — checked in
+the loader rather than only in preflight, because a preflight is skippable and
+this must not be.
+
+**Out of memory at `batch_size=4` on a 15.6 GB T4.** Measured where it went:
+on a batch of 81k vertices and 488k directed edges at `channels=64`, one
+intra-fragment attention layer retained **2,961 MB** for the backward pass, and
+1.16 GB of that was pure concatenation temporary — `cat([x_src, x_dst,
+edge_attr])` at 768 MB and `cat([x_src, edge_attr])` at 393 MB, built only to be
+multiplied.
+
+`VNLinear` has no bias, so `W [a;b;c] == W_a a + W_b b + W_c c` exactly. The
+layer now applies separate projections and sums them, which removes both
+concatenations *and* lets each projection run on the N **nodes** before being
+gathered to the E edges rather than after — one sixth of the work on a triangle
+mesh. Measured: **2,961 → 2,091 MB per layer**, 29%, 3.5 GB across the four
+intra layers. `fan_in` on `VNLinear` keeps each piece's initialisation identical
+to the single wide layer; without it, splitting silently rescales it.
+
+Two things follow that the arithmetic alone would not have given:
+
+- The saving is real but not sufficient on its own. Preflight now **halves the
+  batch until something fits** and reports the largest that does, with the
+  `--accumulate` needed to keep the effective batch — "out of memory" alone
+  leaves the useful question unanswered.
+- Preflight samples a dozen scenes; the dataset's largest single fragment is
+  83,039 vertices, several times anything it will have seen. So the training
+  loop now catches `OutOfMemoryError`, empties the cache, and skips that batch
+  with a count and a size — one pathological scene must not end an eleven-hour
+  session. It is counted and reported rather than swallowed: if it fires often,
+  the batch size is wrong and the largest objects are being dropped from
+  training.

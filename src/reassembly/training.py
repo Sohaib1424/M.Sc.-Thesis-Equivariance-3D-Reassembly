@@ -245,6 +245,8 @@ class BreakingBadScenes:
             )
         official = load_official_split(config.root, split, config.official_subset)
         self.scenes = filter_by_split(scenes, split, official=official)
+        if split in ("train", "val") and official is not None:
+            _assert_splits_disjoint(scenes, config)
         if not self.scenes:
             raise FileNotFoundError(f"no scenes left in split {split!r}")
         self.official = official is not None
@@ -351,6 +353,37 @@ class Skipped(NamedTuple):
     """A sample the dataset could not build, carrying why."""
     key: str
     reason: str
+
+
+def _assert_splits_disjoint(scenes, config: Config) -> None:
+    """
+    Refuse to build a dataset whose train and val splits overlap.
+
+    An object in both makes validation partly a memorisation test, and the
+    resulting number is *better* than the honest one -- so it never looks like
+    an error, it looks like success. Checked here rather than only in preflight
+    because a preflight is easy to skip and this must not be skippable.
+    """
+    from .data.paths import filter_by_split, load_official_split
+
+    keys = {}
+    for name in ("train", "val", "test"):
+        official = load_official_split(config.root, name, config.official_subset)
+        if official is None:
+            return
+        keys[name] = {s.object_key for s in filter_by_split(scenes, name,
+                                                            official=official)}
+    for a, b in (("train", "val"), ("train", "test"), ("val", "test")):
+        shared = keys[a] & keys[b]
+        if shared:
+            listed = ", ".join(sorted(shared)[:5])
+            raise ValueError(
+                f"{len(shared)} object(s) appear in both the {a} and {b} splits "
+                f"-- validation would be measuring memorisation. First few: "
+                f"{listed}. This usually means the split files list "
+                f"<category>/<object> while matching used the object name "
+                f"alone; check reassembly.data.paths.split_key."
+            )
 
 
 def _collate_samples(samples):
@@ -560,6 +593,7 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
     counts = 0
     fragments = 0
     skipped = 0
+    oom = 0
     dropped: Dict[str, str] = {}
     predictions, targets = [], []
     bar = Progress(len(loader), prefix=f"  {label:5s}", enabled=show_progress)
@@ -584,9 +618,33 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
                 for group in optimizer.param_groups:
                     group["lr"] = rate
 
-            with torch.autocast(device_type=torch.device(device).type,
-                                enabled=bool(scaler)):
-                loss, report, R = _forward(model, batch, criterion, config)
+            try:
+                with torch.autocast(device_type=torch.device(device).type,
+                                    enabled=bool(scaler)):
+                    loss, report, R = _forward(model, batch, criterion, config)
+            except torch.cuda.OutOfMemoryError:
+                # One pathological scene must not end an eleven-hour session.
+                # Breaking Bad's largest fragment is 83,039 vertices, and a
+                # preflight that samples a dozen scenes will not have seen it,
+                # so a batch that fits everything measured can still be handed
+                # something several times larger at hour six.
+                #
+                # Skipped, counted and named -- not swallowed. If this fires
+                # more than a handful of times the batch size is wrong, and a
+                # silent skip would hide that while quietly removing the
+                # largest objects from training.
+                oom += 1
+                dropped[f"OOM:batch{index}"] = (
+                    f"{batch.node_features.shape[0]:,} vertices, "
+                    f"{batch.num_fragments} fragments"
+                )
+                model.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                print(f"\n  [oom] batch {index} "
+                      f"({batch.node_features.shape[0]:,} vertices) did not fit; "
+                      f"skipped")
+                bar.update(1)
+                continue
 
             if not torch.isfinite(loss):
                 # Not skipped silently: a non-finite loss means the inputs or
@@ -645,6 +703,7 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
     summary["fragments"] = fragments
     summary["skipped"] = skipped
     summary["dropped"] = len(dropped)
+    summary["oom"] = oom
     summary["dropped_names"] = sorted(dropped)[:20]
     if predictions:
         summary.update(_metrics(torch.cat(predictions), torch.cat(targets)))
@@ -1355,6 +1414,11 @@ def _report_dropped(train_summary: Dict, val_summary: Dict) -> None:
             print(f"  {label}: {summary['dropped']} sample(s) unusable: {shown}{more}")
         if summary.get("skipped"):
             print(f"  {label}: {summary['skipped']} batch(es) skipped entirely")
+        if summary.get("oom"):
+            print(f"  {label}: {summary['oom']} batch(es) hit OOM and were "
+                  f"skipped. A handful is survivable; more than that means "
+                  f"--batch-size is too high and the largest objects are being "
+                  f"dropped from training.")
 
 
 def _resume_recipe(config: Config, out_dir: Path) -> str:
@@ -1537,37 +1601,66 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     model = build_model(config).to(device)
     criterion = build_criterion(config)
     biggest = built[int(np.argmax(vertices))]
-    batch, _ = _collate_samples([biggest] * config.batch_size)
-    batch = _to_device(batch, device)
-    if device.startswith("cuda"):
-        torch.cuda.reset_peak_memory_stats()
-    try:
-        loss, report, _ = _forward(model, batch, criterion, config)
-        loss.backward()
-    except torch.cuda.OutOfMemoryError:
-        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+    total_memory = (torch.cuda.get_device_properties(0).total_memory / 1e9
+                    if device.startswith("cuda") else 0.0)
+
+    # Try the configured batch size, then halve until something fits. Reporting
+    # "out of memory" alone leaves the useful question unanswered; the number
+    # that is actually wanted is the largest batch this card can take, and it
+    # costs seconds to measure rather than a session to discover.
+    fitted, peak, report = 0, 0.0, {}
+    for candidate in _halvings(config.batch_size):
+        batch, _ = _collate_samples([biggest] * candidate)
+        batch = _to_device(batch, device)
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+        try:
+            loss, report, _ = _forward(model, batch, criterion, config)
+            loss.backward()
+        except torch.cuda.OutOfMemoryError:
+            model.zero_grad(set_to_none=True)
+            del batch
+            torch.cuda.empty_cache()
+            print(f"  batch_size={candidate}: out of memory")
+            continue
+        peak = (torch.cuda.max_memory_allocated() / 1e9
+                if device.startswith("cuda") else 0.0)
+        fitted = candidate
+        print(f"  batch_size={candidate}: fits"
+              + (f", peak {peak:.2f} GB of {total_memory:.1f} GB "
+                 f"({100 * peak / total_memory:.0f}%)" if peak else ""))
+        break
+
+    if fitted == 0:
         problems.append(
-            f"out of memory on the largest scene at batch_size="
-            f"{config.batch_size} ({total:.0f} GB card). Lower --batch-size, "
-            f"or --tokens-per-scene, and use --accumulate to keep the effective "
-            f"batch."
+            f"out of memory even at batch_size=1 on a {total_memory:.0f} GB card. "
+            f"Lower --channels (64 -> 32 roughly halves the activations) or "
+            f"--tokens-per-scene."
         )
-        print("  OUT OF MEMORY")
         _summarise(problems, warnings)
         return False
-    peak = (torch.cuda.max_memory_allocated() / 1e9) if device.startswith("cuda") else 0.0
+    if fitted < config.batch_size:
+        effective = max(config.batch_size // fitted, 1)
+        problems.append(
+            f"batch_size={config.batch_size} does not fit; {fitted} does. Use "
+            f"--batch-size {fitted} --accumulate {effective}, which keeps the "
+            f"effective batch at {fitted * effective} and costs only a little "
+            f"speed."
+        )
+    elif peak and peak > 0.65 * total_memory:
+        warnings.append(
+            f"peak memory is {100 * peak / total_memory:.0f}% of the card on the "
+            f"largest of {samples} sampled scenes -- and the dataset's largest "
+            f"single fragment is 83,039 vertices, several times anything sampled "
+            f"here. Training catches an OOM and skips the batch, but if that "
+            f"fires often the largest objects are being dropped. Consider "
+            f"--batch-size {max(fitted // 2, 1)} --accumulate 2."
+        )
+
     parameters = sum(p.numel() for p in model.parameters())
-    print(f"  parameters {parameters:,}   worst-case batch "
-          f"{batch.num_fragments} fragments, {batch.node_features.shape[0]:,} vertices,"
-          f" {batch.token_query.numel():,} cross pairs")
-    if peak:
-        total = torch.cuda.get_device_properties(0).total_memory / 1e9
-        print(f"  peak GPU memory {peak:.2f} GB of {total:.1f} GB "
-              f"({100 * peak / total:.0f}%)")
-        if peak > 0.8 * total:
-            warnings.append(f"peak memory is {100 * peak / total:.0f}% of the "
-                            f"card on the largest sampled scene, and a larger "
-                            f"one exists in the dataset. Lower --batch-size.")
+    print(f"  parameters {parameters:,}   worst case tested: "
+          f"{fitted} x the largest sampled scene")
     dead = [n for n, p in model.named_parameters()
             if p.grad is None or p.grad.abs().sum() == 0]
     if dead:
@@ -1637,6 +1730,17 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
         )
 
     return _summarise(problems, warnings)
+
+
+def _halvings(start: int) -> List[int]:
+    """``4 -> [4, 2, 1]``: the batch sizes to try, largest first."""
+    sizes, value = [], max(int(start), 1)
+    while value >= 1:
+        sizes.append(value)
+        if value == 1:
+            break
+        value //= 2
+    return sizes
 
 
 def _summarise(problems: List[str], warnings: List[str]) -> bool:

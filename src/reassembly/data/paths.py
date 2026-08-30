@@ -176,15 +176,53 @@ def assign_split(name: str, val_frac: float = 0.1, test_frac: float = 0.1,
     return "train"
 
 
+# Extensions a split file might carry on its entries; stripped before matching.
+_SPLIT_SUFFIXES = (".obj", ".npy", ".npz", ".txt", ".ply")
+
+
+def split_key(parts: Sequence[str]) -> tuple:
+    """
+    The identity used to match a scene against a split list.
+
+    The **last two** path components -- category and object -- not the object
+    name alone. Breaking Bad's split files list ``everyday/<category>/<object>``,
+    and object directory names are not unique across categories, so matching on
+    the basename silently merges distinct objects. When that basename appears in
+    both the train and the val list the *same* scene passes both filters and
+    lands in both splits, which makes validation partly a memorisation test and
+    nothing raises. A real dataset put 16 objects in both.
+    """
+    cleaned = [p for p in parts if p and p not in (".", "..")]
+    if not cleaned:
+        return ()
+    last = cleaned[-1]
+    for suffix in _SPLIT_SUFFIXES:
+        if last.lower().endswith(suffix):
+            last = last[: -len(suffix)]
+            break
+    cleaned[-1] = last
+    return tuple(cleaned[-2:])
+
+
+def scene_split_key(scene: "Scene") -> tuple:
+    """A scene's own key, in the same shape :func:`split_key` produces."""
+    parts = [p for p in scene.category.split("/") if p] + [scene.name]
+    return split_key(parts)
+
+
 def load_official_split(root: str | os.PathLike, split: str,
                         subset: str = "everyday") -> Optional[set]:
     """
     Read Breaking Bad's shipped split lists, if present.
 
     Looks for ``data_split/**/{subset}.{split}.txt`` anywhere under ``root``
-    -- ``rglob`` rather than ``glob`` because the directory is often nested
-    one level deeper than expected. Returns a set of object names, or ``None``
-    when no list is found so the caller can fall back to :func:`assign_split`.
+    -- ``rglob`` rather than ``glob`` because the directory is often nested one
+    level deeper than expected. Returns a set of ``(category, object)`` keys, or
+    ``None`` when no list is found so the caller can fall back to
+    :func:`assign_split`.
+
+    Entries keep their category. Returning bare object names, as this used to,
+    merges same-named objects from different categories -- see :func:`split_key`.
     """
     root = Path(root)
     patterns = [f"{subset}.{split}.txt", f"{subset}_{split}.txt", f"{split}.txt"]
@@ -192,7 +230,8 @@ def load_official_split(root: str | os.PathLike, split: str,
         for candidate in sorted(root.rglob(pattern)):
             lines = [ln.strip() for ln in candidate.read_text().splitlines() if ln.strip()]
             if lines:
-                return {Path(ln).name if "/" in ln else ln for ln in lines}
+                keys = {split_key(ln.replace("\\", "/").split("/")) for ln in lines}
+                return {k for k in keys if k}
     return None
 
 
@@ -205,7 +244,12 @@ def filter_by_split(scenes: Sequence[Scene], split: Optional[str],
     if split not in SPLITS:
         raise ValueError(f"split must be one of {SPLITS} or None, got {split!r}")
     if official is not None:
-        return [s for s in scenes if s.name in official]
+        # Match on (category, object), with a name-only fallback for split
+        # files that list bare names. The fallback is per-entry, so a list that
+        # carries categories is never weakened by one that does not.
+        names = {k[-1] for k in official if len(k) == 1}
+        return [s for s in scenes
+                if scene_split_key(s) in official or s.name in names]
     return [s for s in scenes
             if assign_split(s.name, val_frac, test_frac, seed) == split]
 

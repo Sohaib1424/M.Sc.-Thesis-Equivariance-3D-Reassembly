@@ -88,17 +88,25 @@ class VNLinear(nn.Module):
     axis, and the two commute. No bias -- see the module docstring.
     """
 
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+    def __init__(self, in_channels: int, out_channels: int,
+                 fan_in: Optional[int] = None) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        # `fan_in` overrides the initialisation scale without changing the
+        # shape. It exists so that one wide layer can be split into several
+        # narrow ones -- `W [a;b;c] = W_a a + W_b b + W_c c`, exact because
+        # there is no bias -- while each piece keeps the scale it would have
+        # had as part of the whole. Without it, splitting a layer silently
+        # rescales its initialisation.
+        self.fan_in = in_channels if fan_in is None else int(fan_in)
         self.weight = nn.Parameter(torch.empty(out_channels, in_channels))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        # Kaiming-uniform on fan_in = in_channels. The spatial axis is not a
-        # fan-in: it is carried along, not summed over.
-        bound = 1.0 / math.sqrt(self.in_channels)
+        # Kaiming-uniform on fan_in. The spatial axis is not a fan-in: it is
+        # carried along, not summed over.
+        bound = 1.0 / math.sqrt(self.fan_in)
         nn.init.uniform_(self.weight, -bound, bound)
 
     def forward(self, x: Tensor) -> Tensor:

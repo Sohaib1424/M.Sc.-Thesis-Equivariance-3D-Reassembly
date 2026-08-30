@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 293 tests, clean under `-W error` |
+| Pipeline | **built** — 304 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -20,6 +20,8 @@ implementing anything from it.
 | First preflight | found a train/val split overlap and an OOM; both fixed |
 | Second preflight | found the memory ceiling: cross-attention was 7.2 GB of 15.6 GB, now 0.6 GB |
 | Third preflight | `batch_size=2` fits at 76%; preflight itself is now tested end to end |
+| First real run | 13 min on 400 objects — caught an embedding loss minimised by collapse |
+| Two full epochs | rotation flat at chance after 3,536 steps; OOM guard, DDP skip and both time projections fixed |
 
 ---
 
@@ -307,7 +309,7 @@ normal ordering · fracture patches / sampling / budgeting · cross-fragment
 correspondence · SE(3) perturbation · visualiser · exhaustive extraction pass ·
 three analysis scripts · **Vector Neuron primitives · segment reductions ·
 intra-fragment VN-GAT · cross-fragment attention · the composite loss · feature
-construction and batch collate · the backbone and rotation head**. 293 tests,
+construction and batch collate · the backbone and rotation head**. 304 tests,
 no skips.
 
 **Not built** — the translation solver (stage two).
@@ -418,6 +420,12 @@ throws away every check that had already passed.
   weights are deliberately all 1.0 and untuned: the terms have very different
   natural scales, and the first run should *measure* the relative sizes rather
   than assume them. `ReassemblyLoss` returns every term separately for that.
+- **Nothing has been trained to convergence.** One 13-minute calibration run
+  has happened, on 400 objects for 3 epochs. It moved nothing on rotation, and
+  that is not a verdict: 300 optimizer steps against a planned 65,000 is half a
+  percent of training, with the whole cosine schedule compressed into it. The
+  outstanding question — can the machinery fit *real* geometry at all — needs an
+  overfit run on a few dozen real samples, not a short run on many.
 - **Nothing has been trained.** Every number above is a property of the
   architecture, not evidence that it learns. The training loop, the GARF-metric
   evaluation and the translation solver are next.

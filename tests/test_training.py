@@ -598,11 +598,52 @@ def test_the_time_report_projects_remaining_sessions():
     """The number that decides whether a plan is workable."""
     from reassembly.training import _time_report
 
-    history = [{"epoch": i, "seconds": 3600.0} for i in range(3)]
-    line = _time_report(history, Config(epochs=13, max_hours=11.0), 10_800.0, 0)
+    history = [{"epoch": i, "seconds": 3600.0, "steps": 1000} for i in range(3)]
+    line = _time_report(history, Config(epochs=13, max_hours=11.0), 10_800.0, 0,
+                        steps_per_epoch=1000)
     assert "1:00:00/epoch" in line
     assert "10 epoch(s) left" in line
     assert "1 more session(s)" in line
+
+
+def test_the_time_report_survives_the_epoch_size_changing():
+    """
+    The projection is what a session plan is built on, and it was wrong by 2.7x
+    on the first long run.
+
+    A `--limit-train 400` calibration leaves three 236-second epochs in the
+    history. Resuming on the full dataset makes each epoch 3,555 seconds, and
+    averaging the last three across that boundary reported "~22:09/epoch" for
+    an epoch that took 59 minutes. Averaging *per step* is invariant to the
+    dataset size changing, which it does on exactly the resume where the
+    estimate matters most.
+    """
+    from reassembly.training import _time_report
+
+    history = ([{"epoch": i, "seconds": 236.0, "steps": 100} for i in range(3)]
+               + [{"epoch": 3, "seconds": 3555.0, "steps": 1618}])
+    line = _time_report(history, Config(epochs=6, max_hours=11.0), 4341.0, 3,
+                        steps_per_epoch=1618)
+    # 236/100 = 2.36 and 3555/1618 = 2.20 s/step, so blending them projects
+    # ~62 min against an actual 59 -- 5% out, where averaging the durations
+    # was 170% out.
+    token = line.split("~")[1].split("/epoch")[0]
+    hours, minutes, seconds = (int(p) for p in token.split(":"))
+    projected = hours * 3600 + minutes * 60 + seconds
+    assert abs(projected - 3555) < 0.10 * 3555, (
+        f"projected {projected}s for an epoch that takes 3555s: {line}"
+    )
+
+
+def test_the_time_report_falls_back_for_a_checkpoint_without_step_counts():
+    """A checkpoint written before `steps` was recorded must still project."""
+    from reassembly.training import _time_report
+
+    history = [{"epoch": i, "seconds": 100.0 * (i + 1)} for i in range(3)]
+    line = _time_report(history, Config(epochs=5, max_hours=11.0), 600.0, 0,
+                        steps_per_epoch=50)
+    # The most recent epoch alone, not an average over three different sizes.
+    assert "5:00/epoch" in line, line
 
 
 def test_the_stop_signal_only_sets_a_flag(capsys):
@@ -961,3 +1002,104 @@ def test_preflight_says_the_batch_does_not_fit_rather_than_crashing(tmp_path,
                     batch_size=4, channels=16, heads=4, workers=0,
                     tokens_per_scene=64)
     assert training.preflight(config) is False
+
+
+# --------------------------------------------------------------------------
+# Running out of memory mid-epoch
+# --------------------------------------------------------------------------
+
+class _OOMOnBackward(torch.autograd.Function):
+    """Raises where a real out-of-memory raises: in the backward pass."""
+
+    @staticmethod
+    def forward(ctx, x):
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        raise torch.cuda.OutOfMemoryError("simulated")
+
+
+def _loader(n=4):
+    return torch.utils.data.DataLoader(_Fixed(n), batch_size=1,
+                                       collate_fn=_collate_samples)
+
+
+def test_an_out_of_memory_in_the_backward_is_caught():
+    """
+    The guard used to wrap only the forward, which is the *cheaper* half: peak
+    memory is in the backward, and that is exactly where a real six-epoch run
+    died -- an uncaught `torch.OutOfMemoryError` inside `scaled.backward()`
+    ending the run at 3% of the final epoch, after two hours.
+    """
+    torch.manual_seed(0)
+    config = Config(channels=16, heads=4, workers=0, batch_size=1)
+    model = build_model(config)
+    # Make every backward fail, the way an oversized scene would.
+    head = model.embedding
+    model.embedding = torch.nn.Sequential(head, _Lambda(_OOMOnBackward.apply))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    summary, _, _ = run_epoch(model, _loader(), build_criterion(config), config,
+                              optimizer=optimizer, step=0, total_steps=10,
+                              label="train", show_progress=False)
+    assert summary["oom"] == 4, "every batch should have been skipped, not raised"
+
+
+class _Lambda(torch.nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x):
+        return self.fn(x)
+
+
+def test_under_ddp_an_out_of_memory_stops_instead_of_skipping():
+    """
+    Skipping is safe alone and *unsafe* under DDP.
+
+    A rank that runs out of memory has already all-reduced some gradient
+    buckets, so its peer is waiting on buckets that will never arrive. Skipping
+    the batch on one rank and not the other hangs the job silently -- which
+    costs the whole session, where stopping costs one epoch and checkpoints it.
+    """
+    torch.manual_seed(0)
+    config = Config(channels=16, heads=4, workers=0, batch_size=1)
+    model = build_model(config)
+    model.embedding = torch.nn.Sequential(model.embedding,
+                                          _Lambda(_OOMOnBackward.apply))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    summary, _, stopped = run_epoch(
+        model, _loader(), build_criterion(config), config, optimizer=optimizer,
+        step=0, total_steps=10, label="train", show_progress=False,
+        distributed=True,
+    )
+    assert stopped is True, "DDP must stop rather than desynchronise the ranks"
+    assert summary["oom"] == 1, "it should stop on the first one, not keep trying"
+
+
+def test_an_oversized_batch_is_skipped_before_it_is_attempted():
+    """
+    The decision has to be made *before* the forward, from a quantity every
+    rank computes identically. An out-of-memory error arrives on whichever rank
+    was tighter, so it can never be the basis of a collective decision.
+    """
+    torch.manual_seed(0)
+    model = build_model(Config(channels=16, heads=4))
+    tiny = Config(channels=16, heads=4, workers=0, batch_size=1,
+                  max_vertices_per_batch=1)
+    summary, _, _ = run_epoch(model, _loader(), build_criterion(tiny), tiny,
+                              optimizer=torch.optim.AdamW(model.parameters()),
+                              step=0, total_steps=10, label="train",
+                              show_progress=False)
+    assert summary["oom"] == 4
+
+    generous = Config(channels=16, heads=4, workers=0, batch_size=1,
+                      max_vertices_per_batch=10_000_000)
+    summary, _, _ = run_epoch(model, _loader(), build_criterion(generous), generous,
+                              optimizer=torch.optim.AdamW(model.parameters()),
+                              step=0, total_steps=10, label="train",
+                              show_progress=False)
+    assert summary["oom"] == 0

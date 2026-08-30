@@ -35,6 +35,7 @@ torch = pytest.importorskip("torch")
 
 from reassembly.nn.losses import (
     ReassemblyLoss,
+    correspondence_loss,
     _euler_xyz,
     cosine_loss,
     embedding_consistency_loss,
@@ -316,7 +317,20 @@ def test_composite_loss_reports_every_term_at_its_chance_value():
     assert report["face"] == pytest.approx(2.0, abs=0.12)
 
 
-def test_composite_loss_is_zero_for_a_perfect_prediction():
+def test_the_geometric_terms_are_zero_for_a_perfect_prediction():
+    """
+    The geometric terms bottom out at zero. The embedding term does **not**,
+    and that is worth knowing before reading a training curve.
+
+    `correspondence_loss` is InfoNCE, whose minimum is not 0 but a small
+    temperature-dependent floor: even a perfect embedding gives every negative
+    a cosine above -1, so the denominator keeps a little mass. Reading "total"
+    as "distance from perfect" is therefore wrong now -- the floor moved off
+    zero when the embedding term stopped being minimisable by collapse.
+
+    `match@1` is the number that does read absolutely: it is 1.0 exactly when
+    every coincident vertex retrieves its true partner.
+    """
     criterion = ReassemblyLoss()
     R = haar(20, 16)
     v = torch.randn(200, 3, dtype=DTYPE)
@@ -330,11 +344,16 @@ def test_composite_loss_is_zero_for_a_perfect_prediction():
         vertex_batch=fragment,
         embeddings=z[fragment], cluster=fragment, num_clusters=20,
     )
-    assert total.item() < 1e-7
-    for name, value in report.items():
+    for name in ("rotation", "position", "normal"):
         # `position` and `normal` floor at the `safe_norm` epsilon, 1e-8, so
         # this is "zero to the precision the guarded norms allow".
-        assert abs(value) < 1e-6, f"{name} = {value} should be 0 for a perfect fit"
+        assert abs(report[name]) < 1e-6, f"{name} = {report[name]} should be 0"
+
+    # A perfect embedding retrieves every partner, and the residual loss is the
+    # InfoNCE floor rather than an error.
+    assert report["match@1"] == 1.0
+    assert report["embedding"] < 0.2
+    assert total.item() == pytest.approx(report["embedding"], abs=1e-6)
 
 
 def test_the_face_term_uses_only_the_normal_channels():
@@ -367,3 +386,102 @@ def test_the_face_term_uses_only_the_normal_channels():
     assert report["face"] == pytest.approx(sliced["face"], abs=1e-12), (
         "passing three channels must give the same answer as passing two"
     )
+
+
+# --------------------------------------------------------------------------
+# The embedding head: why the agreement term alone was wrong
+# --------------------------------------------------------------------------
+
+def _clusters(pairs: int = 64, per: int = 2):
+    return torch.arange(pairs).repeat_interleave(per), pairs
+
+
+def test_the_agreement_term_alone_is_minimised_by_collapse():
+    """
+    The bug this replaced, stated as a test so it cannot come back.
+
+    `embedding_consistency_loss` asks coincident vertices to agree, and the
+    cheapest way to agree is for everything to agree. A constant embedding
+    scores *exactly zero* -- better than any embedding that actually
+    distinguishes anything. This is not a corner case: the first real training
+    run found it in three epochs, reporting 0.0335 -> 0.0002 while the spread
+    of the embeddings fell by 8x and their norm stayed put.
+    """
+    cluster, n = _clusters()
+    constant = torch.ones(len(cluster), 16, dtype=DTYPE)
+    assert embedding_consistency_loss(constant, cluster, n).item() == 0.0
+
+    informative = torch.randn(n, 16, dtype=DTYPE).repeat_interleave(2, 0)
+    informative = informative + 0.01 * torch.randn_like(informative)
+    assert embedding_consistency_loss(informative, cluster, n).item() > 0.0
+
+
+def test_the_contrastive_term_makes_collapse_the_worst_answer():
+    """
+    Collapse now scores `log(A - 1) - log(|pos|)` exactly -- the value of a
+    uniform distribution over candidates, which is what a constant embedding
+    is. Verified against the closed form rather than a magic number.
+    """
+    cluster, n = _clusters()
+    size = len(cluster)
+    constant = torch.ones(size, 16, dtype=DTYPE)
+    collapsed = correspondence_loss(constant, cluster, n).item()
+    assert collapsed == pytest.approx(math.log(size - 1) - math.log(1), abs=1e-9)
+
+    perfect = torch.nn.functional.normalize(
+        torch.randn(n, 16, dtype=DTYPE), dim=-1).repeat_interleave(2, 0)
+    assert correspondence_loss(perfect, cluster, n).item() < 0.2 * collapsed
+
+
+def test_match_at_1_reads_absolutely_where_the_loss_does_not():
+    """
+    The loss floor depends on temperature and on how many anchors there are, so
+    it cannot be read without a per-batch reference. `match@1` can: it is the
+    fraction of coincident vertices whose true partner is their own nearest
+    neighbour -- chance near zero, perfect exactly 1.
+    """
+    cluster, n = _clusters()
+    perfect = torch.nn.functional.normalize(
+        torch.randn(n, 16, dtype=DTYPE), dim=-1).repeat_interleave(2, 0)
+    _, accuracy = correspondence_loss(perfect, cluster, n, return_accuracy=True)
+    assert accuracy.item() == 1.0
+
+    # A collapsed embedding ties every distance, so its nearest neighbour is
+    # arbitrary -- it cannot fake this number the way it faked the old loss.
+    _, collapsed = correspondence_loss(
+        torch.ones(len(cluster), 16, dtype=DTYPE), cluster, n, return_accuracy=True)
+    assert collapsed.item() < 0.2
+
+
+def test_the_contrastive_term_ignores_unclustered_vertices():
+    """`-1` means "no coincidence partner" and must not become a cluster."""
+    cluster = torch.tensor([0, 0, 1, 1, -1, -1, -1])
+    z = torch.nn.functional.normalize(torch.randn(7, 16, dtype=DTYPE), dim=-1)
+    z[4:] = z[0]                                  # unclustered copies of anchor 0
+    with_noise = correspondence_loss(z, cluster, 2).item()
+    z2 = z.clone()
+    z2[4:] = torch.nn.functional.normalize(torch.randn(3, 16, dtype=DTYPE), dim=-1)
+    assert correspondence_loss(z2, cluster, 2).item() == pytest.approx(with_noise)
+
+
+def test_the_contrastive_term_caps_its_anchor_count():
+    """
+    The similarity matrix is quadratic in anchors and a scene can label
+    thousands of vertices -- the same trap the cross-attention layer had. The
+    cap keeps it bounded, and the loss must still be finite and differentiable.
+    """
+    cluster = torch.arange(3000).repeat_interleave(2)
+    z = torch.randn(6000, 16, dtype=DTYPE, requires_grad=True)
+    loss = correspondence_loss(z, cluster, 3000, max_anchors=256)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(z.grad).all()
+    # Only the sampled anchors receive gradient.
+    assert 0 < int((z.grad.abs().sum(dim=-1) > 0).sum()) <= 256
+
+
+def test_the_contrastive_term_survives_a_scene_with_no_clusters():
+    empty = torch.zeros(0, dtype=torch.long)
+    assert correspondence_loss(torch.zeros(0, 16, dtype=DTYPE), empty, 0).item() == 0.0
+    lonely = torch.tensor([-1, -1, -1])
+    assert correspondence_loss(torch.randn(3, 16, dtype=DTYPE), lonely, 0).item() == 0.0

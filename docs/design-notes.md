@@ -610,7 +610,7 @@ filter in the loader.
 
 `reassembly.nn`, with `tests/test_nn_equivariance.py`, `tests/test_losses.py`
 and `tests/test_model.py`, plus `tests/test_training.py` for the engine.
-293 tests total, clean under `-W error`.
+304 tests total, clean under `-W error`.
 
 `torch` installs from the **default** PyPI index. The earlier failure was
 `download.pytorch.org` being blocked, not torch being unavailable — so
@@ -1224,3 +1224,146 @@ count, but workers are per *rank*: on a 2-GPU 4-CPU box, `workers=2` means four
 worker processes plus two training processes on four CPUs. Scene building costs
 ~647 ms and happens in those workers, so contention there comes straight off
 epoch time. The check now counts `workers × devices + devices`.
+
+### The first real training run, and the loss that was minimised by collapse
+
+The calibration run — 400 objects, 3 epochs, 13 minutes — was worth its cost
+immediately, though not for the reason it was run.
+
+**What it did not show.** Rotation sat at 2.196 / 2.201 / 2.199 rad across the
+three epochs, i.e. 125.8° against a chance of 126.5°, dead flat. That reads like
+a verdict and is not one: 3 epochs × 100 steps is **300 optimizer steps against
+a planned 65,000** — half a percent of training, with the whole cosine schedule
+compressed into it. The run was too short to move a from-scratch model and was
+never capable of answering the question it was set. The right calibration is an
+**overfit test on real data**: a few dozen real samples and enough steps to
+memorise them. That separates "the machinery works on real geometry" from "it
+generalises", and only the first is answerable in an hour.
+
+**What it did show.** The embedding term fell 0.0335 → 0.0007 → 0.0002 while
+every other term stood still. That is not learning, it is collapse, and it is a
+property of the loss rather than an accident:
+
+```
+L = mean_c mean_{i in c} ||z_i - mean(z_c)||^2
+```
+
+is **exactly zero for a constant embedding**. Coincident vertices are asked to
+agree, and the cheapest way to agree is for everything to agree. Reproduced on
+synthetic scenes: over 180 steps the loss fell 0.0109 → 0.0010 while the spread
+of the embeddings fell 0.166 → 0.021 and their norm held at ~2.0 — converging on
+one vector, reporting success the whole way.
+
+The earlier note in this file argued this term was right because the design
+document's `||sum_i z_i||^2` rewards *cancellation*. That was true and
+insufficient: fixing the cancellation minimum left the collapse minimum
+untouched. A constant embedding is worse than an untrained one for what the head
+exists to do, since stage two matches interface points by mutual nearest
+neighbours and a constant embedding ties every distance.
+
+#### The replacement
+
+`correspondence_loss` is InfoNCE over the coincidence clusters — attraction plus
+the repulsion that makes collapse expensive:
+
+```
+L = -mean_i log[ sum_{p in pos(i)} exp(s_ip/T) / sum_{k != i} exp(s_ik/T) ]
+```
+
+Written contrastively rather than as a variance floor because the negatives are
+exactly the confusion set at matching time — the other fracture vertices of the
+same scene — so the training objective and the downstream use become the same
+question. Collapse now scores `log(A-1) - log|pos|`, verified against the closed
+form: with 128 anchors in pairs it is 4.844, against 0.024 for a perfect
+embedding. It is not the global maximum (random scores 6.30, worse), and the
+symmetric point is a saddle rather than a strict minimum — but the number is now
+*honest*, which is the property that failed before. A collapsed run reports 4.84,
+not 0.0002.
+
+Anchors are capped at 1024: the similarity matrix is quadratic in them and a
+scene can label thousands of vertices, which is the same trap the
+cross-attention layer had.
+
+**Two consequences to know before reading a curve.**
+
+The composite total no longer bottoms out at zero — InfoNCE has a small
+temperature-dependent floor even for a perfect embedding (0.11 in the test), so
+"total" is no longer a distance from perfect.
+
+And the term reported next to the metrics is now **`match@1`**, the fraction of
+coincident vertices whose true partner is their own nearest neighbour. Unlike
+the loss it needs no per-batch reference — chance is `|pos|/(A-1)`, near zero,
+and perfect is exactly 1 — and unlike the term it replaced, a collapsed
+embedding cannot fake it.
+
+#### The DDP warning is expected
+
+`find_unused_parameters=True` prints a warning saying it found no unused
+parameters. It stays on: the cross layer's `query`, `key` and `value`
+projections are only reached when a batch has at least one cross-fragment pair,
+and a batch whose scenes all lack a fracture surface skips them. That case is
+rare, which is exactly what makes it dangerous — DDP would hang, hours in, on a
+batch that never came up in testing. The cost is one extra autograd traversal
+per iteration; the alternative is a lost session.
+
+### Two full epochs on the real dataset — three bugs, and a number that is now worth reading
+
+The six-epoch run reached epoch 6 and died. What it produced on the way is more
+useful than the crash.
+
+**The rotation error is flat, and this time that means something.** Epochs 4 and
+5 were full passes: 1,618 steps each, 3,236 steps on top of the 300 already
+done, two complete passes over 6,472 samples. Train rotation went 2.2019 →
+2.2008 rad and validation 2.2053 → 2.1980, against a chance of 2.2074. `normal`
+sat at 1.00 and `face` at 2.00 — their exact chance values. `acc@10` was 0.001.
+Nothing moved.
+
+That is no longer the "300 steps is half a percent of training" objection. It is
+still not a proof of a bug — GARF spends 4×H100 for 72 hours on this task, and a
+635k-parameter model two passes in has seen very little — but a *training* loss
+that is flat to four significant figures across two full epochs is the point at
+which "needs more compute" and "cannot learn this" have to be separated. Only an
+**overfit run on a few dozen real samples** does that.
+
+#### The crash: the guard was on the wrong half
+
+`torch.OutOfMemoryError` in `scaled.backward()`, uncaught, ending the run at 3%
+of epoch 6 after two hours. The try/except was wrapped around the **forward**
+only — and peak memory is in the backward, which is where preflight's own OOM
+had been too. The guard was protecting the cheaper half.
+
+Fixing the scope is necessary and not sufficient, because **skipping a batch is
+unsafe under DDP**. An out-of-memory error arrives on whichever rank happened to
+be tighter; the rank that skips has already all-reduced some gradient buckets,
+so its peer waits forever on buckets that will never arrive. A silent hang costs
+the whole session, where stopping costs one epoch and checkpoints it. So:
+
+- the decision to skip is now made **before the forward**, from the batch's
+  vertex count — a quantity every rank computes identically, so the ranks agree
+  by construction (`--max-vertices-per-batch`, reported by preflight);
+- the try/except still wraps forward *and* backward, as a net. Alone it skips;
+  under DDP it stops cleanly and names the limit to resume with.
+
+#### The projection: wrong twice, in opposite ways
+
+The session plan is built on one number and it was wrong on both sides of the
+run.
+
+**During training, 2.7× low.** `_time_report` averaged the last three epoch
+*durations*. The three calibration epochs at `--limit-train 400` took 236 s
+each; the first full epoch took 3,555 s. Averaging across that boundary reported
+"~22:09/epoch" for an epoch that took 59 minutes. Durations are only comparable
+between epochs of the same size, and the size changes on exactly the resume
+where the estimate matters. It now averages seconds **per step** and multiplies
+by the current steps per epoch, which is invariant to that.
+
+**In preflight, 1.7× low.** It reported 34:27/epoch against an actual 59
+minutes, for two independent reasons: it never timed the **validation pass** at
+all (362 batches at 0.71 it/s — 8.5 minutes on every epoch), and it measures in
+one process on one GPU while projecting onto two, where every step also
+all-reduces gradients and the ranks contend for the same four CPUs. Preflight
+now times validation separately and reports both the single-rank figure and a
+DDP-adjusted one.
+
+The corrected budget for 40 epochs is about **39 hours, four sessions**, not the
+23 hours and three sessions that were on the screen.

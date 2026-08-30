@@ -153,6 +153,21 @@ class Config:
     warmup_fraction: float = 0.03
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
+    max_vertices_per_batch: int = 0
+    """
+    Skip any batch with more vertices than this, before attempting it. 0 is off.
+
+    The point is *when* the decision is made. An out-of-memory error arrives on
+    whichever rank happened to be tighter, so a skip decided from one cannot be
+    made consistently across ranks -- and a rank that skips while its peer
+    proceeds leaves the peer waiting forever in the gradient all-reduce. Vertex
+    count is knowable before the forward and identical on every rank, so this
+    skips collectively by construction.
+
+    Preflight reports the value to use: it is the largest batch it could
+    actually fit, with a margin. Batches skipped this way are counted and named
+    exactly like an out-of-memory skip, because they are the same event.
+    """
     accumulate: int = 1
     """
     Optimizer steps every `accumulate` batches.
@@ -616,7 +631,7 @@ def _metrics(predicted, target) -> Dict[str, float]:
 def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
               device="cpu", step=0, total_steps=1, label="train",
               show_progress=True, deadline=None, stop_signal=None,
-              on_checkpoint=None):
+              on_checkpoint=None, distributed=False):
     """
     One pass over ``loader``. Training when ``optimizer`` is given, else eval.
 
@@ -658,31 +673,68 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
                 for group in optimizer.param_groups:
                     group["lr"] = rate
 
+            # Decided *before* the forward, and identically on every rank, so
+            # the ranks stay in step. A skip decided from a caught
+            # OutOfMemoryError cannot be: the error arrives on whichever rank
+            # happened to be tighter on memory, and a rank that skips while its
+            # peer proceeds leaves the peer waiting forever in the gradient
+            # all-reduce. Size is knowable in advance and agrees across ranks
+            # by construction.
+            vertices = int(batch.node_features.shape[0])
+            if config.max_vertices_per_batch and vertices > config.max_vertices_per_batch:
+                oom += 1
+                dropped[f"toobig:batch{index}"] = (
+                    f"{vertices:,} vertices over the "
+                    f"{config.max_vertices_per_batch:,} limit, "
+                    f"{batch.num_fragments} fragments"
+                )
+                bar.update(1)
+                continue
+
             try:
                 with torch.autocast(device_type=torch.device(device).type,
                                     enabled=bool(scaler)):
                     loss, report, R = _forward(model, batch, criterion, config)
+                if training:
+                    scaled = loss / config.accumulate
+                    if scaler:
+                        scaler.scale(scaled).backward()
+                    else:
+                        scaled.backward()
             except torch.cuda.OutOfMemoryError:
-                # One pathological scene must not end an eleven-hour session.
-                # Breaking Bad's largest fragment is 83,039 vertices, and a
-                # preflight that samples a dozen scenes will not have seen it,
-                # so a batch that fits everything measured can still be handed
-                # something several times larger at hour six.
+                # The backward is inside this block, not outside it. It was
+                # outside, which meant the guard covered the *cheaper* half:
+                # peak memory is in the backward, and that is exactly where a
+                # real run died -- an uncaught OutOfMemoryError in
+                # `scaled.backward()` ending epoch 6 of a six-epoch run.
                 #
-                # Skipped, counted and named -- not swallowed. If this fires
-                # more than a handful of times the batch size is wrong, and a
-                # silent skip would hide that while quietly removing the
-                # largest objects from training.
+                # Breaking Bad's largest fragment is 83,039 vertices and a
+                # preflight sampling a dozen scenes will not have seen it, so a
+                # batch that fits everything measured can still be handed
+                # something several times larger at hour six.
                 oom += 1
+                vertices = int(batch.node_features.shape[0])
                 dropped[f"OOM:batch{index}"] = (
-                    f"{batch.node_features.shape[0]:,} vertices, "
-                    f"{batch.num_fragments} fragments"
-                )
+                    f"{vertices:,} vertices, {batch.num_fragments} fragments")
                 model.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
-                print(f"\n  [oom] batch {index} "
-                      f"({batch.node_features.shape[0]:,} vertices) did not fit; "
-                      f"skipped")
+                if distributed:
+                    # Under DDP this rank may already have all-reduced some
+                    # gradient buckets before running out, so its peer is now
+                    # waiting on buckets that will never come. Continuing would
+                    # hang the job silently, which is worse than stopping: the
+                    # caller checkpoints, and the run resumes with a limit set.
+                    print(f"\n  [oom] batch {index} ({vertices:,} vertices) did "
+                          f"not fit, and under DDP the ranks cannot recover "
+                          f"independently -- stopping cleanly so the epoch is "
+                          f"checkpointed.\n        Resume with "
+                          f"--max-vertices-per-batch {int(vertices * 0.9)} to "
+                          f"skip batches like it before they are attempted.")
+                    stopped = True
+                    break
+                print(f"\n  [oom] batch {index} ({vertices:,} vertices) did not "
+                      f"fit; skipped. Set --max-vertices-per-batch "
+                      f"{int(vertices * 0.9)} to skip these up front.")
                 bar.update(1)
                 continue
 
@@ -695,11 +747,6 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
                 continue
 
             if training:
-                scaled = loss / config.accumulate
-                if scaler:
-                    scaler.scale(scaled).backward()
-                else:
-                    scaled.backward()
                 if (index + 1) % config.accumulate == 0:
                     if scaler:
                         scaler.unscale_(optimizer)
@@ -767,10 +814,17 @@ def format_losses(summary: Dict[str, float]) -> str:
 def format_metrics(summary: Dict[str, float]) -> str:
     if "geodesic_deg" not in summary:
         return ""
-    return (f"geo {summary['geodesic_deg']:6.2f}deg "
+    line = (f"geo {summary['geodesic_deg']:6.2f}deg "
             f"(median {summary['geodesic_median_deg']:6.2f}, chance "
             f"{CHANCE['geodesic_deg']:.1f})  euler {summary['euler_rmse_deg']:6.2f}deg"
             f"  acc@10 {summary['acc@10deg']:.3f}")
+    if "match@1" in summary:
+        # The embedding head's only honest number. Its loss needs a per-batch
+        # reference to interpret, and the term it replaced could be driven to
+        # zero by a collapsed embedding; this cannot -- it is stage two's own
+        # retrieval, from ~0 at chance to 1.0.
+        line += f"  match@1 {summary['match@1']:.3f}"
+    return line
 
 
 def check_initial_losses(summary: Dict[str, float]) -> List[str]:
@@ -1020,18 +1074,34 @@ class StopSignal:
 
 
 def _time_report(history: List[dict], config: Config, elapsed: float,
-                 start_epoch: int) -> str:
+                 start_epoch: int, steps_per_epoch: int = 1) -> str:
     """
     How much longer, and how many more sessions.
 
     The number that actually decides whether a plan is workable, and it cannot
     be guessed before the first epoch is timed.
     """
-    times = [h.get("seconds", 0.0) for h in history if h.get("seconds")]
-    if not times:
-        return ""
-    recent = times[-3:]
-    per_epoch = sum(recent) / len(recent)
+    # Seconds *per step*, not per epoch. An epoch's duration is only comparable
+    # to another epoch of the same size, and they are not always the same size:
+    # a `--limit-train` calibration run resumed at the full dataset leaves three
+    # 236-second epochs sitting in the history in front of three 3,555-second
+    # ones. Averaging those gave "~22:09/epoch" for an epoch that took 59
+    # minutes -- a 2.7x under-estimate, in the one number the session plan is
+    # built on. Per-step is invariant to that, and to `--limit-train` changing
+    # again on the next resume.
+    rates = [h["seconds"] / h["steps"] for h in history
+             if h.get("seconds") and h.get("steps")]
+    if rates:
+        recent = rates[-3:]
+        per_epoch = (sum(recent) / len(recent)) * max(steps_per_epoch, 1)
+    else:
+        # A checkpoint written before `steps` was recorded. Fall back to the
+        # most recent epoch alone rather than an average: one epoch of the
+        # right size beats three of unknown sizes, which is the whole point.
+        times = [h["seconds"] for h in history if h.get("seconds")]
+        if not times:
+            return ""
+        per_epoch = times[-1]
     remaining = max(config.epochs - (history[-1]["epoch"] + 1), 0)
     left = per_epoch * remaining
     sessions = math.ceil(left / (config.max_hours * 3600)) if left > 0 else 0
@@ -1269,6 +1339,7 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
             label="train", show_progress=main, deadline=deadline,
             stop_signal=signal_watch,
             on_checkpoint=lambda s_, completed: checkpoint(s_, epoch, completed),
+            distributed=distributed,
         )
         # Validation gets its own margin rather than `None`. A stop that fires
         # at the end of training must not then spend an unbounded amount of the
@@ -1300,6 +1371,9 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
                # twice. Plot `partial == 0` for a clean curve.
                "partial": int(stopped),
                "lr": learning_rate(step, total_steps, config),
+               # Recorded so the time projection can work in seconds *per step*
+               # and stay right when --limit-train changes between sessions.
+               "steps": max(per_epoch, 1),
                "seconds": round(time.time() - began, 1)}
         row.update({f"train_{k}": v for k, v in train_summary.items()})
         row.update({f"val_{k}": v for k, v in val_summary.items()})
@@ -1318,7 +1392,7 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
                             elapsed=elapsed + (time.time() - session_started))
             print(f"  new best: {best:.3f} deg -> {best_path.name}")
         report = _time_report(history, config, elapsed + (time.time() - session_started),
-                              start_epoch)
+                              start_epoch, steps_per_epoch=per_epoch)
         if report:
             print(report)
 
@@ -1745,6 +1819,22 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     parameters = sum(p.numel() for p in model.parameters())
     print(f"  parameters {parameters:,}   worst case tested: "
           f"{fitted} x the largest sampled scene")
+    # The vertex count that was *proved* to fit, which is the number the
+    # training loop needs to skip the batches that will not. Reported rather
+    # than inferred, because the alternative is discovering it as an
+    # out-of-memory error hours into a session -- which is how this got here.
+    fitted_vertices = int(vertices.max()) * fitted
+    suggested = int(fitted_vertices * 0.95)
+    print(f"  largest batch proved to fit: {fitted_vertices:,} vertices"
+          + (f"   -- pass --max-vertices-per-batch {suggested}"
+             if not config.max_vertices_per_batch else ""))
+    if not config.max_vertices_per_batch:
+        warnings.append(
+            f"--max-vertices-per-batch is not set, so a batch larger than "
+            f"anything sampled here is attempted and can fail mid-epoch. Under "
+            f"DDP that cannot be skipped safely and the run stops. Pass "
+            f"--max-vertices-per-batch {suggested}."
+        )
     dead = [n for n, p in model.named_parameters()
             if p.grad is None or p.grad.abs().sum() == 0]
     # Release step 5's batch and autograd graph before step 6 allocates its own.
@@ -1893,19 +1983,51 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             f"--batch-size and raise --accumulate to keep the effective batch."
         )
     per_step = (time.time() - began) / max(done, 1)
+
+    # An epoch is train *and* validation, and leaving the second one out was a
+    # 15% under-estimate on the real run -- 362 val batches at 0.71 it/s is
+    # 8.5 minutes on top of every epoch. Measured rather than assumed, because
+    # validation runs under `no_grad` and is not simply "the same but cheaper".
+    val_loader = torch.utils.data.DataLoader(
+        val_set, batch_size=timing_batch, shuffle=False,
+        collate_fn=_collate_samples, num_workers=config.workers,
+    )
+    model.eval()
+    val_began, val_done = time.time(), 0
+    with torch.no_grad():
+        for batch, _ in val_loader:
+            if batch is None:
+                continue
+            _forward(model, _to_device(batch, device), criterion, config)
+            val_done += 1
+            if val_done >= max(timed_batches // 2, 2):
+                break
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    val_per_step = (time.time() - val_began) / max(val_done, 1)
+
     world = max(requested, 1)
     steps = math.ceil(len(train_set) / (timing_batch * world))
-    epoch_seconds = per_step * steps
+    val_steps = math.ceil(len(val_set) / (timing_batch * world))
+    epoch_seconds = per_step * steps + val_per_step * val_steps
     total_seconds = epoch_seconds * config.epochs
     sessions = math.ceil(total_seconds / (config.max_hours * 3600))
-    print(f"  {per_step:.2f} s/step (includes warm-up, so pessimistic)")
-    print(f"  {steps} steps/epoch at batch_size={timing_batch} on {world} "
-          f"device(s) -> ~{_hms(epoch_seconds)}/epoch")
+    print(f"  {per_step:.2f} s/step train, {val_per_step:.2f} s/step val")
+    print(f"  {steps} train + {val_steps} val steps/epoch at "
+          f"batch_size={timing_batch} on {world} device(s) "
+          f"-> ~{_hms(epoch_seconds)}/epoch")
     if timing_batch != config.batch_size:
         print(f"  (--accumulate does not change this: it changes how often the "
               f"optimizer steps, not how many forward/backward passes run)")
     print(f"  {config.epochs} epochs -> ~{_hms(total_seconds)} "
           f"= {sessions} session(s) at {config.max_hours:g}h")
+    if world > 1:
+        # Measured in one process on one GPU. Under DDP every step also
+        # all-reduces the gradients, and the ranks contend for the same CPUs to
+        # build scenes. On the real run that gap was about 45%.
+        print(f"  measured on 1 rank -- under {world}-way DDP expect roughly "
+              f"{_hms(epoch_seconds * 1.45)}/epoch "
+              f"({_hms(total_seconds * 1.45)} total)")
     if epoch_seconds > config.max_hours * 3600:
         warnings.append(
             f"one epoch (~{_hms(epoch_seconds)}) is longer than a session. That "

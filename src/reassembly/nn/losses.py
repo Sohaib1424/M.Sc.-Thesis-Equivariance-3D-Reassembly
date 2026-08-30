@@ -186,6 +186,18 @@ def embedding_consistency_loss(
     expressed in two unrelated frames and comparing them directly would
     penalise the perturbation rather than the geometry. This is the same
     constraint that shapes the cross-fragment layer, applied to the loss.
+
+    .. warning::
+       This term is **minimised by a constant embedding**, and that is not
+       hypothetical -- it is what the first real training run did. Measured on
+       synthetic scenes: the loss fell 0.0109 -> 0.0010 over 180 steps while the
+       spread of the embeddings fell 0.166 -> 0.021 and their norm stayed at
+       ~2.0. The head was not learning to agree, it was converging on one
+       vector, and the loss reported success the whole way down.
+
+       It survives only as a *component* of :func:`correspondence_loss`, which
+       adds the repulsion that makes the trivial solution expensive. Do not use
+       it alone.
     """
     if embeddings.numel() == 0 or num_clusters == 0:
         return embeddings.new_zeros(())
@@ -193,6 +205,93 @@ def embedding_consistency_loss(
     deviation = embeddings - centroid[cluster]
     per_vertex = torch.sum(deviation * deviation, dim=-1)
     return segment_mean(per_vertex.unsqueeze(-1), cluster, num_clusters).mean()
+
+
+def correspondence_loss(
+    embeddings: Tensor,
+    cluster: Tensor,
+    num_clusters: int,
+    temperature: float = 0.1,
+    max_anchors: int = 1024,
+    generator: Optional[torch.Generator] = None,
+    return_accuracy: bool = False,
+):
+    """
+    InfoNCE over coincidence clusters: coincident vertices close, others far.
+
+    Why this and not the pure agreement term
+    ----------------------------------------
+    :func:`embedding_consistency_loss` asks only that coincident vertices agree,
+    and the cheapest way to agree is for *everything* to agree. That is a real
+    minimum, not a corner case, and the model finds it within a few hundred
+    steps. A collapsed embedding is worse than an untrained one for what this
+    head exists to do: stage two matches interface points by mutual nearest
+    neighbours, and when every embedding is the same vector every distance ties.
+
+    Repulsion is what removes the trivial solution. Written as InfoNCE rather
+    than as a variance floor because the negatives here are exactly the
+    confusion set at matching time -- the *other* fracture vertices of the same
+    scene -- so the training objective and the downstream use are the same
+    question::
+
+        L = -mean_i  log[ sum_{p in pos(i)} exp(s_ip / T)
+                          / sum_{k != i}    exp(s_ik / T) ]
+
+    with ``s`` the cosine similarity. Collapse now scores its *worst* value,
+    ``log(A - 1) - log|pos|``: identical embeddings make positives and negatives
+    indistinguishable, which is exactly what the term measures.
+
+    Anchors are subsampled to ``max_anchors`` because the similarity matrix is
+    quadratic in them and a scene can label thousands of vertices. 1024 anchors
+    is a 4 MB matrix; the whole set would be gigabytes on the largest scenes,
+    which is the same trap the cross-attention layer had.
+
+    With ``return_accuracy`` it also reports the fraction of anchors whose
+    nearest neighbour is a true coincidence partner. That is the number worth
+    watching: it is exactly what stage two does at inference, it runs from
+    chance (``|pos| / (A - 1)``, near zero) to 1.0, and unlike the loss it does
+    not need a reference value computed per batch to be read.
+    """
+    empty = embeddings.new_zeros(())
+    if embeddings.numel() == 0 or num_clusters == 0:
+        return (empty, empty) if return_accuracy else empty
+
+    # Only clustered vertices participate; -1 marks "no coincidence partner".
+    anchors = torch.nonzero(cluster >= 0, as_tuple=False).flatten()
+    if anchors.numel() < 2:
+        return (empty, empty) if return_accuracy else empty
+    if anchors.numel() > max_anchors:
+        pick = torch.randperm(anchors.numel(), device=embeddings.device,
+                              generator=generator)[:max_anchors]
+        anchors = anchors[pick]
+
+    z = torch.nn.functional.normalize(embeddings[anchors], dim=-1)
+    labels = cluster[anchors]
+    similarity = (z @ z.t()) / temperature
+
+    identity = torch.eye(len(anchors), dtype=torch.bool, device=z.device)
+    positive = (labels[:, None] == labels[None, :]) & ~identity
+    # An anchor whose cluster-mates all fell outside the subsample has no
+    # positive, so its log-ratio is undefined. Dropped rather than given a zero,
+    # which would quietly reward whatever the subsample happened to exclude.
+    keep = positive.any(dim=1)
+    if not bool(keep.any()):
+        return (empty, empty) if return_accuracy else empty
+
+    similarity = similarity.masked_fill(identity, float("-inf"))
+    denominator = torch.logsumexp(similarity, dim=1)
+    numerator = torch.logsumexp(
+        similarity.masked_fill(~positive, float("-inf")), dim=1
+    )
+    loss = (denominator - numerator)[keep].mean()
+    if not return_accuracy:
+        return loss
+
+    with torch.no_grad():
+        nearest = similarity.argmax(dim=1)
+        hit = positive[torch.arange(len(anchors), device=z.device), nearest]
+        accuracy = hit[keep].to(loss.dtype).mean()
+    return loss, accuracy
 
 
 class ReassemblyLoss(torch.nn.Module):
@@ -208,12 +307,15 @@ class ReassemblyLoss(torch.nn.Module):
 
     def __init__(self, rotation: float = 1.0, position: float = 1.0,
                  normal: float = 1.0, face: float = 1.0,
-                 embedding: float = 1.0) -> None:
+                 embedding: float = 1.0, temperature: float = 0.1,
+                 max_anchors: int = 1024) -> None:
         super().__init__()
         self.weights = {
             "rotation": rotation, "position": position, "normal": normal,
             "face": face, "embedding": embedding,
         }
+        self.temperature = temperature
+        self.max_anchors = max_anchors
 
     def forward(
         self,
@@ -251,13 +353,22 @@ class ReassemblyLoss(torch.nn.Module):
             terms["face"] = 2.0 * cosine_loss(
                 predicted_faces, target_faces, edge_batch, n
             )
+        match_top1 = None
         if embeddings is not None and cluster is not None:
-            terms["embedding"] = embedding_consistency_loss(
-                embeddings, cluster, num_clusters
+            terms["embedding"], match_top1 = correspondence_loss(
+                embeddings, cluster, num_clusters,
+                temperature=self.temperature, max_anchors=self.max_anchors,
+                return_accuracy=True,
             )
 
         total = sum(self.weights[k] * v for k, v in terms.items())
         report = {k: float(v.detach()) for k, v in terms.items()}
         report["total"] = float(total.detach())
         report["rotation_degrees"] = report["rotation"] * 180.0 / 3.141592653589793
+        if match_top1 is not None:
+            # The embedding loss needs a per-batch reference to interpret; this
+            # does not. It is stage two's own operation -- is a vertex's true
+            # coincidence partner its nearest neighbour -- so it reads straight
+            # from ~0 at chance to 1.0, and a collapsed embedding cannot fake it.
+            report["match@1"] = float(match_top1.detach())
         return total, report

@@ -84,6 +84,7 @@ import math
 from typing import Optional, Tuple
 
 import torch
+import torch.utils.checkpoint
 from torch import Tensor, nn
 
 from .segment import segment_softmax, segment_sum
@@ -128,6 +129,19 @@ def cross_fragment_index(
     return query[keep], key[keep]
 
 
+def _pair_logits(query, key, query_index, key_index, heads, head_dim, scale):
+    """Attention logits for every pair, without retaining the gathers."""
+    q = query[query_index].view(-1, heads, head_dim)
+    k = key[key_index].view(-1, heads, head_dim)
+    return torch.sum(q * k, dim=-1) * scale
+
+
+def _pair_pool(value, alpha, query_index, key_index, heads, head_dim, n):
+    """Attention-weighted sum of the invariant values, per query token."""
+    v = value[key_index].view(-1, heads, head_dim)
+    return segment_sum(v * alpha.unsqueeze(-1), query_index, n)
+
+
 class VNCrossFragmentAttention(nn.Module):
     """
     One layer of Vector-Neuron cross-fragment attention.
@@ -144,6 +158,7 @@ class VNCrossFragmentAttention(nn.Module):
         heads: int = 4,
         head_dim: int = 16,
         directions: int = 4,
+        checkpoint: bool = True,
     ) -> None:
         super().__init__()
         if channels % heads:
@@ -171,6 +186,7 @@ class VNCrossFragmentAttention(nn.Module):
         self.proj = VNLinear(channels, channels)
         self.norm = VNLayerNorm(channels)
         self.scale = 1.0 / math.sqrt(head_dim)
+        self.checkpoint = bool(checkpoint)
 
         # Start near the identity: the mixing matrix begins near zero, so an
         # untrained cross layer passes the intra-fragment representation through
@@ -182,6 +198,12 @@ class VNCrossFragmentAttention(nn.Module):
         # pathway, dead for the first steps and waking only as a bias drifts.
         nn.init.normal_(self.mix[-1].weight, std=1e-2 / math.sqrt(2 * heads * head_dim))
         nn.init.zeros_(self.mix[-1].bias)
+
+    def _maybe_checkpoint(self, function, *args):
+        if self.checkpoint and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(function, *args,
+                                                     use_reentrant=False)
+        return function(*args)
 
     def forward(
         self,
@@ -204,13 +226,26 @@ class VNCrossFragmentAttention(nn.Module):
             # with no fracture surface at all.
             context = scalars.new_zeros(n, self.heads * self.head_dim)
         else:
-            q = self.query(scalars)[query_index].view(-1, self.heads, self.head_dim)
-            k = self.key(scalars)[key_index].view(-1, self.heads, self.head_dim)
-            v = self.value(scalars)[key_index].view(-1, self.heads, self.head_dim)
-
-            logits = torch.sum(q * k, dim=-1) * self.scale           # (P, heads)
+            # The pair dimension is this layer's whole memory cost, and it is
+            # large: 2048 tokens over 6 fragments is 3.5 million pairs. Holding
+            # q, k and v gathered to that dimension retains 1109 bytes per pair
+            # -- 3.6 GB for a single scene, 7.2 GB across two cross layers, on
+            # a 16 GB card. Measured with saved_tensors_hooks as the slope
+            # against pair count, not estimated.
+            #
+            # Recomputing those gathers in the backward pass rather than storing
+            # them leaves 86 bytes per pair, 0.3 GB, for one extra forward of a
+            # cheap indexing op. The projections are (T, heads*head_dim) and
+            # stay resident either way.
+            logits = self._maybe_checkpoint(
+                _pair_logits, self.query(scalars), self.key(scalars),
+                query_index, key_index, self.heads, self.head_dim, self.scale,
+            )
             alpha = segment_softmax(logits, query_index, n)          # (P, heads)
-            pooled = segment_sum(v * alpha.unsqueeze(-1), query_index, n)
+            pooled = self._maybe_checkpoint(
+                _pair_pool, self.value(scalars), alpha,
+                query_index, key_index, self.heads, self.head_dim, n,
+            )
             context = pooled.reshape(n, self.heads * self.head_dim)
 
         # G: one (per_head, per_head) mixing matrix per head per query token.

@@ -127,7 +127,7 @@ tests still pass and the network tests skip.
 git clone <this-repo> && cd <this-repo>
 python -m venv .venv && source .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest                                        # 283 passed
+python -m pytest                                        # 290 passed
 ```
 
 Installing is optional — `pytest.ini` sets `pythonpath = src .` and each script
@@ -277,7 +277,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             283 tests, no skips
+tests/                             290 tests, no skips
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -335,6 +335,22 @@ from there. Preflight checks the things that are:
 | Every parameter receives gradient | A layer silently not in the model |
 | Loss at initialisation vs chance | A term far from its reference is measuring something other than its name |
 | Measured seconds/step | Projects epoch time, total time, **and how many sessions it will take** |
+
+If it reports that even `batch_size=1` will not fit, turn the knobs in this
+order — the first two do not change what the model can represent, the third
+does:
+
+```bash
+--checkpoint-intra          # recompute the intra-layer projections too
+--channels 32               # half the width
+--tokens-per-scene 1024     # fewer cross-fragment tokens; changes the model
+```
+
+Cross-attention checkpointing is already on by default (`--no-checkpoint-cross`
+turns it off). It is what makes 2048 tokens fit at all: the pair gathers cost
+1109 bytes per pair when stored against 86 when recomputed, which at a
+3.5-million-pair scene is 3.6 GB against 0.3 GB *per cross layer*. Outputs and
+gradients are bitwise identical either way.
 
 ### Training across Kaggle's 12-hour cap
 

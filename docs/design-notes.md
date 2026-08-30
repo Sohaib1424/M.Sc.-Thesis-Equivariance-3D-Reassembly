@@ -610,7 +610,7 @@ filter in the loader.
 
 `reassembly.nn`, with `tests/test_nn_equivariance.py`, `tests/test_losses.py`
 and `tests/test_model.py`, plus `tests/test_training.py` for the engine.
-283 tests total, clean under `-W error`.
+290 tests total, clean under `-W error`.
 
 `torch` installs from the **default** PyPI index. The earlier failure was
 `download.pytorch.org` being blocked, not torch being unavailable — so
@@ -1040,3 +1040,57 @@ Two things follow that the arithmetic alone would not have given:
   session. It is counted and reported rather than swallowed: if it fires often,
   the batch size is wrong and the largest objects are being dropped from
   training.
+
+### What the second preflight run found — the real ceiling
+
+With the split fixed, preflight got further and reported something more useful
+than a pass: `batch_size=1` fits, at **11.61 GB of 15.6 GB (74%)**, and then the
+next step died allocating 5.16 GiB inside the cross-fragment layer. Two separate
+problems, one mine and one architectural.
+
+**The crash was a preflight bug.** Step 5 measures the largest batch that fits;
+step 6 then timed an epoch — but step 5's batch, its loss, and the autograd
+graph holding both were still alive when step 6 allocated its own. The tool
+built to catch out-of-memory was itself leaking a batch. It now frees the batch,
+zeroes the gradients and empties the cache between steps, and sizes step 6 from
+what step 5 proved fits rather than guessing.
+
+**The 74% was the real finding.** Where it goes, measured with
+`saved_tensors_hooks` as the slope against pair count rather than as a total —
+a total is dominated by the `(T, C)` tensors at small sizes and would have said
+nothing about the case that matters:
+
+```
+  q, k, v gathered to the pair dimension   1109 B/pair
+  logits and weights only                    86 B/pair
+```
+
+At 2048 tokens over 6 fragments — 3,496,618 pairs — that is **3.6 GB against
+0.3 GB per cross layer**, 7.2 GB against 0.6 GB across the two of them, for a
+*single scene* on a 16 GB card. The cross-fragment layers were most of the
+budget.
+
+The fix is `torch.utils.checkpoint` around the two gathers, so the backward pass
+recomputes them. What is recomputed is indexing and a dot product, not the
+projections — those are `(T, heads·head_dim)` and stay resident either way — so
+the compute cost is close to nothing while the memory falls by 13×. Outputs and
+gradients are **bitwise** identical, and own-pose equivariance and other-pose
+invariance are unchanged at 1e-16; all three are pinned by tests, along with the
+bytes-per-pair saving itself, so a future edit that reintroduces a pair-sized
+retained tensor fails rather than silently OOMing on Kaggle.
+
+It is on by default (`checkpoint_cross=True`) because the trade is that
+lopsided. The intra-fragment equivalent is off (`checkpoint_intra=False`):
+there, recomputation re-runs the projections themselves, which is real work.
+
+#### The retraction that goes with it
+
+`tokens_per_scene = 2048` was chosen by comparing the resulting pair count to
+the token counts GARF's stack processes. That is a **FLOPs** argument, and GARF
+runs on 4×H100. It was never checked against T4 *memory*, which is the binding
+constraint here and is quadratic in exactly the quantity being set. The number
+survives — with the gathers recomputed, 2048 tokens fit — but it survived by
+luck, not because the check had been done. The ordering to prefer, when
+`batch_size=1` still will not fit, is `--checkpoint-intra` first (free but for
+compute), then `--channels 32`, and only then `--tokens-per-scene 1024`, because
+the last one changes what the model can represent while the first two do not.

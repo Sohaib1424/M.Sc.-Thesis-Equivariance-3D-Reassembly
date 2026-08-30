@@ -408,3 +408,176 @@ def test_cross_fragment_starts_near_the_identity_without_going_dead():
     dead = [name for name, p in layer.named_parameters()
             if p.grad is None or p.grad.abs().sum() == 0]
     assert not dead, f"no gradient reaches {dead} at initialisation"
+
+
+# --------------------------------------------------------------------------
+# Gradient checkpointing
+#
+# Recomputing the gathered q/k/v in the backward pass instead of storing them
+# is what makes a 2048-token scene fit on a 16 GB T4: measured 4.00 GB down to
+# 0.42 GB per cross layer. That is only a legitimate trade if it changes
+# nothing else, so these tests pin all three properties -- identical values,
+# identical gradients, and the memory actually saved.
+# --------------------------------------------------------------------------
+
+def _retained_bytes(function):
+    """
+    Bytes of tensor actually kept alive for the backward pass.
+
+    ``torch.cuda.max_memory_allocated`` cannot answer this: it is a peak, so it
+    also counts temporaries that are freed again, and the first call warms the
+    allocator. Counting distinct tensors as autograd packs them is the direct
+    measurement, and it works identically on CPU.
+    """
+    seen, total = set(), 0
+
+    def pack(tensor):
+        nonlocal total
+        if tensor.data_ptr() not in seen:
+            seen.add(tensor.data_ptr())
+            total += tensor.numel() * tensor.element_size()
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        function()
+    return total
+
+
+def _cross_pair(**kwargs):
+    """The same layer twice, weights tied, checkpointing on in one of them."""
+    torch.manual_seed(7)
+    plain = VNCrossFragmentAttention(16, heads=4, checkpoint=False, **kwargs).to(DTYPE)
+    torch.nn.init.normal_(plain.mix[-1].weight, std=0.3)      # leave the identity
+    torch.manual_seed(7)
+    checkpointed = VNCrossFragmentAttention(16, heads=4, checkpoint=True, **kwargs).to(DTYPE)
+    checkpointed.load_state_dict(plain.state_dict())
+    return plain, checkpointed
+
+
+def test_cross_fragment_checkpointing_changes_nothing():
+    """
+    Bitwise, not approximately. Recomputation re-runs the *same* ops on the
+    *same* inputs, so any difference at all would mean the recomputed forward
+    is not the one that ran -- a stale buffer, a dropout mask, a different
+    branch -- and would show up as a silent training bug, not a crash.
+    """
+    fragment, scene = _scene()
+    plain, checkpointed = _cross_pair()
+    query, key = cross_fragment_index(fragment, scene, 2)
+
+    outputs, grads = [], []
+    for layer in (plain, checkpointed):
+        x = torch.randn(14, 16, 3, dtype=DTYPE, generator=torch.Generator().manual_seed(3))
+        x.requires_grad_(True)
+        out = layer(x, query, key)
+        (out * out).sum().backward()
+        outputs.append(out.detach())
+        grads.append({name: p.grad.clone() for name, p in layer.named_parameters()})
+        grads[-1]["__input__"] = x.grad.clone()
+
+    assert torch.equal(outputs[0], outputs[1]), "checkpointing moved the output"
+    for name in grads[0]:
+        assert torch.equal(grads[0][name], grads[1][name]), f"gradient differs: {name}"
+
+
+def test_cross_fragment_checkpointing_keeps_the_symmetries():
+    """
+    The properties the layer exists for must survive the memory optimisation:
+    equivariant to its own fragment's pose, invariant to every other's.
+    """
+    fragment, scene = _scene()
+    _, layer = _cross_pair()
+    x = torch.randn(14, 16, 3, dtype=DTYPE)
+    query, key = cross_fragment_index(fragment, scene, 2)
+    base = layer(x, query, key)
+
+    R = random_rotation(0)
+    rotated = x.clone()
+    rotated[fragment == 0] = x[fragment == 0] @ R.T
+    out = layer(rotated, query, key)
+    assert torch.allclose(out[fragment == 0], base[fragment == 0] @ R.T, atol=TOL)
+    others = fragment != 0
+    assert (out[others] - base[others]).abs().max() < 1e-12 * base.abs().max()
+
+
+def test_cross_fragment_checkpointing_actually_saves_memory():
+    """
+    The whole point, measured as the quantity that actually decides whether a
+    scene fits: **bytes per pair**, not bytes.
+
+    A total would be the wrong test. The layer's non-pair tensors are ``(T, C)``
+    and dominate at toy sizes, so a total could look fine on 64 pairs while the
+    real 3.5-million-pair scene still OOMs. The slope between two scene sizes
+    isolates the pair dimension exactly, and it is the number the Kaggle
+    arithmetic uses: measured on the real model, 1144 B/pair storing the
+    gathers against 120 B/pair recomputing them, which is 4.00 GB against
+    0.42 GB per cross layer.
+    """
+    plain, checkpointed = _cross_pair()
+
+    def bytes_per_pair(layer):
+        measurements = []
+        for per_fragment in (8, 40):
+            fragment = torch.arange(3).repeat_interleave(per_fragment)
+            scene = torch.zeros_like(fragment)
+            query, key = cross_fragment_index(fragment, scene, 1)
+            x = torch.randn(fragment.numel(), 16, 3, dtype=DTYPE)
+            measurements.append(
+                (query.numel(), _retained_bytes(lambda: layer(x, query, key)))
+            )
+        (p0, b0), (p1, b1) = measurements
+        return (b1 - b0) / (p1 - p0)
+
+    stored = bytes_per_pair(plain)
+    recomputed = bytes_per_pair(checkpointed)
+    assert recomputed < stored / 4, (
+        f"recomputing retained {recomputed:.0f} B/pair against {stored:.0f} "
+        f"B/pair stored -- the gathers are being kept after all"
+    )
+
+
+def test_intra_fragment_checkpointing_changes_nothing():
+    """Same contract for the intra layer, including the no-edge-features path."""
+    for edge_attr in (torch.randn(60, 3, 3, dtype=DTYPE), None):
+        torch.manual_seed(11)
+        plain = VNGraphAttention(16, heads=4, checkpoint=False).to(DTYPE)
+        torch.manual_seed(11)
+        checkpointed = VNGraphAttention(16, heads=4, checkpoint=True).to(DTYPE)
+        checkpointed.load_state_dict(plain.state_dict())
+        edge_index = torch.randint(0, 20, (2, 60), generator=torch.Generator().manual_seed(5))
+
+        outputs, grads = [], []
+        for layer in (plain, checkpointed):
+            x = torch.randn(20, 16, 3, dtype=DTYPE,
+                            generator=torch.Generator().manual_seed(4))
+            x.requires_grad_(True)
+            out = layer(x, edge_index, edge_attr)
+            (out * out).sum().backward()
+            outputs.append(out.detach())
+            # value_edge sees no gradient when there are no edge features --
+            # that is the point of the second pass, so record None as None
+            # rather than crashing on it.
+            grads.append({n: None if p.grad is None else p.grad.clone()
+                          for n, p in layer.named_parameters()})
+            grads[-1]["__input__"] = x.grad.clone()
+
+        assert torch.equal(outputs[0], outputs[1])
+        for name, expected in grads[0].items():
+            actual = grads[1][name]
+            assert (expected is None) == (actual is None), f"differs: {name}"
+            assert expected is None or torch.equal(expected, actual), f"differs: {name}"
+
+
+def test_checkpointing_is_inert_under_no_grad():
+    """
+    Validation runs under ``no_grad``, where there is nothing to recompute for.
+    ``torch.utils.checkpoint`` warns and returns a detached result in that
+    context, so the layer must take the plain path instead -- otherwise every
+    validation batch pays for a spurious second forward.
+    """
+    fragment, scene = _scene()
+    plain, checkpointed = _cross_pair()
+    x = torch.randn(14, 16, 3, dtype=DTYPE)
+    query, key = cross_fragment_index(fragment, scene, 2)
+    with torch.no_grad():
+        assert torch.equal(plain(x, query, key), checkpointed(x, query, key))

@@ -11,13 +11,14 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 283 tests, clean under `-W error` |
+| Pipeline | **built** — 290 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
 | Training | **built** — loops, checkpoints, schedule, metrics, 2-GPU |
 | Trained result | **none yet** — nothing has been run on the real dataset |
 | First preflight | found a train/val split overlap and an OOM; both fixed |
+| Second preflight | found the memory ceiling: cross-attention was 7.2 GB of 15.6 GB, now 0.6 GB |
 
 ---
 
@@ -305,7 +306,7 @@ normal ordering · fracture patches / sampling / budgeting · cross-fragment
 correspondence · SE(3) perturbation · visualiser · exhaustive extraction pass ·
 three analysis scripts · **Vector Neuron primitives · segment reductions ·
 intra-fragment VN-GAT · cross-fragment attention · the composite loss · feature
-construction and batch collate · the backbone and rotation head**. 283 tests,
+construction and batch collate · the backbone and rotation head**. 290 tests,
 no skips.
 
 **Not built** — the translation solver (stage two).
@@ -363,6 +364,23 @@ complaining:
   180°. Clamping the squared sum instead is exact away from zero, and the
   geodesic path takes a far smaller floor because `atan2`'s derivative cancels
   the norm's.
+
+**What the second preflight found.** With the split fixed, `batch_size=1` fit —
+at 11.61 GB of 15.6 GB, which is the more informative number. Measured as the
+slope against pair count, the cross-fragment layers were retaining **1109 bytes
+per pair** for the backward pass: at 2048 tokens over 6 fragments that is 3.6 GB
+per layer, 7.2 GB across the two of them, for a *single scene*. Recomputing the
+pair gathers in the backward pass instead of storing them takes it to 86 B/pair,
+0.3 GB per layer — a 13× reduction for one extra forward of an indexing op,
+with outputs and gradients **bitwise identical** and the equivariance and
+invariance residuals unchanged at 1e-16. On by default; tests pin all three
+properties including the bytes-per-pair saving.
+
+It also produced a retraction. `tokens_per_scene = 2048` was chosen by comparing
+pair counts against GARF's stack — a FLOPs argument, on 4×H100. It was never
+checked against T4 *memory*, which is the binding constraint and is quadratic in
+that exact number. The value survives, but it survived by luck rather than by
+the check having been done.
 
 ---
 

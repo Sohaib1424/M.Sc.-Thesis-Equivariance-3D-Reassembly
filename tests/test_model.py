@@ -535,3 +535,41 @@ def test_the_relative_position_rotates_with_the_fragment():
     for fragment, spun, Q in zip(assembled.fragments, perturbed.fragments, rotations):
         assert np.allclose(spun.edge_normals[:, 2, :],
                            fragment.edge_normals[:, 2, :] @ Q.T, atol=1e-12)
+
+
+def test_checkpointing_does_not_change_the_model():
+    """
+    The layer-level tests pin the equivalence; this pins the *wiring*. The two
+    flags travel Config -> build_model -> ReassemblyNet -> each layer, and a
+    flag that silently failed to arrive would be invisible except as a run that
+    OOMs where a previous one did not.
+
+    Bitwise on both the prediction and every gradient, over a real collated
+    scene rather than random tensors, so the token/pair indices are the ones
+    the dataset actually produces.
+    """
+    batch = collate([_sample(0), _sample(1)], dtype=DTYPE)
+    outputs, grads = [], []
+    for flags in ({"checkpoint_cross": False, "checkpoint_intra": False},
+                  {"checkpoint_cross": True, "checkpoint_intra": True}):
+        net = _net(**flags)
+        # The flag has to reach the layers, not just the constructor: a kwarg
+        # accepted and dropped would make every assertion below pass trivially.
+        for module in net.modules():
+            if hasattr(module, "checkpoint"):
+                assert module.checkpoint is flags["checkpoint_cross"]
+        prediction = _forward(net, batch)
+        (prediction.frame.square().sum()
+         + prediction.vertex_embedding.square().sum()).backward()
+        outputs.append((prediction.rotation.detach(), prediction.frame.detach(),
+                        prediction.vertex_embedding.detach()))
+        grads.append({n: None if p.grad is None else p.grad.clone()
+                      for n, p in net.named_parameters()})
+
+    for a, b in zip(*outputs):
+        assert torch.equal(a, b), "checkpointing moved the prediction"
+    for name, expected in grads[0].items():
+        actual = grads[1][name]
+        assert (expected is None) == (actual is None), f"gradient differs: {name}"
+        assert expected is None or torch.equal(expected, actual), \
+            f"gradient differs: {name}"

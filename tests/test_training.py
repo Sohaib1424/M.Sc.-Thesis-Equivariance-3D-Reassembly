@@ -705,6 +705,38 @@ def test_the_embedding_head_has_no_unlearnable_bias():
     assert model.embedding[-1].bias is None
 
 
+def test_the_checkpointing_flags_reach_the_layers():
+    """
+    ``checkpoint_cross`` defaults on because it is what makes a 2048-token
+    scene fit on a T4 -- measured 1109 B/pair down to 86 B/pair, 3.6 GB down to
+    0.3 GB for one cross layer at 3.5 million pairs. ``checkpoint_intra``
+    defaults off because there recomputation re-runs the projections
+    themselves rather than an indexing op.
+
+    Both are only worth anything if they arrive, and the symptom of a flag that
+    does not is an OOM eleven hours into a session.
+    """
+    from reassembly.nn.cross import VNCrossFragmentAttention
+    from reassembly.nn.gat import VNGraphAttention
+
+    def flags(model):
+        return {
+            "cross": [m.checkpoint for m in model.modules()
+                      if isinstance(m, VNCrossFragmentAttention)],
+            "intra": [m.checkpoint for m in model.modules()
+                      if isinstance(m, VNGraphAttention)],
+        }
+
+    default = flags(build_model(Config(channels=32, heads=4)))
+    assert default["cross"] and all(default["cross"]), "cross is on by default"
+    assert default["intra"] and not any(default["intra"]), "intra is off by default"
+
+    swapped = flags(build_model(Config(channels=32, heads=4,
+                                       checkpoint_cross=False,
+                                       checkpoint_intra=True)))
+    assert not any(swapped["cross"]) and all(swapped["intra"])
+
+
 def test_preflight_reports_a_missing_dataset_rather_than_crashing(capsys):
     """
     The single most likely first failure on a new machine, and the one whose

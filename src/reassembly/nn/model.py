@@ -78,6 +78,8 @@ class ReassemblyNet(nn.Module):
         embedding_dim: int = 32,
         schedule: Sequence[str] = DEFAULT_SCHEDULE,
         negative_slope: float = 0.2,
+        checkpoint_intra: bool = False,
+        checkpoint_cross: bool = True,
     ) -> None:
         super().__init__()
         self.channels = channels
@@ -92,11 +94,13 @@ class ReassemblyNet(nn.Module):
         self.scale_gate = VNScaleGate(channels, scalar_features=1)
 
         self.intra = nn.ModuleList(
-            VNGraphAttentionBlock(channels, edge_channels, heads, head_dim, negative_slope)
+            VNGraphAttentionBlock(channels, edge_channels, heads, head_dim,
+                                  negative_slope, checkpoint_intra)
             for kind in self.schedule if kind == "intra"
         )
         self.cross = nn.ModuleList(
-            VNCrossFragmentAttention(channels, heads=heads, head_dim=2 * head_dim)
+            VNCrossFragmentAttention(channels, heads=heads, head_dim=2 * head_dim,
+                                     checkpoint=checkpoint_cross)
             for kind in self.schedule if kind == "cross"
         )
 

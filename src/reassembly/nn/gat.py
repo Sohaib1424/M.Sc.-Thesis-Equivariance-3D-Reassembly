@@ -40,6 +40,7 @@ import math
 from typing import Optional
 
 import torch
+import torch.utils.checkpoint
 from torch import Tensor, nn
 
 from .segment import segment_softmax, segment_sum
@@ -68,6 +69,7 @@ class VNGraphAttention(nn.Module):
         heads: int = 4,
         head_dim: int = 8,
         negative_slope: float = 0.2,
+        checkpoint: bool = False,
     ) -> None:
         super().__init__()
         if channels % heads:
@@ -107,6 +109,10 @@ class VNGraphAttention(nn.Module):
         self.act = VNLeakyReLU(channels, negative_slope)
         # 3 spatial components per projected direction, head_dim of them.
         self.scale = 1.0 / math.sqrt(3 * head_dim)
+        # Off by default: unlike the cross layer, where recomputation buys 10x
+        # for a trivially cheap indexing op, here it re-runs the projections
+        # themselves. Worth it only when memory is the binding constraint.
+        self.checkpoint = bool(checkpoint)
 
     def forward(
         self,
@@ -121,16 +127,24 @@ class VNGraphAttention(nn.Module):
         src, dst = edge_index[0], edge_index[1]
         n = x.shape[0]
 
-        # Project on the N nodes, then gather to the E edges. The other order
-        # -- gather x to (E, C, 3) and project there -- is what the concatenated
-        # form required, and costs six times as much on a triangle mesh.
-        q = self.query(x)[dst].view(-1, self.heads, self.head_dim, 3)
-        k = self.key_src(x)[src] + self.key_dst(x)[dst]
-        if edge_attr is not None:
-            k = k + self.key_edge(edge_attr)
-        k = k.view(-1, self.heads, self.head_dim, 3)
-        # Invariant: both factors rotate, so the inner product does not.
-        logits = torch.sum(q * k, dim=(-2, -1)) * self.scale          # (E, heads)
+        def scores(x_, edge_attr_):
+            # Project on the N nodes, then gather to the E edges. The other
+            # order -- gather x to (E, C, 3) and project there -- is what the
+            # concatenated form required, and costs six times as much on a
+            # triangle mesh.
+            q = self.query(x_)[dst].view(-1, self.heads, self.head_dim, 3)
+            k = self.key_src(x_)[src] + self.key_dst(x_)[dst]
+            if edge_attr_ is not None:
+                k = k + self.key_edge(edge_attr_)
+            k = k.view(-1, self.heads, self.head_dim, 3)
+            # Invariant: both factors rotate, so the inner product does not.
+            return torch.sum(q * k, dim=(-2, -1)) * self.scale        # (E, heads)
+
+        if self.checkpoint and torch.is_grad_enabled():
+            logits = torch.utils.checkpoint.checkpoint(
+                scores, x, edge_attr, use_reentrant=False)
+        else:
+            logits = scores(x, edge_attr)
 
         alpha = segment_softmax(logits, dst, n)                       # (E, heads)
         messages = self.value_src(x)[src]                             # (E, C, 3)
@@ -147,10 +161,11 @@ class VNGraphAttentionBlock(nn.Module):
     """Attention plus a residual connection, the unit the backbone stacks."""
 
     def __init__(self, channels: int, edge_channels: int = 3, heads: int = 4,
-                 head_dim: int = 8, negative_slope: float = 0.2) -> None:
+                 head_dim: int = 8, negative_slope: float = 0.2,
+                 checkpoint: bool = False) -> None:
         super().__init__()
         self.attention = VNGraphAttention(
-            channels, edge_channels, heads, head_dim, negative_slope
+            channels, edge_channels, heads, head_dim, negative_slope, checkpoint
         )
 
     def forward(self, x: Tensor, edge_index: Tensor,

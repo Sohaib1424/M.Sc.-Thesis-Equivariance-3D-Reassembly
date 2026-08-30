@@ -108,6 +108,21 @@ class Config:
     head_dim: int = 8
     embedding_dim: int = 32
     negative_slope: float = 0.2
+    checkpoint_cross: bool = True
+    """
+    Recompute the cross-attention pair gathers in the backward pass instead of
+    storing them. Measured as bytes per pair: 1109 -> 86, which on 2048 tokens
+    over 6 fragments (3.5M pairs) is 3.6 GB -> 0.3 GB per layer, for one extra
+    forward of a cheap indexing op. On by default because the trade is that
+    lopsided; outputs and gradients are bitwise identical either way.
+    """
+    checkpoint_intra: bool = False
+    """
+    The same for the intra-fragment layers. Off by default: here recomputation
+    re-runs the projections themselves, which is real work, so it is worth it
+    only when memory is the binding constraint. Turn it on if preflight cannot
+    fit `batch_size=1`.
+    """
     schedule: Sequence[str] = ("intra", "intra", "cross", "intra", "cross", "intra")
     """Four intra-fragment layers with two cross layers interleaved. A cross
     layer updates only token vertices, so each is followed by propagation --
@@ -1012,6 +1027,8 @@ def build_model(config: Config):
         channels=config.channels, heads=config.heads, head_dim=config.head_dim,
         embedding_dim=config.embedding_dim, schedule=tuple(config.schedule),
         negative_slope=config.negative_slope,
+        checkpoint_intra=config.checkpoint_intra,
+        checkpoint_cross=config.checkpoint_cross,
     )
 
 
@@ -1635,8 +1652,11 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     if fitted == 0:
         problems.append(
             f"out of memory even at batch_size=1 on a {total_memory:.0f} GB card. "
-            f"Lower --channels (64 -> 32 roughly halves the activations) or "
-            f"--tokens-per-scene."
+            f"Try, in this order: --checkpoint-intra (recomputes the "
+            f"intra-fragment projections in the backward pass, the largest "
+            f"remaining saving), then --channels 32 (roughly halves every edge "
+            f"activation), then --tokens-per-scene 1024 (the cross-attention "
+            f"cost is quadratic in this)."
         )
         _summarise(problems, warnings)
         return False
@@ -1663,6 +1683,14 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
           f"{fitted} x the largest sampled scene")
     dead = [n for n, p in model.named_parameters()
             if p.grad is None or p.grad.abs().sum() == 0]
+    # Release step 5's batch and autograd graph before step 6 allocates its own.
+    # Without this the checks compete for the card and step 6 dies on an OOM
+    # that says nothing about the model -- a preflight that fails for its own
+    # reasons is worse than no preflight.
+    del batch, loss
+    model.zero_grad(set_to_none=True)
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
     if dead:
         warnings.append(f"{len(dead)} parameter(s) got no gradient: "
                         f"{', '.join(dead[:4])}")
@@ -1672,9 +1700,14 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
 
     # -- 6. loss at initialisation ----------------------------------------
     print("\n[6/7] loss at initialisation, against chance")
-    plain, _ = _collate_samples(built[: min(len(built), 8)])
+    # `no_grad` and a batch no larger than what step 5 proved fits: this step
+    # measures the loss, not the memory, and must not fail for memory reasons.
+    plain, _ = _collate_samples(built[: min(len(built), max(fitted, 1) * 2)])
     with torch.no_grad():
         _, report, _ = _forward(model, _to_device(plain, device), criterion, config)
+    del plain
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
     print(f"  {format_losses(report)}")
     print(f"  rotation {report['rotation_degrees']:.1f} deg "
           f"(chance {CHANCE['geodesic_deg']:.1f})   "

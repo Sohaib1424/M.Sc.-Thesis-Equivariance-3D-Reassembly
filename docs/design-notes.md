@@ -610,7 +610,7 @@ filter in the loader.
 
 `reassembly.nn`, with `tests/test_nn_equivariance.py`, `tests/test_losses.py`
 and `tests/test_model.py`, plus `tests/test_training.py` for the engine.
-292 tests total, clean under `-W error`.
+293 tests total, clean under `-W error`.
 
 `torch` installs from the **default** PyPI index. The earlier failure was
 `download.pytorch.org` being blocked, not torch being unavailable — so
@@ -1138,11 +1138,23 @@ way for longer than no advice does. The two cases are now distinguished.
 
 #### The defaults changed
 
-`batch_size` is now **2** with `accumulate=2`, rather than 4 with no
-accumulation. The effective batch is identical — `2 × 2 × 2 devices = 8`, the
-same as `4 × 1 × 2` — and the LR schedule is expressed in forward passes rather
-than optimizer steps, so warmup does not shift. The old default was not chosen
-by measurement; the new one is, on the actual card.
+`batch_size` is now **2**, measured on the actual card rather than guessed.
+
+It was briefly `2` with `accumulate=2`, to hold the effective batch at what the
+old `batch_size=4` gave. That was wrong twice. Accumulation exists to *recover*
+an effective batch when memory forces `batch_size` down from a justified value —
+and 4 was itself a guess, so there was nothing to recover; preserving an
+unjustified number is not a justification. It also halves the optimizer steps
+for identical wall-clock, which on a fixed session budget is a real cost: 40
+epochs is ~65k steps at `accumulate=1` and ~32k at 2. The suite caught it —
+`test_the_model_can_actually_learn` went from passing to 77° against a 70°
+threshold, because it had been given half its optimizer steps.
+
+`accumulate` is therefore **1**. An optimizer step still sees `batch_size ×
+devices` = 4 scenes, and the losses average over *fragments*, so that is ~24
+fragments per step rather than 4 samples. Raise it if the curve turns out to be
+gradient-noise limited — measurable, not assumable. The LR schedule is expressed
+in forward passes, so changing it does not shift warmup either way.
 
 What is *not* settled: 11.96 GB is 76% of the card, measured on the largest of
 twelve **sampled** scenes at 20,777 vertices, and the dataset's largest single
@@ -1152,3 +1164,63 @@ on the biggest objects are likely. Training counts and reports them rather than
 swallowing them; if that count is more than a percent or two of an epoch, the
 answer is `--batch-size 1 --accumulate 4`, because silently dropping the largest
 objects from training is a bias in the result, not a performance detail.
+
+### What "chance" means for an equivariant model — and what it does not
+
+The fourth preflight run came back green, and reported `rotation 137.5 deg
+(chance 126.5)`. The obvious reading is "a bit above chance, probably noise".
+Both halves of that are wrong, and the reason is worth stating because it
+changes how the whole training curve should be read.
+
+The head returns `R_pred = frame^T`, and the frame co-rotates with its input.
+So on a fragment perturbed by `Q`, the prediction is `frame(assembled)^T Q^T`
+while the label is `Q^T`, and the error rotation is
+
+```
+R_pred · R_label^T  =  frame(assembled)^T Q^T Q  =  frame(assembled)^T
+```
+
+**The perturbation cancels exactly.** An untrained model's rotation error is the
+geodesic angle of its own frame on the *assembled* fragment, and has nothing to
+do with how that fragment was tumbled. Verified numerically: across three
+independent perturbations the per-fragment errors agree to 3e-13 rad — algebraic
+cancellation, with only floating-point drift left.
+
+Two consequences.
+
+**126.5° is not a distribution an untrained equivariant model draws from.** It
+is the mean angle between two *independent* uniform rotations. Here the error is
+a deterministic function of the untrained network, so it equals 126.5° only if
+those frames happen to be Haar-diffuse. A few degrees either side measures the
+initialisation, not a defect, and there is nothing there to fix. The reference
+is still the right *band* — a model sitting at ~126° after training has learned
+nothing — but treating a single init reading as a hypothesis test against it is
+a category error.
+
+**It restates the objective usefully.** Since the error at init *is*
+`angle(frame(assembled))`, training is literally driving the frame on assembled
+fragments to the identity. That is a cleaner statement of the task than "predict
+the inverse perturbation", and it is why the synthetic memorisation test is a
+meaningful check despite proving nothing about generalisation.
+
+It also gives a sharper end-to-end test than any tolerance, now in
+`test_model.py`: the variance of the init error across perturbations must be
+zero to round-off, and it covers the *data pipeline* as well as the network. If
+standardisation, token sampling or edge construction leaked any pose dependence,
+this is where it would appear and nowhere else.
+
+#### Two smaller things the same run surfaced
+
+**The init check was too noisy to be a check.** It ran on one batch — with
+`fitted=2`, about a dozen fragments. The geodesic angle of a random rotation has
+a standard deviation of 37°, so the standard error there is 10.7°: the check
+could not have distinguished chance from 20° off chance. It now averages over
+every scene step 4 built, fragment-weighted, and prints the resulting noise band
+(±4.4° over twelve scenes) so the number is read with its error bar. The scenes
+were already built and paid for.
+
+**The worker check ignored DDP.** It compared `config.workers` against the CPU
+count, but workers are per *rank*: on a 2-GPU 4-CPU box, `workers=2` means four
+worker processes plus two training processes on four CPUs. Scene building costs
+~647 ms and happens in those workers, so contention there comes straight off
+epoch time. The check now counts `workers × devices + devices`.

@@ -573,3 +573,56 @@ def test_checkpointing_does_not_change_the_model():
         assert (expected is None) == (actual is None), f"gradient differs: {name}"
         assert expected is None or torch.equal(expected, actual), \
             f"gradient differs: {name}"
+
+
+def test_the_error_at_initialisation_does_not_depend_on_the_perturbation():
+    """
+    A consequence of equivariance that changes how preflight's number is read.
+
+    The head returns `R_pred = frame^T`, and the frame co-rotates with the
+    input, so on a fragment perturbed by `Q` the prediction is
+    `frame(assembled)^T Q^T` while the label is `Q^T`. The error rotation is
+    therefore
+
+        R_pred · R_label^T = frame(assembled)^T Q^T Q = frame(assembled)^T
+
+    -- the perturbation cancels exactly. An untrained model's rotation error is
+    the geodesic angle of its own frame on the *assembled* fragment, and nothing
+    to do with how the fragment was tumbled.
+
+    Two things follow. First, "chance = 126.5 deg" is not what an untrained
+    equivariant model must score: it scores the mean angle of its own frames,
+    which equals chance only if those frames are Haar-diffuse. A preflight
+    reading a few degrees off chance is measuring the initialisation, not a bug.
+
+    Second, it is a sharp end-to-end check, and it covers the data pipeline as
+    well as the network: if standardisation, token sampling or edge construction
+    leaked any dependence on the pose, it would show up here and nowhere else.
+
+    The cancellation is algebraically exact but not bitwise -- rotating the
+    input changes the floating-point path through six layers. Measured drift is
+    ~3e-13 rad, which is 2e-11 degrees against errors of order 100 degrees, so
+    the tolerance below is thirteen orders of magnitude tighter than any real
+    leak could hide under.
+    """
+    net = _net()
+    rotations = [np.repeat(np.eye(3)[None], 3, axis=0)]
+    for seed in (31, 32, 33):
+        rotations.append(random_rotations(3, np.random.default_rng(seed)))
+
+    errors = []
+    with torch.no_grad():
+        for rotation in rotations:
+            batch = collate([_sample(7, rotations=rotation)], dtype=DTYPE)
+            prediction = _forward(net, batch)
+            errors.append(geodesic_angle(prediction.rotation, batch.target_rotation))
+
+    # The assembled case (identity perturbation) is the reference: there the
+    # label is the identity, so the error *is* the frame's own angle.
+    for index, other in enumerate(errors[1:], 1):
+        drift = (errors[0] - other).abs().max().item()
+        assert drift < 1e-10, (
+            f"re-posing the fragments moved the initial error by {drift:.2e} rad "
+            f"(perturbation {index}), which is far above round-off -- something "
+            f"in the model or the pipeline sees the pose"
+        )

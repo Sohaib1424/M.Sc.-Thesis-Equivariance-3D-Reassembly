@@ -127,7 +127,7 @@ tests still pass and the network tests skip.
 git clone <this-repo> && cd <this-repo>
 python -m venv .venv && source .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest                                        # 292 passed
+python -m pytest                                        # 293 passed
 ```
 
 Installing is optional — `pytest.ini` sets `pythonpath = src .` and each script
@@ -277,7 +277,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             292 tests, no skips
+tests/                             293 tests, no skips
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -336,7 +336,7 @@ from there. Preflight checks the things that are:
 | Loss at initialisation vs chance | A term far from its reference is measuring something other than its name |
 | Measured seconds/step | Projects epoch time, total time, **and how many sessions it will take** |
 
-The defaults — `batch_size=2`, `accumulate=2`, `checkpoint_cross=True` — are the
+The defaults — `batch_size=2`, `accumulate=1`, `checkpoint_cross=True` — are the
 ones **measured** to fit a 15.6 GB T4: 11.96 GB (76%) on the largest of twelve
 sampled Breaking Bad scenes. Watch the skipped-batch count in the first epoch;
 the dataset's largest single fragment is four times anything preflight samples,

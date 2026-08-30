@@ -153,12 +153,23 @@ class Config:
     warmup_fraction: float = 0.03
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
-    accumulate: int = 2
+    accumulate: int = 1
     """
-    Optimizer steps every `accumulate` batches, so the effective batch is
-    `batch_size * accumulate * devices` = 8 at the defaults -- the same as the
-    old `batch_size=4` gave, without the memory. The LR schedule is expressed in
-    forward passes, not optimizer steps, so changing this does not shift warmup.
+    Optimizer steps every `accumulate` batches.
+
+    This was briefly 2, to "keep the effective batch the same as the old
+    `batch_size=4` default". That reasoning was wrong twice over. Accumulation
+    exists to *recover* an effective batch when memory forces `batch_size` down
+    from a justified value -- and 4 was never justified, it was a guess, so
+    there was nothing to recover. It also halves the number of optimizer steps
+    for identical wall-clock, which for a 635k-parameter model on a fixed
+    session budget is a real cost: 40 epochs is ~65k steps at 1 and ~32k at 2.
+
+    At 1 an optimizer step still sees `batch_size * devices` = 4 scenes, and the
+    losses average over *fragments*, so that is around 24 fragments per step,
+    not 4 samples. Raise this if the loss curve turns out to be gradient-noise
+    limited -- which is something to measure, not assume. The LR schedule is
+    expressed in forward passes, so changing it does not shift warmup.
     """
     amp: bool = False
 
@@ -1546,10 +1557,24 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     requested = devices if config.devices < 0 else config.devices
     if requested > devices:
         problems.append(f"devices={config.devices} but only {devices} GPU(s) visible")
-    print(f"  cpus: {os.cpu_count()}   dataloader workers: {config.workers}")
-    if config.workers > max((os.cpu_count() or 2) - 1, 1):
-        warnings.append(f"workers={config.workers} on {os.cpu_count()} cpus may "
-                        f"contend; 2 is usually right on Kaggle")
+    # Under DDP the worker count is per *rank*, so the machine actually runs
+    # `workers * devices` of them plus one main process each. Comparing the
+    # per-rank number to the CPU count understates it by the world size, which
+    # on a 2-GPU 4-CPU Kaggle box is the difference between "fine" and
+    # oversubscribed -- and this pipeline builds scenes in the workers, so
+    # contention there shows up directly as epoch time.
+    world = max(requested, 1)
+    cpus = os.cpu_count() or 2
+    total_workers = config.workers * world
+    print(f"  cpus: {cpus}   dataloader workers: {config.workers}"
+          + (f" x {world} ranks = {total_workers}" if world > 1 else ""))
+    if total_workers + world > cpus:
+        warnings.append(
+            f"{total_workers} dataloader workers plus {world} training "
+            f"process(es) on {cpus} cpus is oversubscribed. Scene building is "
+            f"CPU-bound here, so this comes straight off epoch time; try "
+            f"--workers {max((cpus - world) // world, 1)}."
+        )
 
     # -- 2. output location ------------------------------------------------
     print("\n[2/7] checkpoint directory")
@@ -1698,13 +1723,23 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             f"speed."
         )
     if peak and peak > 0.65 * total_memory:
+        # Keep the effective batch identical when suggesting a smaller one.
+        # `--accumulate 2` alongside a halved batch would quietly halve the
+        # effective batch as well, which changes the optimisation rather than
+        # just the memory -- and a suggestion that silently retunes the run is
+        # worse than no suggestion.
+        safer = max(fitted // 2, 1)
+        keep = max(config.accumulate * max(fitted // safer, 1), 1)
         warnings.append(
             f"peak memory is {100 * peak / total_memory:.0f}% of the card on the "
             f"largest of {samples} sampled scenes -- and the dataset's largest "
             f"single fragment is 83,039 vertices, several times anything sampled "
-            f"here. Training catches an OOM and skips the batch, but if that "
-            f"fires often the largest objects are being dropped. Consider "
-            f"--batch-size {max(fitted // 2, 1)} --accumulate 2."
+            f"here. Training catches an OOM and skips the batch and reports the "
+            f"count; if that count is more than a percent or so of an epoch, the "
+            f"largest objects are being dropped from training, which biases the "
+            f"result. Then use --batch-size {safer} --accumulate {keep}, which "
+            f"holds the effective batch at "
+            f"{safer * keep * max(requested, 1)}."
         )
 
     parameters = sum(p.numel() for p in model.parameters())
@@ -1737,21 +1772,38 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     # The `try` is the belt to that brace: this step measures the loss, not the
     # memory, so if it runs out anyway it must shrink and carry on rather than
     # take the whole report down with it.
-    report = {}
-    for count in _halvings(min(len(built), max(fitted, 1))):
+    # Averaged over *every* scene built in step 4, not just one batch.
+    #
+    # This is what makes the check worth having. The rotation angle of a random
+    # rotation has a standard deviation of 37 deg, so the mean over one batch of
+    # two scenes -- about a dozen fragments -- carries a standard error of
+    # 10.7 deg. A check with that much noise cannot tell chance from 20 deg off
+    # chance, which is most of what it is for. Over twelve scenes the standard
+    # error is ~4.4 deg, and the scenes are already built and paid for.
+    report, fragments = {}, 0
+    chunk = max(fitted, 1)
+    for start in range(0, len(built), chunk):
         plain = None
         try:
-            plain, _ = _collate_samples(built[:count])
+            plain, _ = _collate_samples(built[start:start + chunk])
             with torch.no_grad():
-                _, report, _ = _forward(model, _to_device(plain, device),
-                                        criterion, config)
-            break
+                _, piece, _ = _forward(model, _to_device(plain, device),
+                                       criterion, config)
+            # Fragment-weighted, the same way `run_epoch` aggregates, so the
+            # average does not over-count scenes that happen to be small.
+            weight = int(plain.num_fragments)
+            for name, value in piece.items():
+                report[name] = report.get(name, 0.0) + value * weight
+            fragments += weight
         except torch.cuda.OutOfMemoryError:
-            plain = None
             if device.startswith("cuda"):
                 torch.cuda.empty_cache()
         finally:
             plain = None
+    if fragments:
+        report = {name: total / fragments for name, total in report.items()}
+        print(f"  averaged over {len(built)} scenes / {fragments} fragments "
+              f"(+-{37.0 / math.sqrt(fragments):.1f} deg noise on rotation)")
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
     if not report:
@@ -1764,6 +1816,15 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
           f"(chance {CHANCE['geodesic_deg']:.1f})   "
           f"normal {report.get('normal', float('nan')):.3f} (1.0)   "
           f"face {report.get('face', float('nan')):.3f} (2.0)")
+    # Worth stating, because the obvious reading of this line is wrong. Because
+    # the model is equivariant, the perturbation cancels out of the error at
+    # initialisation exactly: R_pred R_label^T = frame(assembled)^T. So this
+    # number is the mean angle of the untrained frames on *assembled* fragments,
+    # not a draw from the chance distribution -- it equals 126.5 deg only if
+    # those frames happen to be uniformly spread. A few degrees either way is a
+    # property of the initialisation, and there is nothing there to fix.
+    print("  (equivariance cancels the perturbation here, so this is the "
+          "untrained frame's own angle, not a sample from chance)")
     for complaint in check_initial_losses(report):
         problems.append(f"loss at init: {complaint}")
     if "embedding" not in report:

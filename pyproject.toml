@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reassembly"
+version = "0.1.0"
+description = "Data, geometry and fracture-surface extraction for Breaking Bad 3D reassembly"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# `igl` and `trimesh` are imported lazily, inside the functions that need
+# them, but they are not optional in practice: no fragment can be
+# decompressed without igl, and no scene rendered without trimesh. They are
+# listed here rather than as extras so that `pip install -e .` gives a
+# working pipeline.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "libigl>=2.5",   # provides `import igl`
+    "trimesh>=4.0",
+]
+
+[project.optional-dependencies]
+# pandas is genuinely optional: scripts.extract_fracture_surfaces writes its
+# per-fragment CSV with the stdlib `csv` module and only reaches for pandas
+# to compute the summary table, printing a notice and carrying on if it is
+# absent.
+stats = ["pandas>=2.0"]
+
+# torch is a real optional: `reassembly.mesh` and `reassembly.data` (except
+# `data.features`) have no torch import at all, and the geometry test suite
+# passes on a machine without it. Only `reassembly.nn` needs it.
+#
+# Install from the default PyPI index -- `pip install torch` -- not from
+# download.pytorch.org. The CUDA wheels are on PyPI and the pytorch.org index
+# is blocked from some networks.
+torch = ["torch>=2.2"]
+dev = ["pytest>=7.4", "pandas>=2.0", "torch>=2.2"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+# `scripts` and `tests` are deliberately excluded: they are entry points and
+# checks, not library code. Run them from the repository root with
+# `python -m scripts.<name>`.
+
+# NOTE: pytest configuration lives in pytest.ini, not here. pytest.ini takes
+# precedence over pyproject.toml, so a [tool.pytest.ini_options] block added
+# here would be silently ignored. Edit pytest.ini instead.

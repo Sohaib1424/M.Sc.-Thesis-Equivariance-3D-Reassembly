@@ -1,0 +1,190 @@
+"""Compare the refactored package against the original code, scene by scene."""
+import sys, time
+import numpy as np
+
+sys.path.insert(0, "baseline")
+sys.path.insert(0, "/home/claude/project/src")
+
+from helpers import list_scene_directories                     # original
+from src.utils import load_random_scene, resolve_duplicated_faces as rdf_orig
+from src.geometry import extract_fractures as ef_orig, find_neighbors as fn_orig
+from src.correspondence import compute_scene_correspondence as csc_orig
+
+from reassembly.data.paths import find_scenes
+from reassembly.data.scene import SceneReader
+from reassembly.mesh.fracture import extract_fracture_surface, fracture_face_mask
+from reassembly.mesh.correspondence import compute_scene_correspondence as csc_new
+from reassembly.mesh.topology import count_unique_edges, unique_edges
+
+ROOT = "/home/claude/bench/data_fake"
+FAILS = []
+
+
+def check(name, ok, extra=""):
+    print(f"  {'PASS' if ok else 'FAIL'}  {name} {extra}")
+    if not ok:
+        FAILS.append(name)
+
+
+# ---- scene discovery ------------------------------------------------------
+print("== scene discovery ==")
+old = sorted(str(p) for p in list_scene_directories(root=ROOT))
+new = sorted(str(s.path) for s in find_scenes(ROOT))
+check("scene set identical", old == new, f"{len(old)} vs {len(new)}")
+
+scene_objs = find_scenes(ROOT)
+if len(scene_objs) < 4:
+    raise SystemExit(f"ABORT: only {len(scene_objs)} scenes under {ROOT!r} -- the suite would pass vacuously. Refusing to report a verdict.")
+print(f"  subsets: {sorted({s.subset for s in scene_objs})}")
+print(f"  categories: {sorted({s.category for s in scene_objs})}")
+
+
+# ---- fragment loading -----------------------------------------------------
+print("\n== fragment loading (all modes, all scenes) ==")
+import src.utils as ou
+import os
+
+
+def load_mode_original(scene_dir, mode):
+    """Original loader, pinned to a specific mode instead of a random one."""
+    import igl, trimesh
+    from scipy.sparse import load_npz
+    V, F = igl.read_triangle_mesh(os.path.join(scene_dir, "compressed_mesh.obj"))
+    M = load_npz(os.path.join(scene_dir, "compressed_data.npz"))
+    labels = np.load(os.path.join(scene_dir, mode, "compressed_fracture.npy"))
+    vlab = M @ labels
+    n = int(np.max(labels) + 1)
+    out = []
+    for i in range(n):
+        tri = vlab[F[:, 0]]
+        if not np.any(tri == i):
+            continue
+        vi, fi = igl.remove_unreferenced(V, F[tri == i, :])[:2]
+        ui, I, J, _ = igl.remove_duplicate_vertices(vi, fi, 1e-10)
+        gi = J[fi]
+        ffi, _ = rdf_orig(gi)
+        nv, nf, _, _ = igl.remove_unreferenced(ui, ffi)
+        out.append(trimesh.Trimesh(nv, nf))
+    return out
+
+
+n_frag = n_same = 0
+for scene in scene_objs[:6]:
+    reader = SceneReader(scene.path)
+    for mode in reader.mode_names():
+        a = load_mode_original(str(scene.path), mode)
+        b = reader.load_mode(mode).fragments
+        if len(a) != len(b):
+            check(f"frag count {scene.name}/{mode}", False, f"{len(a)} vs {len(b)}")
+            continue
+        for x, y in zip(a, b):
+            n_frag += 1
+            same = (np.array_equal(np.asarray(x.faces), np.asarray(y.faces))
+                    and np.allclose(np.asarray(x.vertices), np.asarray(y.vertices)))
+            n_same += same
+check("fragments identical", n_same == n_frag, f"{n_same}/{n_frag}")
+
+
+# ---- fracture extraction --------------------------------------------------
+print("\n== fracture extraction ==")
+n_frag = n_same = 0
+diff_examples = []
+for scene in scene_objs[:6]:
+    reader = SceneReader(scene.path)
+    for mode in reader.mode_names()[:2]:
+        for frag in reader.load_mode(mode).fragments:
+            a = ef_orig(frag)
+            b = extract_fracture_surface(frag, compact=False)
+            n_frag += 1
+            fa = np.sort(np.asarray(a.faces), axis=0)
+            fb = np.sort(np.asarray(b.faces), axis=0)
+            same = fa.shape == fb.shape and np.array_equal(fa, fb)
+            n_same += same
+            if not same and len(diff_examples) < 3:
+                diff_examples.append((len(a.faces), len(b.faces)))
+check("fracture face sets identical", n_same == n_frag,
+      f"{n_same}/{n_frag}" + (f" examples {diff_examples}" if diff_examples else ""))
+
+
+# ---- edges ----------------------------------------------------------------
+print("\n== unique edges ==")
+ok = True
+for scene in scene_objs[:4]:
+    reader = SceneReader(scene.path)
+    for frag in reader.load_mode(reader.mode_names()[0]).fragments:
+        e_tri = set(map(tuple, np.sort(np.asarray(frag.edges_unique), axis=1).tolist()))
+        e_new = set(map(tuple, unique_edges(np.asarray(frag.faces),
+                                            len(frag.vertices)).tolist()))
+        ok &= (e_tri == e_new)
+        ok &= (count_unique_edges(np.asarray(frag.faces), len(frag.vertices)) == len(e_tri))
+check("edges match trimesh", ok)
+
+
+# ---- correspondence -------------------------------------------------------
+print("\n== correspondence ==")
+ok = True
+for scene in scene_objs[:4]:
+    reader = SceneReader(scene.path)
+    frags = reader.load_mode(reader.mode_names()[0]).fragments
+    if len(frags) < 2:
+        continue
+    va, ea = csc_orig(frags)
+    vb, eb = csc_new(frags)
+    # Vertices are positionally aligned in both, so compare directly.
+    for x, y in zip(va, vb):
+        ok &= np.array_equal(x >= 0, y >= 0)
+    # Edges are NOT: trimesh.edges_unique and unique_edges return the same set
+    # in different orders. Compare the geometry each marks as shared instead
+    # of the positional arrays.
+    for m, x, y in zip(frags, ea, eb):
+        V = np.asarray(m.vertices)
+        e_old = np.sort(np.asarray(m.edges_unique), axis=1)
+        e_new = unique_edges(np.asarray(m.faces), len(V))
+        mid_old = ((V[e_old[:, 0]] + V[e_old[:, 1]]) / 2)[x >= 0]
+        mid_new = ((V[e_new[:, 0]] + V[e_new[:, 1]]) / 2)[y >= 0]
+        key = lambda a: set(map(tuple, np.round(a, 9).tolist()))
+        ok &= key(mid_old) == key(mid_new)
+check("shared-point sets identical", ok)
+
+
+# ---- timing ---------------------------------------------------------------
+print("\n== end-to-end timing (all scenes, all modes) ==")
+
+
+def run_original():
+    total = 0
+    for scene in scene_objs:
+        reader = SceneReader(scene.path)
+        for mode in reader.mode_names():
+            for frag in load_mode_original(str(scene.path), mode):
+                m = ef_orig(frag)
+                c = m.copy(); c.remove_unreferenced_vertices()
+                total += len(c.vertices) + len(frag.edges_unique) + len(c.edges_unique)
+    return total
+
+
+def run_new():
+    from reassembly.arrays import compact_indices
+    total = 0
+    for scene in scene_objs:
+        reader = SceneReader(scene.path)
+        for mode in reader.mode_names():
+            for frag in reader.load_mode(mode).fragments:
+                V = np.asarray(frag.vertices); F = np.asarray(frag.faces)
+                mask = fracture_face_mask(V, F, has_duplicate_faces=False).face_mask
+                kf = F[mask]
+                kept, _ = compact_indices(kf, len(V))
+                total += (len(kept) + count_unique_edges(F, len(V))
+                          + count_unique_edges(kf, len(V)))
+    return total
+
+
+t = time.perf_counter(); r1 = run_original(); t1 = time.perf_counter() - t
+t = time.perf_counter(); r2 = run_new(); t2 = time.perf_counter() - t
+print(f"  original : {t1:7.2f} s   (checksum {r1})")
+print(f"  refactor : {t2:7.2f} s   (checksum {r2})")
+print(f"  speedup  : {t1 / t2:6.2f}x   checksums {'match' if r1 == r2 else 'DIFFER'}")
+if r1 != r2:
+    FAILS.append("checksum")
+
+print("\n" + ("ALL PASS" if not FAILS else f"FAILURES: {FAILS}"))

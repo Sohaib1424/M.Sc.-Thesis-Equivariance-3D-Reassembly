@@ -1,0 +1,25 @@
+# Runtime dependencies. Mirrors [project.dependencies] in pyproject.toml.
+#
+#   pip install -r requirements.txt
+#
+# or, to get the package importable without touching sys.path:
+#
+#   pip install -e ".[dev]"
+
+numpy>=1.24
+scipy>=1.10
+libigl>=2.5        # provides `import igl` — fragment decompression
+trimesh>=4.0       # scene assembly and rendering
+
+# Optional. scripts/extract_fracture_surfaces.py writes its per-fragment CSV
+# without pandas and only uses it for the summary table.
+pandas>=2.0
+
+# The network. Optional: reassembly.mesh and reassembly.data (except
+# data.features) never import torch, and the geometry tests pass without it.
+# Install from the default index; download.pytorch.org is blocked on some
+# networks and the CUDA wheels are on PyPI anyway.
+torch>=2.2
+
+# Tests.
+pytest>=7.4

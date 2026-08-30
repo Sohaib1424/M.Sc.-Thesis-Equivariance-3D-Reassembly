@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+venv/
+.venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Dataset. Breaking Bad is tens of GB and is not redistributable — keep it
+# out of the repository and point --root at it instead.
+/data/
+/out/
+*.obj
+*.npz
+*.npy
+
+# Extraction output: packed fracture masks and their CSVs. Reproducible from
+# `python -m scripts.extract_fracture_surfaces`, so not worth versioning.
+out/
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

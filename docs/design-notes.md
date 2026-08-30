@@ -610,7 +610,7 @@ filter in the loader.
 
 `reassembly.nn`, with `tests/test_nn_equivariance.py`, `tests/test_losses.py`
 and `tests/test_model.py`, plus `tests/test_training.py` for the engine.
-290 tests total, clean under `-W error`.
+292 tests total, clean under `-W error`.
 
 `torch` installs from the **default** PyPI index. The earlier failure was
 `download.pytorch.org` being blocked, not torch being unavailable — so
@@ -1094,3 +1094,61 @@ luck, not because the check had been done. The ordering to prefer, when
 `batch_size=1` still will not fit, is `--checkpoint-intra` first (free but for
 compute), then `--channels 32`, and only then `--tokens-per-scene 1024`, because
 the last one changes what the model can represent while the first two do not.
+
+### The third preflight run, and the bug that kept coming back
+
+With the cross layers checkpointed, `batch_size=2` fits at **11.96 GB of
+15.6 GB** — the two cross layers had been most of the previous 11.61 GB at
+`batch_size=1`. Then step 7 died in `loss.backward()`.
+
+It was the same bug for the third time, in a third place. The shape of it:
+
+| | |
+|---|---|
+| Step 6, run 2 | Allocated while step 5's batch and graph were still alive |
+| Step 7, run 3 | Timed at `config.batch_size`, which step 5 had *just proved* does not fit |
+| Step 6, run 3 | Sized from `fitted` — then doubled it, to `fitted * 2` |
+
+The third one was mine, introduced by the fix for the first. The reasoning was
+that step 6 runs under `no_grad` and so stores no autograd graph, which is true
+and still not a proof; `fitted * 2` died the moment `fitted` was 2. **Preflight
+is the one function in this project that must not estimate memory** — it exists
+because estimates are what fail on Kaggle.
+
+So the rule is now explicit rather than repeatedly rediscovered: after step 5,
+`fitted` is a ceiling that no later step may exceed, and each step that
+allocates catches `OutOfMemoryError` and degrades instead of raising. A
+preflight that dies of its own memory use is worse than no preflight, because
+it throws away every check that had already passed.
+
+The reason this survived three rounds is that **`preflight` was the one function
+the test suite could not reach**: it needs a dataset on disk in the real
+Breaking Bad layout, so every bug in it was found by spending a Kaggle session.
+`tests/test_training.py` now builds one — a handful of icospheres labelled into
+angular sectors, each fine vertex its own cell so the cell matrix is the
+identity — and runs the whole of preflight against it with `_forward`
+monkeypatched to raise `OutOfMemoryError` above a chosen batch size. CPU has no
+memory ceiling to hit, but the control flow under test is the real one, and it
+fails on all three bugs above.
+
+One more thing it found, unrelated to memory: when a split came out empty,
+preflight printed advice about fixing `--root` — but `--root` was *correct*, or
+no scenes would have been found at all. Wrong advice sends someone the wrong
+way for longer than no advice does. The two cases are now distinguished.
+
+#### The defaults changed
+
+`batch_size` is now **2** with `accumulate=2`, rather than 4 with no
+accumulation. The effective batch is identical — `2 × 2 × 2 devices = 8`, the
+same as `4 × 1 × 2` — and the LR schedule is expressed in forward passes rather
+than optimizer steps, so warmup does not shift. The old default was not chosen
+by measurement; the new one is, on the actual card.
+
+What is *not* settled: 11.96 GB is 76% of the card, measured on the largest of
+twelve **sampled** scenes at 20,777 vertices, and the dataset's largest single
+fragment is 83,039. Vertex-linear terms grow with it, though the cross-attention
+term does not (tokens are capped at 2048 regardless of mesh size). So OOM-skips
+on the biggest objects are likely. Training counts and reports them rather than
+swallowing them; if that count is more than a percent or two of an epoch, the
+answer is `--batch-size 1 --accumulate 4`, because silently dropping the largest
+objects from training is a bias in the result, not a performance detail.

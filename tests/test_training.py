@@ -864,3 +864,100 @@ def test_preflight_reports_the_largest_batch_that_fits():
     assert _halvings(4) == [4, 2, 1]
     assert _halvings(8) == [8, 4, 2, 1]
     assert _halvings(1) == [1]
+
+
+def _fake_dataset(root: Path, objects: int = 24, modes: int = 2) -> Path:
+    """
+    A Breaking Bad directory tree small enough to run preflight against.
+
+    Preflight is the one function the rest of the suite cannot reach: it needs a
+    dataset on disk in the real layout, so every bug in it has so far been found
+    by a Kaggle session instead of by a test. Three have been, all of the same
+    kind -- a later step allocating as though an earlier one had not run.
+
+    Each fine vertex is its own cell, so the cell matrix is the identity and the
+    fracture file is a plain per-vertex label. Pieces are angular sectors, which
+    keeps them contiguous.
+    """
+    from scipy.sparse import identity, save_npz
+
+    mesh = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
+    vertices = np.asarray(mesh.vertices)
+    theta = np.arctan2(vertices[:, 1], vertices[:, 0])
+
+    for index in range(objects):
+        directory = (root / "everyday_compressed" / "everyday_compressed"
+                     / "Mug" / f"mug_{index}")
+        directory.mkdir(parents=True)
+        mesh.export(directory / "compressed_mesh.obj")
+        save_npz(directory / "compressed_data.npz",
+                 identity(len(vertices), format="csr"))
+        for mode in range(modes):
+            pieces = 2 + mode
+            mode_dir = directory / f"mode_{mode}"
+            mode_dir.mkdir()
+            labels = np.floor((theta + np.pi) / (2 * np.pi) * pieces)
+            np.save(mode_dir / "compressed_fracture.npy",
+                    np.clip(labels, 0, pieces - 1).astype(np.int64))
+    return root
+
+
+def test_preflight_times_at_a_batch_size_that_fits(tmp_path, monkeypatch, capsys):
+    """
+    Step 5 halves the batch until one fits. Every step after it must then use
+    *that* size -- timing at the configured size, which step 5 just proved does
+    not fit, kills preflight for its own reasons and throws away the report.
+
+    This has now happened twice: first in step 6, then, after that fix, in step
+    7, where the traceback landed in `loss.backward()` and looked like a model
+    problem rather than a preflight one. The OOM is simulated here because CPU
+    has no such limit, but the control flow under test is the real one.
+    """
+    import reassembly.training as training
+
+    _fake_dataset(tmp_path / "data")
+    real_forward = training._forward
+    seen = []
+
+    def limited(model, batch, criterion, config):
+        """Anything above two scenes 'runs out of memory'."""
+        size = int(batch.num_scenes)
+        seen.append(size)
+        if size > 2:
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return real_forward(model, batch, criterion, config)
+
+    monkeypatch.setattr(training, "_forward", limited)
+    config = Config(root=str(tmp_path / "data"), out_dir=str(tmp_path / "out"),
+                    batch_size=4, channels=16, heads=4, workers=0,
+                    tokens_per_scene=64)
+    training.preflight(config)
+    text = capsys.readouterr().out
+
+    assert "batch_size=4: out of memory" in text
+    assert "batch_size=2: fits" in text
+    # The point of the test: step 7 ran, and ran at 2.
+    assert "timing" in text and "batch_size=2" in text
+    assert "s/step" in text, "step 7 never produced a timing"
+    assert max(seen) == 4, "step 5 should have tried the configured size once"
+    assert seen.count(4) == 1, "nothing after step 5 may retry a size that failed"
+
+
+def test_preflight_says_the_batch_does_not_fit_rather_than_crashing(tmp_path,
+                                                                   monkeypatch):
+    """A batch size that does not fit is a [STOP], not a traceback."""
+    import reassembly.training as training
+
+    _fake_dataset(tmp_path / "data", objects=24)
+    real_forward = training._forward
+
+    def limited(model, batch, criterion, config):
+        if int(batch.num_scenes) > 1:
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return real_forward(model, batch, criterion, config)
+
+    monkeypatch.setattr(training, "_forward", limited)
+    config = Config(root=str(tmp_path / "data"), out_dir=str(tmp_path / "out"),
+                    batch_size=4, channels=16, heads=4, workers=0,
+                    tokens_per_scene=64)
+    assert training.preflight(config) is False

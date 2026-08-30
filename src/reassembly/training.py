@@ -137,15 +137,29 @@ class Config:
 
     # -- optimisation -----------------------------------------------------
     epochs: int = 40
-    batch_size: int = 4
-    """Scenes per step *per device*. A scene is a whole graph, so this is not
-    comparable to an image batch size."""
+    batch_size: int = 2
+    """
+    Scenes per step *per device*. A scene is a whole graph, so this is not
+    comparable to an image batch size.
+
+    2 rather than 4 because that is what was **measured** to fit on the target
+    card: on a 15.6 GB T4, 4 copies of the largest of twelve sampled Breaking
+    Bad scenes ran out of memory and 2 peaked at 11.96 GB (76%). With
+    `accumulate=2` the effective batch is unchanged, so this costs a little
+    speed and nothing else.
+    """
     lr: float = 1e-3
     min_lr_fraction: float = 0.02
     warmup_fraction: float = 0.03
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
-    accumulate: int = 1
+    accumulate: int = 2
+    """
+    Optimizer steps every `accumulate` batches, so the effective batch is
+    `batch_size * accumulate * devices` = 8 at the defaults -- the same as the
+    old `batch_size=4` gave, without the memory. The LR schedule is expressed in
+    forward passes, not optimizer steps, so changing this does not shift warmup.
+    """
     amp: bool = False
 
     # -- runtime ----------------------------------------------------------
@@ -1555,8 +1569,17 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
         val_set = BreakingBadScenes(config, "val", epoch_seed=0)
     except FileNotFoundError as error:
         print(f"  FAILED: {error}")
-        print("\n  --root must point at the directory *containing* the subset")
-        print("  folders, e.g. /kaggle/input/breaking-bad, not at one object.")
+        # Two different failures reach here and they need opposite advice. If no
+        # scenes were found at all, --root is wrong. If scenes were found but a
+        # split came out empty, --root is right and the split is the problem --
+        # telling someone to fix a correct path sends them the wrong way.
+        if "no scenes left in split" in str(error):
+            print("\n  The dataset was found, so --root is right. Either the")
+            print("  official split lists no object present here, or there are")
+            print("  too few objects for the hashed fallback to fill every split.")
+        else:
+            print("\n  --root must point at the directory *containing* the subset")
+            print("  folders, e.g. /kaggle/input/breaking-bad, not at one object.")
         return False
     print(f"  objects: {len(train_set.scenes)} train / {len(val_set.scenes)} val")
     print(f"  samples: {len(train_set)} train / {len(val_set)} val "
@@ -1626,6 +1649,7 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     # that is actually wanted is the largest batch this card can take, and it
     # costs seconds to measure rather than a session to discover.
     fitted, peak, report = 0, 0.0, {}
+    batch = loss = None
     for candidate in _halvings(config.batch_size):
         batch, _ = _collate_samples([biggest] * candidate)
         batch = _to_device(batch, device)
@@ -1636,8 +1660,13 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             loss, report, _ = _forward(model, batch, criterion, config)
             loss.backward()
         except torch.cuda.OutOfMemoryError:
+            # `loss` must go too, not just `batch`. If the OOM landed in
+            # `backward` rather than the forward, `loss` is bound and holds the
+            # entire autograd graph of the candidate that just failed -- which
+            # would then still be resident while the *next*, smaller candidate
+            # is measured, inflating its peak and possibly failing it too.
             model.zero_grad(set_to_none=True)
-            del batch
+            batch = loss = report = None
             torch.cuda.empty_cache()
             print(f"  batch_size={candidate}: out of memory")
             continue
@@ -1668,7 +1697,7 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             f"effective batch at {fitted * effective} and costs only a little "
             f"speed."
         )
-    elif peak and peak > 0.65 * total_memory:
+    if peak and peak > 0.65 * total_memory:
         warnings.append(
             f"peak memory is {100 * peak / total_memory:.0f}% of the card on the "
             f"largest of {samples} sampled scenes -- and the dataset's largest "
@@ -1700,14 +1729,36 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
 
     # -- 6. loss at initialisation ----------------------------------------
     print("\n[6/7] loss at initialisation, against chance")
-    # `no_grad` and a batch no larger than what step 5 proved fits: this step
-    # measures the loss, not the memory, and must not fail for memory reasons.
-    plain, _ = _collate_samples(built[: min(len(built), max(fitted, 1) * 2)])
-    with torch.no_grad():
-        _, report, _ = _forward(model, _to_device(plain, device), criterion, config)
-    del plain
+    # Never larger than what step 5 proved fits. An earlier version used
+    # `fitted * 2`, reasoning that `no_grad` stores no autograd graph and so
+    # costs a fraction -- true, but a guess, and preflight is the one place that
+    # must not guess about memory. It duly died on a card where `fitted` was 2.
+    #
+    # The `try` is the belt to that brace: this step measures the loss, not the
+    # memory, so if it runs out anyway it must shrink and carry on rather than
+    # take the whole report down with it.
+    report = {}
+    for count in _halvings(min(len(built), max(fitted, 1))):
+        plain = None
+        try:
+            plain, _ = _collate_samples(built[:count])
+            with torch.no_grad():
+                _, report, _ = _forward(model, _to_device(plain, device),
+                                        criterion, config)
+            break
+        except torch.cuda.OutOfMemoryError:
+            plain = None
+            if device.startswith("cuda"):
+                torch.cuda.empty_cache()
+        finally:
+            plain = None
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
+    if not report:
+        problems.append("could not evaluate the loss at initialisation even on "
+                        "a single scene -- something is wrong beyond batch size.")
+        _summarise(problems, warnings)
+        return False
     print(f"  {format_losses(report)}")
     print(f"  rotation {report['rotation_degrees']:.1f} deg "
           f"(chance {CHANCE['geodesic_deg']:.1f})   "
@@ -1721,36 +1772,77 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
                         "train and stage two has nothing to match on")
 
     # -- 7. speed ----------------------------------------------------------
-    print(f"\n[7/7] timing {timed_batches} training steps")
+    # Time at the size step 5 *proved* fits, never at the configured one. Timing
+    # at a size already shown to OOM makes this step die for preflight's own
+    # reasons and throws away the whole report -- which is exactly the failure
+    # step 6 had, in a second place.
+    timing_batch = max(min(config.batch_size, fitted), 1)
+    print(f"\n[7/7] timing {timed_batches} training steps at "
+          f"batch_size={timing_batch}"
+          + (f" (not {config.batch_size} -- that did not fit)"
+             if timing_batch != config.batch_size else ""))
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
     loader = torch.utils.data.DataLoader(
-        train_set, batch_size=config.batch_size, shuffle=True,
+        train_set, batch_size=timing_batch, shuffle=True,
         collate_fn=_collate_samples, num_workers=config.workers,
     )
     model.train()
-    began, done = time.time(), 0
+    began, done, skipped = time.time(), 0, 0
     for index, (batch, _) in enumerate(loader):
         if batch is None:
             continue
-        batch = _to_device(batch, device)
-        loss, _, _ = _forward(model, batch, criterion, config)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-        optimizer.step()
+        try:
+            batch = _to_device(batch, device)
+            loss, _, _ = _forward(model, batch, criterion, config)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            optimizer.step()
+        except torch.cuda.OutOfMemoryError:
+            # Step 5 measured the largest *sampled* scene; the loader draws from
+            # the whole set, where the largest single fragment is 83k vertices.
+            # Training skips such a batch rather than dying, so preflight must
+            # too -- otherwise it reports a failure the real run would survive.
+            skipped += 1
+            batch = loss = None
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            continue
+        finally:
+            batch = loss = None
         optimizer.zero_grad(set_to_none=True)
         done += 1
         if done >= timed_batches:
             break
     if device.startswith("cuda"):
         torch.cuda.synchronize()
+    if done == 0:
+        problems.append(
+            f"every one of the first {skipped} batches ran out of memory at "
+            f"batch_size={timing_batch}, even though a batch of {fitted} copies "
+            f"of the largest sampled scene fits. Real scenes are bigger than the "
+            f"sample; lower --batch-size or --tokens-per-scene."
+        )
+        _summarise(problems, warnings)
+        return False
+    if skipped:
+        warnings.append(
+            f"{skipped} of the first {done + skipped} batches ran out of memory "
+            f"and were skipped. Training survives this by design, but that rate "
+            f"means the largest objects are being dropped from training -- lower "
+            f"--batch-size and raise --accumulate to keep the effective batch."
+        )
     per_step = (time.time() - began) / max(done, 1)
     world = max(requested, 1)
-    steps = math.ceil(len(train_set) / (config.batch_size * world))
+    steps = math.ceil(len(train_set) / (timing_batch * world))
     epoch_seconds = per_step * steps
     total_seconds = epoch_seconds * config.epochs
     sessions = math.ceil(total_seconds / (config.max_hours * 3600))
     print(f"  {per_step:.2f} s/step (includes warm-up, so pessimistic)")
-    print(f"  {steps} steps/epoch on {world} device(s) -> ~{_hms(epoch_seconds)}/epoch")
+    print(f"  {steps} steps/epoch at batch_size={timing_batch} on {world} "
+          f"device(s) -> ~{_hms(epoch_seconds)}/epoch")
+    if timing_batch != config.batch_size:
+        print(f"  (--accumulate does not change this: it changes how often the "
+              f"optimizer steps, not how many forward/backward passes run)")
     print(f"  {config.epochs} epochs -> ~{_hms(total_seconds)} "
           f"= {sessions} session(s) at {config.max_hours:g}h")
     if epoch_seconds > config.max_hours * 3600:

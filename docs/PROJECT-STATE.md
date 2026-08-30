@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 290 tests, clean under `-W error` |
+| Pipeline | **built** — 292 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -19,6 +19,7 @@ implementing anything from it.
 | Trained result | **none yet** — nothing has been run on the real dataset |
 | First preflight | found a train/val split overlap and an OOM; both fixed |
 | Second preflight | found the memory ceiling: cross-attention was 7.2 GB of 15.6 GB, now 0.6 GB |
+| Third preflight | `batch_size=2` fits at 76%; preflight itself is now tested end to end |
 
 ---
 
@@ -306,7 +307,7 @@ normal ordering · fracture patches / sampling / budgeting · cross-fragment
 correspondence · SE(3) perturbation · visualiser · exhaustive extraction pass ·
 three analysis scripts · **Vector Neuron primitives · segment reductions ·
 intra-fragment VN-GAT · cross-fragment attention · the composite loss · feature
-construction and batch collate · the backbone and rotation head**. 290 tests,
+construction and batch collate · the backbone and rotation head**. 292 tests,
 no skips.
 
 **Not built** — the translation solver (stage two).
@@ -381,6 +382,23 @@ pair counts against GARF's stack — a FLOPs argument, on 4×H100. It was never
 checked against T4 *memory*, which is the binding constraint and is quadratic in
 that exact number. The value survives, but it survived by luck rather than by
 the check having been done.
+
+**What the third preflight found.** `batch_size=2` fits, at 11.96 GB of 15.6 GB
+— so the defaults are now `batch_size=2, accumulate=2`, measured rather than
+assumed, with the same effective batch as before. But the run still died, in a
+*third* instance of one bug: a preflight step allocating memory as though an
+earlier step had not run. Once because step 5's graph was never freed, once
+because step 7 timed at the configured batch size that step 5 had just
+disproved, and once — my own fix for the first — because step 6 sized from
+`fitted` and then doubled it.
+
+That it took three sessions to find is the real lesson: `preflight` was the only
+function the suite could not reach, since it needs a dataset on disk in the
+Breaking Bad layout. The suite now builds a synthetic one and runs preflight
+end to end against it with out-of-memory simulated, which fails on all three.
+`fitted` is now a hard ceiling for every later step, and each allocating step
+degrades rather than raising — a preflight that dies of its own memory use
+throws away every check that had already passed.
 
 ---
 

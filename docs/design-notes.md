@@ -610,7 +610,7 @@ filter in the loader.
 
 `reassembly.nn`, with `tests/test_nn_equivariance.py`, `tests/test_losses.py`
 and `tests/test_model.py`, plus `tests/test_training.py` for the engine.
-304 tests total, clean under `-W error`.
+311 tests total, clean under `-W error`.
 
 `torch` installs from the **default** PyPI index. The earlier failure was
 `download.pytorch.org` being blocked, not torch being unavailable — so
@@ -1417,3 +1417,43 @@ DDP-adjusted one.
 
 The corrected budget for 40 epochs is about **39 hours, four sessions**, not the
 23 hours and three sessions that were on the screen.
+
+
+### Gradient accumulation was not doing what its name promised
+
+Preflight recommends `--batch-size 1 --accumulate 2` whenever memory forces the
+batch down, on the stated grounds that it "keeps the effective batch". It did
+not. The old form divided each micro-batch's loss by `accumulate`, which weights
+each **scene** equally — while a real batch weights each **fragment** equally,
+since every loss term is a mean over fragments. A Breaking Bad scene holds
+anywhere from 2 to 35 of them.
+
+Measured on a 2-fragment scene and an 8-fragment scene:
+
+| | cosine similarity to a real batch | norm |
+|---|---|---|
+| `loss / accumulate` | **0.80** | 45% out |
+| weighted by fragment count | **1.0000000** | exact |
+
+A silent re-weighting of the objective, introduced by a flag chosen for memory
+reasons — the small scene was getting four times its share of the gradient. Each
+micro-batch is now multiplied by its fragment count and the accumulated sum is
+divided by the group's total just before the step, after `unscale_` and before
+the clip so `grad_clip` means the same thing at every accumulation setting.
+
+Two things follow that the old form got wrong for free:
+
+- **A skipped micro-batch no longer shrinks the step.** A group that loses one
+  to an out-of-memory skip divides by what actually contributed; `/ accumulate`
+  would have made that step too small.
+- **`grad_clip` is now comparable across settings**, because the gradient being
+  clipped is a mean over the same population either way.
+
+**One term does not decompose, and should not.** `correspondence_loss` is
+InfoNCE, and its negatives come from whatever is in the batch — two scenes
+batched together see each other's vertices as negatives, the same two forwarded
+separately do not. No accumulation scheme can reproduce that (cosine 0.55, and
+it stays there). It is also the better behaviour: matching only ever happens
+*within* a scene, so a scene's own fracture vertices are the real confusion set
+and another object's are free negatives that teach nothing. Accumulation
+sharpens this term rather than weakening it.

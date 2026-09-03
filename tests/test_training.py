@@ -1140,3 +1140,171 @@ def test_token_reach_survives_a_scene_with_no_tokens():
     from reassembly.training import _token_reach
 
     assert _token_reach([], 3) == [0.0, 0.0, 0.0]
+
+
+def test_accumulation_skips_the_gradient_sync_it_cannot_use():
+    """
+    Under DDP every `backward` all-reduces the full gradient. During
+    accumulation all but the last of those is overwritten by the next
+    micro-batch, so paying for it is pure waste — and preflight *recommends*
+    `--accumulate 2` whenever the batch has to be halved, which is exactly the
+    configuration this run uses.
+
+    Checked by counting `no_sync` entries rather than by timing: a wrapper that
+    records them stands in for DDP, so the test says which micro-batches skipped
+    the sync, not merely that the run got faster.
+    """
+    import contextlib
+
+    torch.manual_seed(0)
+    config = Config(channels=16, heads=4, workers=0, batch_size=1, accumulate=2)
+    model = build_model(config)
+    entered = []
+
+    class _CountsSync(torch.nn.Module):
+        """Stands in for DistributedDataParallel: forwards, and counts."""
+
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+        def forward(self, *a, **k):
+            return self.inner(*a, **k)
+
+        @contextlib.contextmanager
+        def no_sync(self):
+            entered.append(len(entered))
+            yield
+
+    wrapped = _CountsSync(model)
+    loader = torch.utils.data.DataLoader(_Fixed(4), batch_size=1,
+                                         collate_fn=_collate_samples)
+    run_epoch(wrapped, loader, build_criterion(config), config,
+              optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
+              step=0, total_steps=10, label="train", show_progress=False)
+
+    # Four batches at accumulate=2: micro-batches 0 and 2 skip the sync, 1 and 3
+    # perform it because they close an accumulation group.
+    assert len(entered) == 2, (
+        f"expected 2 skipped syncs over 4 batches at accumulate=2, got {len(entered)}"
+    )
+
+
+def test_without_accumulation_every_step_syncs():
+    """`accumulate=1` closes a group every batch, so nothing may be skipped."""
+    import contextlib
+
+    torch.manual_seed(0)
+    config = Config(channels=16, heads=4, workers=0, batch_size=1, accumulate=1)
+    model = build_model(config)
+    entered = []
+
+    class _CountsSync(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+        def forward(self, *a, **k):
+            return self.inner(*a, **k)
+
+        @contextlib.contextmanager
+        def no_sync(self):
+            entered.append(1)
+            yield
+
+    run_epoch(_CountsSync(model),
+              torch.utils.data.DataLoader(_Fixed(4), batch_size=1,
+                                          collate_fn=_collate_samples),
+              build_criterion(config), config,
+              optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
+              step=0, total_steps=10, label="train", show_progress=False)
+    assert entered == []
+
+
+def _grad_vector(model):
+    return torch.cat([p.grad.flatten() for _, p in sorted(model.named_parameters())
+                      if p.grad is not None])
+
+
+def _accumulated_gradient(scenes, **overrides):
+    """Run the real loop one scene at a time and capture the gradient it steps."""
+    torch.manual_seed(0)
+    config = Config(channels=16, heads=4, workers=0, accumulate=len(scenes),
+                    grad_clip=1e9, **overrides)
+    model = build_model(config)
+
+    class _Each(torch.utils.data.Dataset):
+        def __len__(self):
+            return len(scenes)
+
+        def __getitem__(self, i):
+            return scenes[i]
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)   # lr 0: grads survive
+    captured, real = {}, optimizer.step
+    optimizer.step = lambda: (captured.setdefault("g", _grad_vector(model)), real())
+    run_epoch(model, torch.utils.data.DataLoader(_Each(), batch_size=1,
+              collate_fn=_collate_samples), build_criterion(config), config,
+              optimizer=optimizer, step=0, total_steps=10, label="train",
+              show_progress=False)
+    return captured["g"]
+
+
+def _batched_gradient(scenes, **overrides):
+    torch.manual_seed(0)
+    config = Config(channels=16, heads=4, workers=0, accumulate=1, **overrides)
+    model = build_model(config)
+    batch, _ = _collate_samples(scenes)
+    _forward(model, batch, build_criterion(config), config)[0].backward()
+    return _grad_vector(model)
+
+
+@pytest.mark.parametrize("term", ["rotation", "position", "normal", "face"])
+def test_accumulation_matches_a_real_batch_on_the_geometric_terms(term):
+    """
+    `--batch-size 1 --accumulate 2` must give the same gradient as
+    `--batch-size 2`, because preflight recommends the first as a substitute for
+    the second whenever memory forces the batch down.
+
+    It did not. `loss / accumulate` weights each *scene* equally, while a real
+    batch weights each *fragment* equally — and a Breaking Bad scene holds
+    anywhere from 2 to 35 fragments. Measured on a 2-fragment and an 8-fragment
+    scene, the two gradients had cosine similarity **0.80** and norms 45% apart:
+    a silent re-weighting of the objective, applied by a flag chosen for memory
+    reasons. Weighting each micro-batch by its fragment count and normalising by
+    the group total makes them identical.
+    """
+    scenes = [_scene(1, fragments=2), _scene(2, fragments=8)]
+    off = {f"w_{k}": 0.0 for k in ("rotation", "position", "normal", "face", "embedding")}
+    off[f"w_{term}"] = 1.0
+
+    batched = _batched_gradient(scenes, **off)
+    accumulated = _accumulated_gradient(scenes, **off)
+    cosine = torch.nn.functional.cosine_similarity(batched, accumulated, dim=0)
+    assert cosine > 0.99999, f"{term}: accumulation diverged from a real batch, {cosine}"
+
+
+def test_the_contrastive_term_cannot_match_a_real_batch_and_that_is_correct():
+    """
+    The one term that does *not* decompose, stated so nobody tries to fix it.
+
+    InfoNCE draws its negatives from whatever is in the batch. Two scenes in one
+    batch see each other's vertices as negatives; the same two scenes forwarded
+    separately do not. No accumulation scheme can reproduce that — it is a
+    property of contrastive objectives, not a defect.
+
+    It is also the better behaviour here. Matching only ever happens *within* a
+    scene, so a scene's own fracture vertices are the real confusion set and
+    another object's are free negatives that teach nothing. Accumulation
+    tightens this term rather than weakening it.
+    """
+    scenes = [_scene(1, fragments=2), _scene(2, fragments=8)]
+    off = {f"w_{k}": 0.0 for k in ("rotation", "position", "normal", "face")}
+    off["w_embedding"] = 1.0
+
+    cosine = torch.nn.functional.cosine_similarity(
+        _batched_gradient(scenes, **off), _accumulated_gradient(scenes, **off), dim=0)
+    assert cosine < 0.99, (
+        "the contrastive term matched a real batch exactly, which would mean the "
+        "negatives are no longer drawn from the batch — check correspondence_loss"
+    )

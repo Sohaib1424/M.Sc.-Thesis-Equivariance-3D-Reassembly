@@ -658,6 +658,10 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
     fragments = 0
     skipped = 0
     oom = 0
+    # Fragments accumulated since the last optimizer step. Resets on every step,
+    # so a group cut short by the end of an epoch cannot normalise the next
+    # epoch's first step by the wrong total.
+    group_weight = 0.0
     dropped: Dict[str, str] = {}
     predictions, targets = [], []
     bar = Progress(len(loader), prefix=f"  {label:5s}", enabled=show_progress)
@@ -705,11 +709,39 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
                                     enabled=bool(scaler)):
                     loss, report, R = _forward(model, batch, criterion, config)
                 if training:
-                    scaled = loss / config.accumulate
-                    if scaler:
-                        scaler.scale(scaled).backward()
+                    # Weighted by the micro-batch's fragment count, not divided
+                    # by `accumulate`. Every loss term is a *mean over
+                    # fragments*, so multiplying by the count turns it back into
+                    # a sum; the sum is divided by the group's total fragments
+                    # just before the optimizer steps. That makes
+                    # `--batch-size 1 --accumulate 2` produce the same gradient
+                    # as `--batch-size 2`, which `loss / accumulate` does not:
+                    # it weights each *scene* equally, and a scene holds 2 to 35
+                    # fragments. Measured on a 2-fragment and an 8-fragment
+                    # scene, the two gradients had cosine similarity 0.80 and
+                    # norms 45% apart -- a silent re-weighting of the objective,
+                    # applied by a flag preflight recommends for memory reasons.
+                    #
+                    # It also fixes the skipped-batch case for free: a group
+                    # that loses a micro-batch to an OOM divides by what
+                    # actually contributed, where `/ accumulate` would have made
+                    # the step too small.
+                    micro_weight = float(batch.num_fragments)
+                    group_weight += micro_weight
+                    scaled = loss * micro_weight
+                    # Under DDP, every `backward` all-reduces the whole gradient
+                    # -- 928k parameters -- and during accumulation all but the
+                    # last of those is thrown away by the very next micro-batch.
+                    # `no_sync` skips the ones that cannot matter. It is not an
+                    # optimisation to reach for later: preflight *recommends*
+                    # `--accumulate 2` whenever the batch has to be halved, so
+                    # without this the recommended configuration pays double.
+                    syncing = (index + 1) % config.accumulate == 0
+                    if not syncing and hasattr(model, "no_sync"):
+                        with model.no_sync():
+                            (scaler.scale(scaled) if scaler else scaled).backward()
                     else:
-                        scaled.backward()
+                        (scaler.scale(scaled) if scaler else scaled).backward()
             except torch.cuda.OutOfMemoryError:
                 # The backward is inside this block, not outside it. It was
                 # outside, which meant the guard covered the *cheaper* half:
@@ -759,6 +791,16 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
                 if (index + 1) % config.accumulate == 0:
                     if scaler:
                         scaler.unscale_(optimizer)
+                    # Sum of fragment-weighted gradients -> mean over the
+                    # group's fragments. After `unscale_`, so the AMP scale is
+                    # already off, and before the clip, so `grad_clip` means the
+                    # same thing at every accumulation setting.
+                    if group_weight > 0:
+                        inverse = 1.0 / group_weight
+                        for parameter in model.parameters():
+                            if parameter.grad is not None:
+                                parameter.grad.mul_(inverse)
+                    group_weight = 0.0
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
                     if scaler:
                         scaler.step(optimizer)
@@ -1853,9 +1895,13 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
         effective = max(config.batch_size // fitted, 1)
         problems.append(
             f"batch_size={config.batch_size} does not fit; {fitted} does. Use "
-            f"--batch-size {fitted} --accumulate {effective}, which keeps the "
-            f"effective batch at {fitted * effective} and costs only a little "
-            f"speed."
+            f"--batch-size {fitted} --accumulate {effective}. The gradient is "
+            f"identical to a real batch of {fitted * effective} on all four "
+            f"geometric terms -- micro-batches are weighted by fragment count, "
+            f"not by 1/accumulate -- and costs a little speed. The contrastive "
+            f"term differs by construction: its negatives come from the batch, "
+            f"so accumulation gives it within-scene negatives only, which is "
+            f"the confusion set matching actually faces."
         )
     if peak and peak > 0.65 * total_memory:
         # Keep the effective batch identical when suggesting a smaller one.

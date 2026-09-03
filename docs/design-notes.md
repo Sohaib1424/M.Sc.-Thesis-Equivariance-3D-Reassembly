@@ -720,12 +720,62 @@ Getting this backwards is invisible at initialisation, since chance is chance in
 either direction, so it would surface only as a model that never converges.
 `test_model.py` asserts the round trip against a known perturbation.
 
-### The layer schedule is interleaved, not stacked
+### The layer schedule: encoder, fusion, then one hop back
 
-`intra, intra, cross, intra, cross, intra`. A cross layer updates only the
-*token* vertices, so without intra layers after it the rest of the fragment
-never hears about its neighbours and the pooled rotation is decided by vertices
-that learned nothing from the cross-attention.
+`intra x5, cross x3, intra` — 928,640 parameters against 635,200 for the earlier
+six-layer form, and 0.84 GB of retained cross-attention memory against 0.56 GB
+(measured, 86 bytes per pair at 3.5M pairs). It needs a fresh preflight before a
+session.
+
+Describe each fragment, let the fragments talk, then spread what they heard.
+That last clause is not decoration. **A cross layer writes only to token
+vertices, and the rotation head pools a mean over every vertex** — so a vertex
+the tokens never reach contributes to the prediction without having heard from
+another fragment. Without the trailing layer the tokens are the only informed
+vertices: 2,048 against a median 9,149 per scene, about a fifth.
+
+Each intra layer after the last cross layer buys exactly one hop along mesh
+edges, and preflight now measures the reach on the real meshes rather than
+assuming it. On the synthetic scenes, with 9% of vertices as tokens:
+
+| after the last cross layer | vertices that have heard from another fragment |
+|---|---|
+| nothing | 9% |
+| **1 intra layer** | **51%** |
+| 2 intra layers | 81% |
+| 3 intra layers | 93% |
+
+One layer is the difference between a fifth of the pooled signal being informed
+and half of it. Whether half is enough is an open question, and the real number
+depends on how the fracture surface is shaped — which is why preflight prints
+it for the dataset actually being trained on, and warns when the reach after the
+trailing layers falls below 50%.
+
+If the run still parks near the 89.9° axis-only floor, the next moves are a
+second trailing intra layer, then `intra x2, (cross, intra) x3` fully
+interleaved, then pooling the head over tokens instead of all vertices — the
+last removes the dilution at its source but changes what the frame is computed
+from.
+
+### What an untrained equivariant model reads at initialisation
+
+Not chance, and the check had to be widened to admit it. Because the
+perturbation cancels, the rotation error at initialisation *is* the angle of the
+untrained frame on assembled fragments, so it depends on the architecture.
+Measured over 12 seeds on a 24-fragment batch:
+
+| schedule | initial rotation error |
+|---|---|
+| `intra x2, cross, intra, cross, intra` | 132.3° ± 11.8 |
+| `intra x5, cross x3` | 121.9° ± 15.0 |
+| `intra x5, cross x3, intra` | 133.9° ± 13.5 |
+
+Spanning 92–154° overall. The old band of 100–155° would have flagged the second
+of those as a defect, and it flagged the third on a 12-fragment batch where the
+standard error is 10.7°. It is now 85–170°, which still catches a model starting
+near 0° or 180° — the only thing it was ever able to catch. It never caught a
+transposed label, because chance is chance in either direction; `test_model.py`
+asserts the round trip directly for that.
 
 ### No `torch_scatter`
 

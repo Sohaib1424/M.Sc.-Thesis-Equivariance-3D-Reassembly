@@ -143,7 +143,11 @@ def test_losses_start_at_their_reference_values():
     """
     torch.manual_seed(0)
     config = Config(channels=32, heads=4)
-    batch, _ = _collate_samples([_scene(1), _scene(2), _scene(3), _scene(4)])
+    # Eight scenes, not four. The rotation angle of a random rotation has a
+    # standard deviation of 37 deg, so twelve fragments carry a standard error
+    # of 10.7 deg -- enough for a single seed to land outside any honest band by
+    # luck alone, which is exactly what it did. Twenty-four fragments halve it.
+    batch, _ = _collate_samples([_scene(s) for s in range(1, 9)])
     model = build_model(config)
     loss, report, R = _forward(model, batch, build_criterion(config), config)
 
@@ -1103,3 +1107,36 @@ def test_an_oversized_batch_is_skipped_before_it_is_attempted():
                               step=0, total_steps=10, label="train",
                               show_progress=False)
     assert summary["oom"] == 0
+
+
+def test_token_reach_measures_how_far_cross_information_travels():
+    """
+    The number that decides whether a schedule's trailing intra layers are
+    enough. A cross layer writes only to tokens, and the rotation head pools a
+    mean over *every* vertex — so vertices the tokens never reach dilute the
+    prediction with features that know nothing about the other fragments.
+
+    Each trailing intra layer buys exactly one hop along mesh edges, so the
+    sequence must be strictly increasing and bounded by 1, and its first entry
+    must exceed the token share (one hop reaches strictly more than the tokens
+    themselves on any mesh with edges).
+    """
+    from reassembly.training import _token_reach
+
+    samples = [_scene(s) for s in range(3)]
+    reach = _token_reach(samples, 4)
+
+    assert len(reach) == 4
+    assert all(0.0 < r <= 1.0 for r in reach)
+    assert reach == sorted(reach), f"reach must grow with hops: {reach}"
+
+    tokens = sum(len(f.token_vertices) for s in samples for f in s.fragments)
+    total = sum(len(f.vertices) for s in samples for f in s.fragments)
+    assert reach[0] > tokens / total, "one hop must reach more than the tokens"
+
+
+def test_token_reach_survives_a_scene_with_no_tokens():
+    """Coincidence labelling reports fragments with no fracture surface."""
+    from reassembly.training import _token_reach
+
+    assert _token_reach([], 3) == [0.0, 0.0, 0.0]

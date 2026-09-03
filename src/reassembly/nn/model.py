@@ -12,9 +12,24 @@ layers after it, the rest of the fragment never learns anything about its
 neighbours, and the pooled rotation prediction is dominated by vertices that
 never heard from anyone.
 
-The default schedule is ``intra, intra, cross, intra, cross, intra`` -- four
-intra-fragment layers, matching the layer count carried over from the previous
-design, with two cross layers interleaved so each is followed by propagation.
+The default schedule is ``intra x5, cross x3`` -- an encoder-then-fusion shape:
+build the per-vertex description of each fragment first, then let the fragments
+talk. It is the arrangement the thesis is testing.
+
+**It accepts the cost named above, and the cost is measurable.** With no intra
+layer after the last cross layer, only *token* vertices carry any cross-fragment
+information into the pool, and the pool is a mean over every vertex. At the
+defaults that is 2,048 tokens against a median 9,149 vertices per scene, so
+roughly **78% of the pooled rotation signal comes from vertices that never heard
+from another fragment**.
+
+That is a dilution, not a wall: the network can learn to give token vertices a
+larger magnitude and dominate the mean, since VN layers scale features freely.
+But it starts at a disadvantage the interleaved form does not have, and the
+cross layers are the whole mechanism for beating the 89.9 deg axis-only floor.
+If the floor turns out to be where this parks, ``intra x5, cross x3, intra`` --
+one extra layer -- is the first thing to try, and
+``("intra",) * 2 + ("cross", "intra") * 3`` the second.
 
 The rotation convention, derived rather than guessed
 ----------------------------------------------------
@@ -47,7 +62,7 @@ from .gat import VNGraphAttentionBlock
 from .segment import segment_mean
 from .vn import VNInvariant, VNLinear, VNScaleGate, gram_schmidt
 
-DEFAULT_SCHEDULE = ("intra", "intra", "cross", "intra", "cross", "intra")
+DEFAULT_SCHEDULE = ("intra",) * 5 + ("cross",) * 3 + ("intra",)
 
 
 class Prediction(NamedTuple):

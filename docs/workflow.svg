@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 1010" role="img" aria-label="Workflow. A single shared path builds every batch: a scene directory is read into fragments in their assembled frame; a fracture mask is computed from geometry alone (available at inference) while coincidence clusters and the ground-truth copy are taken in the assembled frame (training signal only); build_scene then draws a random rotation per fragment, standardises, and samples tokens; collate concatenates fragments into one ragged batch; the network runs identically in both modes. The path splits only at the end: training computes five losses and steps the optimizer, while validation and test run the same forward under no_grad and score the prediction against the label. A final band lists what is missing on a genuinely broken object.">
+<defs>
+<marker id="wa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#24292f"/></marker>
+<marker id="wb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#0969da"/></marker>
+<marker id="wc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#cf222e"/></marker>
+</defs>
+<g font-family="IBM Plex Sans, sans-serif" font-size="12.5" fill="#24292f">
+<text x="440" y="26" text-anchor="middle" font-size="15" fill="#24292f" font-weight="600">One shared path. It splits only at the very end.</text>
+<rect x="250" y="48" width="380" height="44" rx="3" fill="none" stroke="#24292f" stroke-width="1.3"/>
+<text x="440" y="68" text-anchor="middle" font-size="12.5" fill="#24292f">scene directory</text>
+<text x="440" y="84" text-anchor="middle" font-size="10.5" fill="#6e7781">one object, one fracture mode k</text>
+<line x1="440" y1="92" x2="440" y2="110" stroke="#24292f" stroke-width="1.3" marker-end="url(#wa)"/>
+<rect x="250" y="112" width="380" height="46" rx="3" fill="none" stroke="#24292f" stroke-width="1.3"/>
+<text x="440" y="132" text-anchor="middle" font-size="12.5" fill="#24292f">SceneReader.load_mode(k)</text>
+<text x="440" y="148" text-anchor="middle" font-size="10.5" fill="#6e7781">fragments, in the ASSEMBLED frame</text>
+<line x1="440" y1="158" x2="440" y2="170" stroke="#24292f" stroke-width="1.3"/>
+<line x1="220" y1="170" x2="660" y2="170" stroke="#24292f" stroke-width="1.3"/>
+<line x1="220" y1="170" x2="220" y2="180" stroke="#24292f" stroke-width="1.3" marker-end="url(#wa)"/>
+<line x1="440" y1="170" x2="440" y2="180" stroke="#24292f" stroke-width="1.3" marker-end="url(#wa)"/>
+<line x1="660" y1="170" x2="660" y2="180" stroke="#24292f" stroke-width="1.3" marker-end="url(#wa)"/>
+<rect x="120" y="182" width="200" height="76" rx="3" fill="none" stroke="#24292f" stroke-width="1.3"/>
+<text x="220" y="202" text-anchor="middle" font-size="12" fill="#24292f" font-weight="600">fracture mask</text>
+<text x="220" y="218" text-anchor="middle" font-size="10.5" fill="#6e7781">dihedral @ 0.9 — from</text>
+<text x="220" y="231" text-anchor="middle" font-size="10.5" fill="#6e7781">one fragment's geometry</text>
+<text x="220" y="249" text-anchor="middle" font-size="10.5" fill="#24292f">available at inference</text>
+<rect x="340" y="182" width="200" height="76" rx="3" fill="none" stroke="#0969da" stroke-width="1.3"/>
+<text x="440" y="202" text-anchor="middle" font-size="12" fill="#0969da" font-weight="600">coincidence clusters</text>
+<text x="440" y="218" text-anchor="middle" font-size="10.5" fill="#6e7781">which vertices touch —</text>
+<text x="440" y="231" text-anchor="middle" font-size="10.5" fill="#6e7781">needs the assembled scene</text>
+<text x="440" y="249" text-anchor="middle" font-size="10.5" fill="#0969da" font-weight="600">training signal ONLY</text>
+<rect x="560" y="182" width="200" height="76" rx="3" fill="none" stroke="#0969da" stroke-width="1.3"/>
+<text x="660" y="202" text-anchor="middle" font-size="12" fill="#0969da" font-weight="600">ground-truth copy</text>
+<text x="660" y="218" text-anchor="middle" font-size="10.5" fill="#6e7781">the assembled fragments,</text>
+<text x="660" y="231" text-anchor="middle" font-size="10.5" fill="#6e7781">sharing one topology</text>
+<text x="660" y="249" text-anchor="middle" font-size="10.5" fill="#0969da" font-weight="600">training signal ONLY</text>
+<line x1="220" y1="258" x2="220" y2="270" stroke="#24292f" stroke-width="1.3"/>
+<line x1="440" y1="258" x2="440" y2="270" stroke="#24292f" stroke-width="1.3"/>
+<line x1="660" y1="258" x2="660" y2="270" stroke="#24292f" stroke-width="1.3"/>
+<line x1="220" y1="270" x2="660" y2="270" stroke="#24292f" stroke-width="1.3"/>
+<line x1="440" y1="270" x2="440" y2="282" stroke="#24292f" stroke-width="1.3" marker-end="url(#wa)"/>
+<rect x="160" y="284" width="560" height="122" rx="3" fill="none" stroke="#24292f" stroke-width="1.3"/>
+<text x="440" y="304" text-anchor="middle" font-size="12.5" fill="#24292f" font-weight="600">build_scene</text>
+<text x="440" y="324" text-anchor="middle" font-size="11" fill="#6e7781">draw a random rotation Q per fragment  —  this is the perturbation</text>
+<text x="440" y="340" text-anchor="middle" font-size="11" fill="#6e7781">centre each fragment, divide the scene by its radius</text>
+<text x="440" y="356" text-anchor="middle" font-size="11" fill="#6e7781">nodes (2,3): centred position, vertex normal</text>
+<text x="440" y="372" text-anchor="middle" font-size="11" fill="#6e7781">edges (3,3): the two adjacent face normals, relative position</text>
+<text x="440" y="388" text-anchor="middle" font-size="11" fill="#6e7781">tokens: geodesic-disk sample inside the mask, 2048 per scene</text>
+<line x1="440" y1="406" x2="440" y2="414" stroke="#24292f" stroke-width="1.3"/>
+<line x1="440" y1="414" x2="440" y2="424" stroke="#24292f" stroke-width="1.3" marker-end="url(#wa)"/>
+<rect x="210" y="426" width="460" height="44" rx="3" fill="none" stroke="#24292f" stroke-width="1.3"/>
+<text x="440" y="446" text-anchor="middle" font-size="12.5" fill="#24292f">collate  →  one ragged batch</text>
+<text x="440" y="461" text-anchor="middle" font-size="10.5" fill="#6e7781">2 scenes of 6 and 35 fragments → 41 rows. No padding.</text>
+<line x1="440" y1="470" x2="440" y2="484" stroke="#24292f" stroke-width="1.3" marker-end="url(#wa)"/>
+<rect x="160" y="486" width="560" height="128" rx="3" fill="none" stroke="#24292f" stroke-width="1.3"/>
+<text x="440" y="506" text-anchor="middle" font-size="12.5" fill="#24292f" font-weight="600">ReassemblyNet — bit-for-bit identical in both modes</text>
+<text x="440" y="526" text-anchor="middle" font-size="11" fill="#6e7781">embed  →  scale gate (log fragment size, invariant)</text>
+<text x="440" y="543" text-anchor="middle" font-size="11" fill="#6e7781">intra ×5  ·  CROSS · CROSS · CROSS  ·  intra</text>
+<text x="440" y="560" text-anchor="middle" font-size="11" fill="#6e7781">pool over vertices  →  VNLinear(2)  →  Gram-Schmidt  →  R  (F, 3, 3)</text>
+<text x="440" y="577" text-anchor="middle" font-size="11" fill="#6e7781">VNInvariant  →  MLP  →  per-vertex embedding  (N, D)</text>
+<text x="440" y="604" text-anchor="middle" font-size="10.5" fill="#0969da">equivariant by construction — nothing here is learned about rotation</text>
+<line x1="440" y1="614" x2="440" y2="628" stroke="#24292f" stroke-width="1.3"/>
+<line x1="235" y1="628" x2="645" y2="628" stroke="#24292f" stroke-width="1.3"/>
+<line x1="235" y1="628" x2="235" y2="642" stroke="#24292f" stroke-width="1.3" marker-end="url(#wa)"/>
+<line x1="645" y1="628" x2="645" y2="642" stroke="#24292f" stroke-width="1.3" marker-end="url(#wa)"/>
+<rect x="40" y="644" width="390" height="186" rx="3" fill="none" stroke="#24292f" stroke-width="1.3"/>
+<text x="235" y="666" text-anchor="middle" font-size="13" fill="#24292f" font-weight="600">TRAINING</text>
+<text x="235" y="690" text-anchor="middle" font-size="11" fill="#24292f">loss = rotation + position + normal + face</text>
+<text x="235" y="709" text-anchor="middle" font-size="11" fill="#24292f">            + embedding (InfoNCE)</text>
+<text x="235" y="728" text-anchor="middle" font-size="11" fill="#6e7781">first four need the ground-truth copy;</text>
+<text x="235" y="747" text-anchor="middle" font-size="11" fill="#6e7781">embedding needs the coincidence clusters</text>
+<text x="235" y="766" text-anchor="middle" font-size="11" fill="#24292f">backward  →  clip 1.0  →  AdamW</text>
+<text x="235" y="785" text-anchor="middle" font-size="11" fill="#6e7781">lr: 3% warmup, then cosine to 2e-5</text>
+<text x="235" y="804" text-anchor="middle" font-size="11" fill="#6e7781">checkpoint every 30 min, stop at 11 h</text>
+<rect x="450" y="644" width="390" height="186" rx="3" fill="none" stroke="#24292f" stroke-width="1.3"/>
+<text x="645" y="666" text-anchor="middle" font-size="13" fill="#24292f" font-weight="600">VALIDATION  /  TEST</text>
+<text x="645" y="690" text-anchor="middle" font-size="11" fill="#24292f">model.eval(),  torch.no_grad()</text>
+<text x="645" y="709" text-anchor="middle" font-size="11" fill="#6e7781">the same five losses — reported, not stepped</text>
+<text x="645" y="728" text-anchor="middle" font-size="11" fill="#24292f">collect R against the label, then score:</text>
+<text x="645" y="747" text-anchor="middle" font-size="11" fill="#6e7781">geodesic mean + median   ·   Euler RMSE</text>
+<text x="645" y="766" text-anchor="middle" font-size="11" fill="#6e7781">acc@5/10/30°   ·   match@1</text>
+<text x="645" y="785" text-anchor="middle" font-size="11" fill="#6e7781">best geodesic gates best.pt</text>
+<text x="440" y="851" text-anchor="middle" font-size="11" fill="#0969da">The label IS available here. The pipeline generated Q itself, so Qᵀ is known —</text>
+<text x="440" y="866" text-anchor="middle" font-size="11" fill="#0969da">which is the only reason any of these numbers can be computed.</text>
+<rect x="40" y="882" width="800" height="112" rx="3" fill="none" stroke="#cf222e" stroke-width="1.3" stroke-dasharray="4 3"/>
+<text x="440" y="904" text-anchor="middle" font-size="13" fill="#cf222e" font-weight="600">A REAL broken object — what is gone</text>
+<text x="440" y="928" text-anchor="middle" font-size="11" fill="#6e7781">no Q, so no label — there is a prediction and nothing to check it against</text>
+<text x="440" y="945" text-anchor="middle" font-size="11" fill="#6e7781">no coincidence — the dihedral mask is all that is left (precision 0.24, over-labels 3.9×).</text>
+<text x="440" y="962" text-anchor="middle" font-size="11" fill="#6e7781">GARF's answer is a trained fracture segmenter, >99.5%. Not built here.</text>
+<text x="440" y="979" text-anchor="middle" font-size="11" fill="#6e7781">rotation alone does not place the pieces — stage two, the translation solver, is not built</text>
+</g></svg>

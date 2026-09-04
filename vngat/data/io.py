@@ -50,6 +50,51 @@ def random_rotation_matrices(num: int, rng: np.random.Generator | None = None) -
 # ---------------------------------------------------------------------------
 # Original decompression code -- logic untouched
 # ---------------------------------------------------------------------------
+def list_fracture_dirs(mesh_dir_full_path: str, prefix: str | None = None) -> list:
+    """Sorted names of a scene's fracture sub-directories."""
+    dirs = sorted(
+        d for d in os.listdir(mesh_dir_full_path)
+        if os.path.isdir(os.path.join(mesh_dir_full_path, d))
+    )
+    if prefix:
+        filtered = [d for d in dirs if d.startswith(prefix)]
+        if filtered:
+            return filtered
+    return dirs
+
+
+def load_scene(mesh_dir_full_path: str, fracture_dir: str) -> list:
+    """
+    Load ONE NAMED fracture pattern, deterministically.
+
+    `load_random_scene` samples a pattern, which is right for training and
+    useless for inspecting a specific breakage. The decompression below is the
+    same untouched igl code with the random choice replaced by the argument.
+    """
+    compressed_mesh_path = os.path.join(mesh_dir_full_path, "compressed_mesh.obj")
+    compressed_data_path = os.path.join(mesh_dir_full_path, "compressed_data.npz")
+    fine_vertices, fine_triangles = igl.read_triangle_mesh(compressed_mesh_path)
+    piece_to_fine_vertices_matrix = load_npz(compressed_data_path)
+
+    frac_data_path = os.path.join(mesh_dir_full_path, fracture_dir, "compressed_fracture.npy")
+    piece_labels_after_impact = np.load(frac_data_path)
+    fine_vertex_labels_after_impact = piece_to_fine_vertices_matrix @ piece_labels_after_impact
+    n_pieces_after_impact = int(np.max(piece_labels_after_impact) + 1)
+    tri_labels = fine_vertex_labels_after_impact[fine_triangles[:, 0]]
+
+    meshes = []
+    for i in range(n_pieces_after_impact):
+        if not np.any(tri_labels == i):
+            continue
+        vi, fi = igl.remove_unreferenced(fine_vertices, fine_triangles[tri_labels == i, :])[:2]
+        ui, _I, J, _ = igl.remove_duplicate_vertices(vi, fi, 1e-10)
+        gi = J[fi]
+        ffi, _ = resolve_duplicated_faces(gi)
+        nv, nf, _, _ = igl.remove_unreferenced(ui, ffi)
+        meshes.append(trimesh.Trimesh(nv, nf))
+    return meshes
+
+
 def load_random_scene(mesh_dir_full_path: str, fracture_pattern: str | None = None) -> list:
     """
     Reads one Breaking Bad scene directory and returns its fragment meshes.

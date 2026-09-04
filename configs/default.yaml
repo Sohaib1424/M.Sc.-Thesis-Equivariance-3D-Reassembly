@@ -34,6 +34,7 @@ w_mid: 1.0
 w_face: 1.0
 w_emb_v: 1.0
 w_emb_e: 1.0
+symmetry_axis: z
 emb_pull_margin: 0.1
 emb_push_margin: 0.5
 

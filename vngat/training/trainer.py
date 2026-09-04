@@ -50,7 +50,7 @@ from .drive import DriveSync
 from .history import History
 
 _LOSS_KEYS = ("total", "rot", "rot_deg", "pos", "node", "mid", "face", "emb_v", "emb_e",
-              "head_cos")
+              "head_cos", "tilt", "twist")
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +577,7 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
         w_rot=cfg.w_rot, w_pos=cfg.w_pos, w_node=cfg.w_node, w_mid=cfg.w_mid,
         w_face=cfg.w_face, w_emb_v=cfg.w_emb_v, w_emb_e=cfg.w_emb_e,
         emb_pull_margin=cfg.emb_pull_margin, emb_push_margin=cfg.emb_push_margin,
+        symmetry_axis=cfg.symmetry_axis,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler, scheduler_needs_metric = build_scheduler(cfg, optimizer)
@@ -672,6 +673,15 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
                             train_diag["data_seconds"], train_diag["compute_seconds"], current_lr))
             write(table_row(epoch, "val", val_metrics,
                             val_diag["data_seconds"], val_diag["compute_seconds"], current_lr))
+            tilt_v, twist_v = val_metrics.get("tilt"), val_metrics.get("twist")
+            if tilt_v is not None:
+                verdict = ""
+                if tilt_v < 25 and twist_v > 60:
+                    verdict = "  <- axis learned, azimuth NOT (structural floor)"
+                elif tilt_v > 60:
+                    verdict = "  <- axis not learned either (headroom remains)"
+                write(f"  [val ] tilt {tilt_v:6.2f}  twist {twist_v:6.2f}"
+                      f"  (chance 90/90){verdict}")
             if train_diag["fallback_steps"]:
                 write(f"  [amp] {int(train_diag['fallback_steps'])} step(s) recomputed in "
                       f"float32 after a half-precision overflow (data kept)")

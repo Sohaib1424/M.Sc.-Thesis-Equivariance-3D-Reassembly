@@ -71,6 +71,11 @@ class Config:
     w_face: float = 1.0
     w_emb_v: float = 1.0
     w_emb_e: float = 1.0
+    symmetry_axis: str = "z"
+    """Canonical up-axis of the dataset's meshes, used only for the reported
+    tilt/twist split. Verify it -- run evaluation with x, y and z and see which
+    shows the signature. Wrong choice makes the diagnostic meaningless, not the
+    training wrong."""
     emb_pull_margin: float = 0.1
     """Cluster members closer than this to their centroid are already good
     enough. Embeddings are L2-normalised, so distances lie in [0, 2]."""

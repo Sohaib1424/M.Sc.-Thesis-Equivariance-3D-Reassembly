@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..evaluation.metrics import swing_twist_error
 from ..models.vn_layers import geodesic_rotation_loss
 
 
@@ -190,6 +191,7 @@ class CompositeLoss(nn.Module):
         w_emb_e: float = 1.0,
         emb_pull_margin: float = 0.1,
         emb_push_margin: float = 0.5,
+        symmetry_axis: str = "z",
     ):
         super().__init__()
         self.weights = dict(
@@ -198,9 +200,13 @@ class CompositeLoss(nn.Module):
         )
         self.emb_pull_margin = emb_pull_margin
         self.emb_push_margin = emb_push_margin
+        self.symmetry_axis = symmetry_axis
 
     def forward(self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         rot_angles = geodesic_rotation_loss(outputs["R_pred"], targets["R_gt"])
+        with torch.no_grad():
+            tilt, twist = swing_twist_error(
+                outputs["R_pred"], targets["R_gt"], axis=self.symmetry_axis)
         l_rot = _mean(rot_angles)
         l_pos = node_position_loss(outputs["x_pred"], targets["x_gt"])
         l_node = node_normal_loss(outputs["n_pred"], targets["n_gt"])
@@ -229,6 +235,15 @@ class CompositeLoss(nn.Module):
             # different numbers and must not be compared directly; see
             # `vngat/evaluation/metrics.py`, which computes both.
             "rot_deg": _mean(rot_angles.detach()) * (180.0 / torch.pi),
+            # Reported, never optimised. Splits the residual into TILT off the
+            # object's symmetry axis and TWIST about it. On validation this is
+            # the measurement that separates "has not learned the axis either"
+            # (tilt ~ 90) from "learned the axis, cannot recover the azimuth"
+            # (tilt ~ 0, twist ~ 90) -- the latter being a structural limit of a
+            # one-shot per-fragment canonicaliser on surfaces of revolution,
+            # which no amount of tuning or compute would move.
+            "tilt": tilt.detach().mean(),
+            "twist": twist.detach().mean(),
             "pos": l_pos,
             "node": l_node,
             "mid": l_mid,

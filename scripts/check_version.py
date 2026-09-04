@@ -104,6 +104,8 @@ MARKERS = [
      "vngat/training/trainer.py", "def _first_non_finite_parameter"),
     ("official Breaking Bad splits",
      "vngat/data/splits.py", "def load_official_split"),
+    ("tilt/twist reported during training",
+     "vngat/losses/composite.py", '"tilt": tilt.detach().mean()'),
     ("deterministic single-fracture loader",
      "vngat/data/io.py", "def load_scene"),
     ("prediction dump script",

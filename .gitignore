@@ -6,3 +6,4 @@ data/
 *.png
 *.glb
 .ipynb_checkpoints/
+/.vscode

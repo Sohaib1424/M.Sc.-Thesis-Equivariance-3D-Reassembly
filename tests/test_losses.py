@@ -230,3 +230,66 @@ def test_model_forward_and_backward_under_autocast(scene):
     assert torch.isfinite(losses["total"]).all()
     missing = [n for n, p in model.named_parameters() if p.grad is None]
     assert not missing, f"parameters received no gradient (breaks DDP): {missing}"
+
+
+@pytest.mark.parametrize("axis", ["x", "y", "z"])
+def test_composite_reports_tilt_and_twist(axis):
+    """
+    tilt/twist are reported, never optimised. On validation they separate
+    "has not learned the axis either" from "learned the axis, cannot recover
+    the azimuth" -- the second being a structural limit rather than a tuning
+    failure, so the distinction decides whether to redesign or keep training.
+    """
+    from conftest import random_rotation
+
+    loss_fn = CompositeLoss(symmetry_axis=axis)
+    F_, V, E = 4, 40, 60
+    R_gt = random_rotation(F_)
+    outputs = {
+        "R_pred": R_gt.clone(),
+        "x_pred": torch.randn(V, 3), "n_pred": torch.randn(V, 3),
+        "mid_pred": torch.randn(E, 3), "n1_pred": torch.randn(E, 3),
+        "n2_pred": torch.randn(E, 3),
+        "vertex_embedding": torch.randn(V, 8), "edge_embedding": torch.randn(E, 8),
+    }
+    targets = {
+        "R_gt": R_gt,
+        "x_gt": torch.randn(V, 3), "n_gt": torch.randn(V, 3),
+        "mid_gt": torch.randn(E, 3), "n1_gt": torch.randn(E, 3),
+        "n2_gt": torch.randn(E, 3),
+        "vertex_cluster_id": torch.randint(-1, 3, (V,)),
+        "edge_cluster_id": torch.randint(-1, 3, (E,)),
+    }
+    out = loss_fn(outputs, targets)
+    assert "tilt" in out and "twist" in out
+    # a perfect prediction has no residual to decompose
+    assert float(out["tilt"]) < 0.1 and float(out["twist"]) < 0.1
+    # and they must not carry gradient into the objective
+    assert not out["tilt"].requires_grad
+
+
+def test_tilt_twist_do_not_change_the_total():
+    """The diagnostic must be inert: adding it cannot alter what is optimised."""
+    from conftest import random_rotation
+
+    torch.manual_seed(0)
+    F_, V, E = 3, 30, 45
+    R_gt = random_rotation(F_)
+    outputs = {
+        "R_pred": random_rotation(F_),
+        "x_pred": torch.randn(V, 3), "n_pred": torch.randn(V, 3),
+        "mid_pred": torch.randn(E, 3), "n1_pred": torch.randn(E, 3),
+        "n2_pred": torch.randn(E, 3),
+        "vertex_embedding": torch.randn(V, 8), "edge_embedding": torch.randn(E, 8),
+    }
+    targets = {
+        "R_gt": R_gt,
+        "x_gt": torch.randn(V, 3), "n_gt": torch.randn(V, 3),
+        "mid_gt": torch.randn(E, 3), "n1_gt": torch.randn(E, 3),
+        "n2_gt": torch.randn(E, 3),
+        "vertex_cluster_id": torch.randint(-1, 3, (V,)),
+        "edge_cluster_id": torch.randint(-1, 3, (E,)),
+    }
+    out = CompositeLoss()(outputs, targets)
+    parts = sum(out[k] * 1.0 for k in ("rot", "pos", "node", "mid", "face", "emb_v", "emb_e"))
+    assert abs(float(out["total"]) - float(parts)) < 1e-5

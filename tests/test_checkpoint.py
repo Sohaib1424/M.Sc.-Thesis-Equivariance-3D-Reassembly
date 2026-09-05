@@ -94,3 +94,39 @@ def test_history_survives_a_round_trip(tmp_path):
 def test_history_load_tolerates_a_truncated_file(tmp_path):
     (tmp_path / "history.json").write_text('{"train": {"tot')
     assert History.load(tmp_path / "history.json").num_epochs == 0
+
+
+def test_restart_schedule_spans_only_the_remaining_epochs():
+    """
+    A resumed cosine must anneal over the epochs that REMAIN, not the run total.
+
+    Without `span`, resuming at epoch 125 with --epochs 250 would spread the
+    anneal over 250 epochs while only 125 are left, so the rate would still be
+    at half its base when the session ended.
+    """
+    from vngat.config import Config
+    from vngat.training.trainer import build_scheduler
+
+    model = torch.nn.Linear(3, 3)
+    cfg = Config(lr=2e-4, lr_min=1e-5, epochs=250, lr_schedule="cosine")
+    opt = torch.optim.SGD(model.parameters(), lr=cfg.lr)
+    sched, _ = build_scheduler(cfg, opt, span=125)
+
+    assert abs(opt.param_groups[0]["lr"] - 2e-4) < 1e-9
+    for _ in range(125):
+        sched.step()
+    assert abs(opt.param_groups[0]["lr"] - cfg.lr_min) < 1e-7, "did not reach the floor"
+
+
+def test_cosine_does_not_rise_after_its_span():
+    """Guards the periodicity trap: past the horizon the rate must stay down."""
+    from vngat.config import Config
+    from vngat.training.trainer import build_scheduler
+
+    model = torch.nn.Linear(3, 3)
+    cfg = Config(lr=1e-3, lr_min=1e-5, epochs=40, lr_schedule="cosine")
+    opt = torch.optim.SGD(model.parameters(), lr=cfg.lr)
+    sched, _ = build_scheduler(cfg, opt, span=40)
+    for _ in range(120):                      # three times the horizon
+        sched.step()
+    assert opt.param_groups[0]["lr"] <= cfg.lr_min * 1.01

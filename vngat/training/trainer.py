@@ -118,7 +118,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader, BreakingBadD
     return DataLoader(train_set, **loader_kwargs), DataLoader(val_set, **loader_kwargs), train_set
 
 
-def build_scheduler(cfg: Config, optimizer):
+def build_scheduler(cfg: Config, optimizer, span: int | None = None):
     """
     Returns (scheduler, needs_metric).
 
@@ -128,6 +128,10 @@ def build_scheduler(cfg: Config, optimizer):
     moved, so every epoch registered as a plateau and the rate was halved nine
     times, ending 512x below where it started while the log gave no sign.
     """
+    # `span` is the number of epochs the schedule should cover. It differs from
+    # cfg.epochs only on a restarted resume, where the schedule must anneal over
+    # the epochs that REMAIN rather than the run's total.
+    span = max(1, span if span is not None else cfg.epochs)
     kind = (cfg.lr_schedule or "plateau").lower()
     if kind == "constant":
         return None, False
@@ -141,7 +145,7 @@ def build_scheduler(cfg: Config, optimizer):
         # schedule" is normally taken to mean.
         import math
 
-        t_max = max(cfg.epochs, 1)
+        t_max = span
         floor = cfg.lr_min / max(cfg.lr, 1e-12)
 
         def cosine_once(epoch: int) -> float:
@@ -627,6 +631,15 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
                       f"remain from here")
     elif is_main and cfg.resume not in ("", "none", "None"):
         write("  [ckpt] no checkpoint found -- starting from scratch")
+
+    if start_epoch > 0 and cfg.restart_schedule:
+        remaining = max(1, cfg.epochs - start_epoch)
+        for group in optimizer.param_groups:
+            group["lr"] = cfg.lr
+        scheduler, scheduler_needs_metric = build_scheduler(cfg, optimizer, span=remaining)
+        if is_main:
+            write(f"  [lr  ] schedule restarted at {cfg.lr:.2e}, annealing over the "
+                  f"{remaining} remaining epoch(s) to {cfg.lr_min:.2e}")
 
     if is_main:
         write(table_header())

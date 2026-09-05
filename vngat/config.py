@@ -133,6 +133,19 @@ class Config:
     lr_patience: int = 20
     lr_factor: float = 0.5
     lr_min: float = 1e-5
+    restart_schedule: bool = False
+    """On resume, discard the saved scheduler state and begin a FRESH schedule
+    at `lr`, spanning only the remaining epochs.
+
+    Needed because a resumed cosine otherwise produces a rate nobody chose. Its
+    `last_epoch` is restored from the checkpoint while its horizon comes from
+    the new `--epochs`, so a run that annealed to 1e-5 over 125 epochs restarts
+    at 5.6e-5, 1.2e-4 or 3.2e-4 depending only on whether the new total is 145,
+    160 or 200. That coupling is invisible and unintended.
+
+    With this set, `--lr` means what it says: a second session is a deliberate
+    warm restart at whatever base you choose, annealed over the epochs that
+    actually remain."""
     lr_warmup_epochs: int = 5
     """Linearly ramp the learning rate from lr/10 over this many epochs.
 

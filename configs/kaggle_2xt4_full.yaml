@@ -52,6 +52,7 @@ lr_schedule: plateau
 lr_monitor: rot
 lr_patience: 20
 lr_min: 1.0e-05
+restart_schedule: false
 lr_warmup_epochs: 5
 lr_factor: 0.5
 seed: 0

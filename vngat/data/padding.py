@@ -3,41 +3,35 @@ Pad a `SceneBatch` to fixed shapes, for accelerators that require them.
 
 WHY THIS EXISTS
 ---------------
-XLA (TPU) compiles a separate program for every distinct set of tensor shapes.
-Breaking Bad scenes have wildly varying vertex, edge and fragment counts -- 5k
-to 90k nodes, 2 to 94 fragments -- so an unpadded graph would trigger a fresh
-compilation almost every step, and compilation costs seconds to minutes. Padding
-into a handful of size buckets bounds the number of compilations to the number
-of buckets.
+XLA compiles a separate program for every distinct set of tensor shapes.
+Breaking Bad scenes vary enormously -- 5k to 90k vertices, 2 to 94 fragments --
+so an unpadded graph would trigger a fresh compilation almost every step, and
+each compilation costs seconds to minutes. Padding into a small ladder of size
+buckets bounds the number of compilations to the number of buckets.
 
 HOW PADDING IS MADE HARMLESS
 ----------------------------
-Rather than masking at every use site, the padding is given its own identity:
+Rather than masking at every use site inside the layers, the padding is given
+its own identity:
 
   * padded vertices belong to one extra PAD FRAGMENT,
   * that pad fragment belongs to one extra PAD SCENE,
   * padded edges have both endpoints on a single PAD VERTEX.
 
-Every segment operation in this model is already scoped by fragment or by scene,
-so real fragments and the pad fragment cannot mix -- the isolation falls out of
-the existing indexing rather than needing new masks inside the layers. Attention
-softmaxes normalise within a segment, so the pad segment normalises among
-itself and is then discarded.
+Every segment operation in this model is already scoped by fragment or by
+scene, so real and padded data cannot mix -- the isolation falls out of the
+existing indexing instead of needing new masks in the message passing.
+Attention softmaxes normalise within a segment, so the pad segment normalises
+among itself and is then discarded.
 
-The one place masks ARE still needed is the loss, because a mean over a padded
-tensor divides by the padded length. `masked_mean` handles that, and
-`tests/test_padding.py` asserts the padded loss equals the unpadded loss to
-float64 precision.
-
-BUCKETS
--------
-Padding to the global maximum would waste ~8x on a median scene. A small
-ladder of buckets keeps waste bounded while keeping recompilations few.
+Masks ARE still needed in the loss, because a mean over a padded tensor divides
+by the padded length. `masked_mean` handles that, and `tests/test_padding.py`
+asserts the padded loss equals the unpadded loss to float64 precision.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import Sequence, Tuple
 
 import torch
 
@@ -65,8 +59,8 @@ def choose_bucket(value: int, buckets: Sequence[int]) -> int:
     for b in buckets:
         if value <= b:
             return b
-    # Beyond the ladder, round up to the next power of two rather than failing:
-    # one extra compilation is far better than a crash mid-run.
+    # Beyond the ladder, double rather than fail: one extra compilation beats a
+    # crash mid-run.
     size = buckets[-1]
     while size < value:
         size *= 2
@@ -83,10 +77,9 @@ def pad_scene_batch(
     Pad to the next bucket in each dimension.
 
     Layout after padding, with N/E/F the real counts:
-        vertices  [0 .. N-1] real, [N .. N_pad-1] padding
-        the vertex at index N is the PAD VERTEX every padded edge points at
-        fragments [0 .. F-1] real, index F is the PAD FRAGMENT
-        scenes    [0 .. S-1] real, index S is the PAD SCENE
+        vertices  [0 .. N-1] real; index N is the PAD VERTEX
+        fragments [0 .. F-1] real; index F is the PAD FRAGMENT
+        scenes    [0 .. S-1] real; index S is the PAD SCENE
     """
     n, e, f = batch.num_nodes, batch.num_edges, batch.num_fragments
     s = batch.num_scenes
@@ -104,9 +97,7 @@ def pad_scene_batch(
         shape = (target - t.shape[0], *t.shape[1:])
         return torch.cat([t, torch.full(shape, fill, dtype=t.dtype, device=device)], 0)
 
-    pad_vertex = n            # first padded slot, reused as the sink
-    pad_frag = f
-    pad_scene = s
+    pad_vertex, pad_frag, pad_scene = n, f, s
 
     node_vec = grow(batch.node_vec, n_pad)
     node_frag = grow(batch.node_frag, n_pad, fill=pad_frag)
@@ -148,7 +139,7 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     Mean over masked entries, computed without any host synchronisation.
 
     `values[mask].mean()` would need the mask's contents on the host to size the
-    result, which forces an XLA sync every step and destroys throughput. The
+    result, forcing an XLA sync every step and serialising the pipeline. The
     sum-and-divide form keeps the graph static and stays on device.
     """
     if mask is None:
@@ -156,9 +147,7 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     m = mask.to(values.dtype)
     while m.dim() < values.dim():
         m = m.unsqueeze(-1)
-    total = (values * m).sum()
-    count = m.sum().clamp_min(1.0)
-    return total / count
+    return (values * m).sum() / m.sum().clamp_min(1.0)
 
 
 def bucket_report(sizes: Sequence[Tuple[int, int, int]],
@@ -166,15 +155,15 @@ def bucket_report(sizes: Sequence[Tuple[int, int, int]],
                   edge_buckets: Sequence[int] = DEFAULT_EDGE_BUCKETS,
                   frag_buckets: Sequence[int] = DEFAULT_FRAG_BUCKETS) -> str:
     """How much compute the padding wastes, and how many shapes XLA will see."""
-    lines, combos, waste = [], set(), []
+    combos, waste = set(), []
     for n, e, f in sizes:
         nb = choose_bucket(n + 1, node_buckets)
         eb = choose_bucket(max(e, 1), edge_buckets)
         fb = choose_bucket(f + 1, frag_buckets)
         combos.add((nb, eb, fb))
         waste.append(eb / max(e, 1))
-    lines.append(f"  distinct shape combinations: {len(combos)}  (= XLA compilations)")
+    lines = [f"  distinct shape combinations: {len(combos)}  (= XLA compilations)"]
     if waste:
         w = sorted(waste)
-        lines.append(f"  edge padding factor: median {w[len(w)//2]:.2f}x, worst {w[-1]:.2f}x")
+        lines.append(f"  edge padding factor: median {w[len(w) // 2]:.2f}x, worst {w[-1]:.2f}x")
     return "\n".join(lines)

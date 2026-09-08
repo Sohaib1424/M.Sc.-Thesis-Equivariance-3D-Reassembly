@@ -36,10 +36,13 @@ def _mean(values: torch.Tensor) -> torch.Tensor:
 
 
 def _reduce(values: torch.Tensor, mask=None) -> torch.Tensor:
-    """Mean over `values`, restricted to `mask` when padding is present.
+    """
+    Mean over `values`, restricted to `mask` when the batch has been padded.
 
-    `mask=None` is the unpadded path and behaves exactly as before, so the GPU
-    trainer is unaffected by the existence of the TPU one."""
+    `mask=None` is the unpadded path and behaves exactly as `_mean`, so this
+    file stays a drop-in match for the GPU branch. Only the XLA trainer passes
+    masks; everything else is unaffected.
+    """
     if mask is None:
         return _mean(values)
     from ..data.padding import masked_mean

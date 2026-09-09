@@ -65,6 +65,7 @@ from vngat.training.bridge import (  # noqa: E402
 from vngat.training.checkpoint import CheckpointManager  # noqa: E402
 from vngat.training.history import History  # noqa: E402
 from vngat.utils.env import seed_everything  # noqa: E402
+from vngat.utils.progress import make_bar, table_header, table_row, write  # noqa: E402
 
 _LOSS_KEYS = ("total", "rot", "rot_deg", "pos", "node", "mid", "face",
               "emb_v", "emb_e", "head_cos", "tilt", "twist")
@@ -101,27 +102,72 @@ def report_buckets(cfg, num_scenes: int = 60) -> int:
 
 
 def resolve_strategy(force_cpu: bool = False):
-    """TPU if one is attached, otherwise the default strategy, so the same
-    script runs unchanged on CPU for smoke tests."""
+    """
+    Connect to the TPU, or FAIL LOUDLY.
+
+    Colab now uses the TPU VM architecture, where the accelerator is attached
+    directly to the VM rather than reached over gRPC. The bare
+    `TPUClusterResolver()` is the OLD (TPU node) form and raises ValueError
+    there; `TPUClusterResolver(tpu="local")` is the one that works. Both are
+    tried, newest first.
+
+    There is deliberately NO silent CPU fallback. An earlier version fell back
+    quietly, and the run continued at roughly 1/100th the speed with a single
+    line of warning that scrolled past -- indistinguishable, from the outside,
+    from a TPU run that was merely slow to compile. Pass --cpu to ask for CPU
+    on purpose.
+    """
     if force_cpu:
         return tf.distribute.get_strategy(), "cpu"
-    try:
-        resolver = tf.distribute.cluster_resolver.TPUClusterResolver()
-        tf.config.experimental_connect_to_cluster(resolver)
-        tf.tpu.experimental.initialize_tpu_system(resolver)
-        return tf.distribute.TPUStrategy(resolver), "tpu"
-    except Exception as exc:  # noqa: BLE001
-        print(f"no TPU ({type(exc).__name__}); falling back to the default strategy")
-        return tf.distribute.get_strategy(), "cpu"
+
+    errors = []
+    for label, kwargs in (("TPU VM (tpu='local')", {"tpu": "local"}),
+                          ("TPU node (gRPC)", {})):
+        try:
+            resolver = tf.distribute.cluster_resolver.TPUClusterResolver(**kwargs)
+            tf.config.experimental_connect_to_cluster(resolver)
+            tf.tpu.experimental.initialize_tpu_system(resolver)
+            strategy = tf.distribute.TPUStrategy(resolver)
+            write(f"connected via {label}: {strategy.num_replicas_in_sync} replica(s)")
+            return strategy, "tpu"
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"  {label}: {type(exc).__name__}: {exc}")
+
+    raise SystemExit(
+        "Could not connect to a TPU.\n" + "\n".join(errors) + "\n\n"
+        "Checks, in order:\n"
+        "  1. Runtime -> Change runtime type -> TPU, then RESTART the runtime.\n"
+        "  2. Confirm TensorFlow itself can see it:\n"
+        "       import tensorflow as tf\n"
+        "       print(tf.config.list_logical_devices('TPU'))\n"
+        "     An empty list means TF has no TPU support in this runtime. Colab's\n"
+        "     current TPU images are JAX-oriented, and TF-on-TPU is not always\n"
+        "     available -- if JAX sees the TPU but TF does not, that is this case\n"
+        "     and no code change here will fix it.\n"
+        "  3. To run on CPU deliberately (slow, for smoke tests only), pass --cpu.\n"
+    )
 
 
-def run_epoch(model, loss_fn, dataset, optimizer, cfg, train: bool, pad: bool):
+def run_epoch(model, loss_fn, dataset, optimizer, cfg, train: bool, pad: bool, bar=None):
+    """
+    One epoch. Returns (metrics, diagnostics).
+
+    `data_seconds` vs `compute_seconds` is reported separately because it is the
+    only way to tell a data-starved run from a compute-bound one -- on the GPU
+    branch that split showed 99 s of every 325 s epoch was loader stall, which
+    no accelerator change would have fixed.
+    """
     totals = {k: 0.0 for k in _LOSS_KEYS}
     count = 0
-    for _ in range(cfg.steps_per_epoch if train else cfg.val_steps):
+    data_seconds = compute_seconds = 0.0
+    steps = cfg.steps_per_epoch if train else cfg.val_steps
+    for _ in range(steps):
+        t0 = time.perf_counter()
         samples = [dataset[i] for i in range(cfg.batch_size)]
         batch = collate_fn(samples)
         scene = prepare_scene(batch, pad=pad)
+        data_seconds += time.perf_counter() - t0
+        t0 = time.perf_counter()
         inputs = to_tensors(scene["diffused_input"])
         targets = build_targets(scene["clean_target"], scene["rot"], scene["diffused_input"])
         for key in ("node_mask", "edge_mask", "frag_mask"):
@@ -153,7 +199,17 @@ def run_epoch(model, loss_fn, dataset, optimizer, cfg, train: bool, pad: bool):
         for k in _LOSS_KEYS:
             totals[k] += float(losses[k])
         count += 1
-    return {k: v / max(count, 1) for k, v in totals.items()}
+        compute_seconds += time.perf_counter() - t0
+        if bar is not None:
+            # Per-step feedback. Without it the first output arrives only after
+            # a whole epoch, and on TPU the first epoch is dominated by XLA
+            # compilation -- so a healthy run is indistinguishable from a hung
+            # one for a long time.
+            bar.update(1)
+            bar.set_postfix_str(f"deg {totals['rot_deg'] / count:.1f} "
+                                f"total {totals['total'] / count:.3f}")
+    metrics = {k: v / max(count, 1) for k, v in totals.items()}
+    return metrics, {"data_seconds": data_seconds, "compute_seconds": compute_seconds}
 
 
 def main(argv=None) -> int:
@@ -201,8 +257,8 @@ def main(argv=None) -> int:
             start_epoch = int(meta.get("epoch", -1)) + 1
             history = History.from_dict(meta.get("history") or {})
             history.truncate_to(start_epoch)
-            print(f"  [ckpt] resumed from {path} at epoch {start_epoch}")
-            print(f"  [ckpt] --epochs {cfg.epochs} is a TOTAL, so "
+            write(f"  [ckpt] resumed from {path} at epoch {start_epoch}")
+            write(f"  [ckpt] --epochs {cfg.epochs} is a TOTAL, so "
                   f"{max(0, cfg.epochs - start_epoch)} epoch(s) remain")
 
     loss_fn = CompositeLoss(
@@ -211,40 +267,52 @@ def main(argv=None) -> int:
         emb_pull_margin=cfg.emb_pull_margin, emb_push_margin=cfg.emb_push_margin,
         symmetry_axis=cfg.symmetry_axis)
 
-    print(f"VN-GAT (TensorFlow) on {kind} | {replicas} replica(s) | padding={pad}")
-    print("chance level: geodesic 126.47 deg")
+    write(f"VN-GAT (TensorFlow) on {kind} | {replicas} replica(s) | padding={pad}")
+    write("chance level: geodesic 126.47 deg")
     if pad:
-        print("first epochs are dominated by XLA compilation; judge speed from epoch 5 on")
+        write("first epochs are dominated by XLA compilation; judge speed from epoch 5 on")
 
+    write(table_header())
+    # A single reusable bar, reset between epochs. On a non-TTY -- which is what
+    # a Colab `!python` cell is -- tqdm emits a NEW line per refresh, so it
+    # refreshes rarely; that is intentional, and still far better than the
+    # alternative of no output at all until a whole epoch finishes. With XLA
+    # compiling a program per new shape, epoch 0 can otherwise be a very long
+    # silence that looks identical to a hung run.
+    bar = make_bar(cfg.steps_per_epoch + cfg.val_steps, "epoch")
     wall = time.perf_counter()
     for epoch in range(start_epoch, cfg.epochs):
-        tr = run_epoch(model, loss_fn, train_set, optimizer, cfg, True, pad)
-        va = run_epoch(model, loss_fn, val_set, optimizer, cfg, False, pad)
+        bar.reset(total=cfg.steps_per_epoch + cfg.val_steps)
+        bar.set_description(f"epoch {epoch}")
+        tr, tr_diag = run_epoch(model, loss_fn, train_set, optimizer, cfg, True, pad, bar)
+        va, va_diag = run_epoch(model, loss_fn, val_set, optimizer, cfg, False, pad, bar)
         history.append("train", tr)
         history.append("val", va)
         lr = float(optimizer.learning_rate(optimizer.iterations)
                    if callable(optimizer.learning_rate) else optimizer.learning_rate)
         history.append_meta(lr=lr, epoch_seconds=time.perf_counter() - wall)
 
-        print(f"  epoch {epoch:>4} train total {tr['total']:8.4f} deg {tr['rot_deg']:7.2f} "
-              f"hcos {tr['head_cos']:.2f} | val deg {va['rot_deg']:7.2f} "
-              f"tilt {va['tilt']:6.2f} twist {va['twist']:6.2f} | lr {lr:.2e}")
+        write(table_row(epoch, "train", tr, tr_diag["data_seconds"],
+                        tr_diag["compute_seconds"], lr))
+        write(table_row(epoch, "val", va, va_diag["data_seconds"],
+                        va_diag["compute_seconds"], lr))
         verdict = ("  <- axis learned, azimuth NOT (structural floor)"
                    if va["tilt"] < 25 and va["twist"] > 60 else
                    "  <- axis not learned either (headroom remains)"
                    if va["tilt"] > 60 else "")
-        if verdict:
-            print(f"  [val ] tilt {va['tilt']:6.2f} twist {va['twist']:6.2f}{verdict}")
+        write(f"  [val ] tilt {va['tilt']:6.2f}  twist {va['twist']:6.2f}"
+              f"  (chance 90/90){verdict}")
 
         if manager.should_save(epoch, cfg.epochs):
             wrote = manager.save(model, optimizer, epoch, tr["total"], va["total"],
                                  history.to_dict(), cfg.to_dict())
-            print(f"  [ckpt] epoch {epoch}: wrote {', '.join(k for k, v in wrote.items() if v)}")
+            write(f"  [ckpt] epoch {epoch}: wrote {', '.join(k for k, v in wrote.items() if v)}")
         if (time.perf_counter() - wall) > cfg.time_budget_hours * 3600:
-            print(f"  [budget] stopping cleanly at epoch {epoch}")
+            write(f"  [budget] stopping cleanly at epoch {epoch}")
             manager.save(model, optimizer, epoch, tr["total"], va["total"],
                          history.to_dict(), cfg.to_dict(), force=True)
             break
+    bar.close()
     return 0
 
 

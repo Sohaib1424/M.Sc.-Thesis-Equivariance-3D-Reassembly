@@ -1,8 +1,20 @@
 __pycache__/
 *.py[cod]
-checkpoints/
-/data/
-*.pt
-*.png
-*.glb
 .ipynb_checkpoints/
+
+# Leading slash = repository root ONLY.
+# Without it, `data/` matches at ANY depth and would exclude the vngat/data
+# package -- the whole data pipeline -- from the repository. Same for
+# checkpoints/, which is only ever created at the root.
+/data/
+/checkpoints/
+
+# Run outputs. Anchored where they are actually written, so a source file that
+# happens to share a name is not swept up.
+/runs/
+/outputs/
+*.pt
+*.npz
+*.glb
+*.png
+!docs/**/*.png

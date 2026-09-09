@@ -635,11 +635,24 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
     if start_epoch > 0 and cfg.restart_schedule:
         remaining = max(1, cfg.epochs - start_epoch)
         for group in optimizer.param_groups:
+            # BOTH keys. `LambdaLR`/`CosineAnnealingLR` read their base rates
+            # from `initial_lr` and only write that key when it is ABSENT --
+            # and `optimizer.load_state_dict` has already restored it from the
+            # checkpoint. Setting `lr` alone is silently undone on the
+            # scheduler's first step, so a restart requesting 2e-4 actually ran
+            # at the checkpoint's 5e-4 while the log reported 2e-4.
             group["lr"] = cfg.lr
+            group["initial_lr"] = cfg.lr
         scheduler, scheduler_needs_metric = build_scheduler(cfg, optimizer, span=remaining)
         if is_main:
-            write(f"  [lr  ] schedule restarted at {cfg.lr:.2e}, annealing over the "
+            actual = optimizer.param_groups[0]["lr"]
+            write(f"  [lr  ] schedule restarted at {actual:.2e}, annealing over the "
                   f"{remaining} remaining epoch(s) to {cfg.lr_min:.2e}")
+            if abs(actual - cfg.lr) > 1e-12:
+                # Report what the optimiser actually holds, never what was asked
+                # for -- the previous message printed the request and was wrong.
+                write(f"!! requested --lr {cfg.lr:.2e} but the optimiser holds "
+                      f"{actual:.2e}; the schedule is NOT what you asked for")
 
     if is_main:
         write(table_header())

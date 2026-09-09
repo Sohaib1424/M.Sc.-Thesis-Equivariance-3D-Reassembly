@@ -130,3 +130,37 @@ def test_cosine_does_not_rise_after_its_span():
     for _ in range(120):                      # three times the horizon
         sched.step()
     assert opt.param_groups[0]["lr"] <= cfg.lr_min * 1.01
+
+
+def test_restart_schedule_overrides_the_checkpoints_base_lr():
+    """
+    Regression guard for a silent failure.
+
+    `LambdaLR` takes its base rates from `param_groups["initial_lr"]` and only
+    writes that key when absent. `optimizer.load_state_dict` restores it from
+    the checkpoint, so setting `lr` alone is undone on the scheduler's first
+    step -- a restart requesting 2e-4 ran at the checkpoint's 5e-4 while the log
+    reported 2e-4.
+    """
+    from vngat.config import Config
+    from vngat.training.trainer import build_scheduler
+
+    model = torch.nn.Linear(3, 3)
+    opt = torch.optim.SGD(model.parameters(), lr=5e-4)
+    # simulate a resumed optimiser: initial_lr already present, from the old run
+    for group in opt.param_groups:
+        group["initial_lr"] = 5e-4
+
+    cfg = Config(lr=2e-4, lr_min=2e-5, epochs=60, lr_schedule="cosine")
+    for group in opt.param_groups:          # what the restart block does
+        group["lr"] = cfg.lr
+        group["initial_lr"] = cfg.lr
+    sched, _ = build_scheduler(cfg, opt, span=23)
+
+    assert abs(opt.param_groups[0]["lr"] - 2e-4) < 1e-12
+    sched.step()
+    # one step in, still ~2e-4 -- NOT the 4.98e-4 the stale base would give
+    assert opt.param_groups[0]["lr"] < 2.1e-4, opt.param_groups[0]["lr"]
+    for _ in range(22):
+        sched.step()
+    assert abs(opt.param_groups[0]["lr"] - cfg.lr_min) < 1e-7

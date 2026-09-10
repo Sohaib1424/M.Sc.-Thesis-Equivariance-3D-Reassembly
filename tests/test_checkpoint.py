@@ -190,14 +190,22 @@ def test_cosine_horizon_survives_a_checkpoint_round_trip():
     assert saved["lr_lambdas"][0] is not None, "the horizon must be serialised"
     assert saved["lr_lambdas"][0]["t_max"] == 23
 
-    # resume: a NEW process builds with the default span (= cfg.epochs = 60)
+    # resume: a NEW process builds with the default span (= cfg.epochs = 60).
+    # The optimiser is restored too, so it carries the rate the run left off at.
     opt_b = torch.optim.SGD(model.parameters(), lr=cfg.lr)
+    for group in opt_b.param_groups:            # what load_state_dict restores
+        group["lr"] = opt_a.param_groups[0]["lr"]
+        group["initial_lr"] = cfg.lr
     sched_b, _ = build_scheduler(cfg, opt_b)
     sched_b.load_state_dict(saved)
     assert sched_b.lr_lambdas[0].t_max == 23, "horizon reverted to cfg.epochs"
+
+    # the horizon is what matters: stepping on from here must follow the
+    # 23-epoch curve, not a 60-epoch one
+    sched_a.step(); sched_b.step()
     assert abs(opt_a.param_groups[0]["lr"] - opt_b.param_groups[0]["lr"]) < 1e-12
 
-    for _ in range(19):                                   # finish the 23 epochs
+    for _ in range(18):                                   # finish the 23 epochs
         sched_b.step()
     assert abs(opt_b.param_groups[0]["lr"] - cfg.lr_min) < 1e-8
 

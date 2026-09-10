@@ -95,12 +95,27 @@ def test_parse_config_records_which_flags_were_typed():
     assert "hidden_channels" not in cfg._explicit
 
 
-def test_resumed_fields_and_architecture_fields_are_disjoint():
-    """Schedule settings are restorable; architecture is not -- weights of one
-    shape cannot load into another."""
+def test_architecture_is_both_restored_and_checked():
+    """
+    Architecture is a SUBSET of the restored fields, not a separate category.
+
+    Restored, so a resume needs no `--hidden_channels 128` re-typed; also
+    checked, so an EXPLICIT mismatch fails loudly instead of hitting a shape
+    error inside load_state_dict. An earlier version only checked, which made a
+    bare resume crash against the default architecture.
+    """
     from vngat.training.trainer import _ARCHITECTURE_FIELDS, _RESTORED_FIELDS
 
-    assert not set(_RESTORED_FIELDS) & set(_ARCHITECTURE_FIELDS)
+    assert set(_ARCHITECTURE_FIELDS) <= set(_RESTORED_FIELDS)
     names = {f.name for f in __import__("dataclasses").fields(Config)}
     assert set(_RESTORED_FIELDS) <= names
-    assert set(_ARCHITECTURE_FIELDS) <= names
+
+
+def test_the_data_definition_is_restored():
+    """The worst silent failure available: a resume that quietly changes the
+    train/val split leaks validation objects into training."""
+    from vngat.training.trainer import _RESTORED_FIELDS
+
+    for name in ("split_source", "data_subsets", "steps_per_epoch", "val_steps",
+                 "max_scenes", "input_source", "val_frac", "split_seed"):
+        assert name in _RESTORED_FIELDS, name

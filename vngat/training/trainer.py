@@ -653,14 +653,18 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
     if hasattr(torch.backends.cuda, "matmul"):
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    train_loader, val_loader, train_set = build_dataloaders(cfg)
-    # Peek at the checkpoint first: its stored config decides the architecture
-    # and the schedule, so nothing may be constructed before this.
+    # Peek at the checkpoint FIRST. Its stored config decides the architecture,
+    # the schedule AND THE DATA -- `split_source`, `data_subsets`,
+    # `steps_per_epoch`, `val_steps`. Nothing may be constructed before this:
+    # building the dataloaders first meant they used the un-adopted config
+    # while everything downstream used the adopted one, so a resumed epoch
+    # silently ran 50 steps on a hash split instead of 80 on the official one.
     _probe = CheckpointManager(cfg.checkpoint_dir, cfg.save_every, None, cfg.tag)
     _resume_path = (_probe.locate(cfg.resume)
                     if cfg.resume not in ("", "none", "None") else None)
     adopt_checkpoint_config(cfg, _resume_path, is_main)
 
+    train_loader, val_loader, train_set = build_dataloaders(cfg)
     model = build_model(cfg, device)
 
     if is_main:

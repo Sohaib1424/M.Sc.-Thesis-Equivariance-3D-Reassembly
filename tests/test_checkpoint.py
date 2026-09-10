@@ -324,3 +324,21 @@ def test_platform_flags_are_never_restored(tmp_path):
                  "time_budget_hours", "checkpoint_dir", "root_dir",
                  "grad_checkpointing", "device", "tag"):
         assert name not in _RESTORED_FIELDS, name
+
+
+def test_config_is_adopted_before_anything_is_constructed():
+    """
+    Ordering guard. The stored config decides the DATA -- split_source,
+    data_subsets, steps_per_epoch -- so the dataloaders must not exist yet when
+    it is read. Building them first made a resumed epoch silently run 50 steps
+    on a hash split instead of 80 on the official one, with the progress bar
+    sized from the adopted config and the data from the default one.
+    """
+    import inspect
+
+    from vngat.training import trainer
+
+    src = inspect.getsource(trainer.run_worker)
+    adopt = src.index("adopt_checkpoint_config(cfg, _resume_path")
+    assert adopt < src.index("build_dataloaders(cfg)")
+    assert adopt < src.index("build_model(cfg, device)")

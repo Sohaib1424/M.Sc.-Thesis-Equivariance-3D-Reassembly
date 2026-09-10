@@ -84,3 +84,23 @@ def test_yaml_configs_agree_with_the_dataclass_defaults_on_precision():
             f"{path.name} sets amp={values['amp']} but the Config default is "
             f"{Config().amp}; see the docstring for the measurement behind it"
         )
+
+
+def test_parse_config_records_which_flags_were_typed():
+    """A resume restores everything else from the checkpoint, so it has to know
+    what the caller actually asked for."""
+    cfg = parse_config(["--lr", "5e-4", "--epochs", "80"])
+    assert "lr" in cfg._explicit and "epochs" in cfg._explicit
+    assert "lr_min" not in cfg._explicit
+    assert "hidden_channels" not in cfg._explicit
+
+
+def test_resumed_fields_and_architecture_fields_are_disjoint():
+    """Schedule settings are restorable; architecture is not -- weights of one
+    shape cannot load into another."""
+    from vngat.training.trainer import _ARCHITECTURE_FIELDS, _RESTORED_FIELDS
+
+    assert not set(_RESTORED_FIELDS) & set(_ARCHITECTURE_FIELDS)
+    names = {f.name for f in __import__("dataclasses").fields(Config)}
+    assert set(_RESTORED_FIELDS) <= names
+    assert set(_ARCHITECTURE_FIELDS) <= names

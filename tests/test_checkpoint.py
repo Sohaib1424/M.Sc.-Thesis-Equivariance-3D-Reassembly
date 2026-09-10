@@ -164,3 +164,155 @@ def test_restart_schedule_overrides_the_checkpoints_base_lr():
     for _ in range(22):
         sched.step()
     assert abs(opt.param_groups[0]["lr"] - cfg.lr_min) < 1e-7
+
+
+def test_cosine_horizon_survives_a_checkpoint_round_trip():
+    """
+    Regression guard for a SILENT schedule change.
+
+    `LambdaLR.state_dict()` serialises the lambda's `__dict__` only when the
+    lambda is not a plain function. With a closure the horizon was never written
+    to the checkpoint, so on resume it reverted to `cfg.epochs` while
+    `last_epoch` continued -- a 23-epoch anneal silently became a 60-epoch one
+    and ended at 1.4e-4 instead of 2e-5, with nothing in the log to show it.
+    """
+    from vngat.config import Config
+    from vngat.training.trainer import build_scheduler
+
+    model = torch.nn.Linear(3, 3)
+    cfg = Config(lr=2e-4, lr_min=2e-5, epochs=60, lr_schedule="cosine")
+
+    opt_a = torch.optim.SGD(model.parameters(), lr=cfg.lr)
+    sched_a, _ = build_scheduler(cfg, opt_a, span=23)     # the original run
+    for _ in range(4):
+        sched_a.step()
+    saved = sched_a.state_dict()
+    assert saved["lr_lambdas"][0] is not None, "the horizon must be serialised"
+    assert saved["lr_lambdas"][0]["t_max"] == 23
+
+    # resume: a NEW process builds with the default span (= cfg.epochs = 60)
+    opt_b = torch.optim.SGD(model.parameters(), lr=cfg.lr)
+    sched_b, _ = build_scheduler(cfg, opt_b)
+    sched_b.load_state_dict(saved)
+    assert sched_b.lr_lambdas[0].t_max == 23, "horizon reverted to cfg.epochs"
+    assert abs(opt_a.param_groups[0]["lr"] - opt_b.param_groups[0]["lr"]) < 1e-12
+
+    for _ in range(19):                                   # finish the 23 epochs
+        sched_b.step()
+    assert abs(opt_b.param_groups[0]["lr"] - cfg.lr_min) < 1e-8
+
+
+def test_cosine_clamps_and_never_rises_after_its_horizon():
+    from vngat.config import Config
+    from vngat.training.trainer import build_scheduler
+
+    model = torch.nn.Linear(3, 3)
+    cfg = Config(lr=1e-3, lr_min=1e-5, epochs=40, lr_schedule="cosine")
+    opt = torch.optim.SGD(model.parameters(), lr=cfg.lr)
+    sched, _ = build_scheduler(cfg, opt, span=40)
+    for _ in range(120):                                  # three times the horizon
+        sched.step()
+    assert opt.param_groups[0]["lr"] <= cfg.lr_min * 1.01
+
+
+def _write_stub_checkpoint(path, config):
+    torch.save({"epoch": 39, "train_loss": 4.8, "val_loss": 5.4, "best_val": 5.4,
+                "history": {}, "config": config}, path)
+
+
+def test_resume_adopts_the_checkpoints_schedule_with_no_flags(tmp_path):
+    """
+    THE property this exists for: `--resume auto --checkpoint_dir X` continues a
+    run exactly, on any platform, without reconstructing --lr / --epochs /
+    --lr_schedule by hand. Rebuilding them from memory is how a 23-epoch anneal
+    silently became a 60-epoch one.
+    """
+    from vngat.config import Config
+    from vngat.training.trainer import adopt_checkpoint_config
+
+    ckpt = tmp_path / "last.pt"
+    _write_stub_checkpoint(ckpt, dict(lr=2e-4, lr_min=2e-5, lr_schedule="cosine",
+                                      epochs=60, hidden_channels=128, num_layers=6))
+    cfg = Config(lr=1e-3, lr_min=1e-5, lr_schedule="plateau", epochs=400,
+                 hidden_channels=128, num_layers=6)
+    object.__setattr__(cfg, "_explicit", frozenset())
+    adopt_checkpoint_config(cfg, ckpt, is_main=False)
+
+    assert cfg.lr == 2e-4 and cfg.lr_min == 2e-5
+    assert cfg.lr_schedule == "cosine" and cfg.epochs == 60
+
+
+def test_an_explicit_flag_still_wins(tmp_path):
+    from vngat.config import Config
+    from vngat.training.trainer import adopt_checkpoint_config
+
+    ckpt = tmp_path / "last.pt"
+    _write_stub_checkpoint(ckpt, dict(lr=2e-4, epochs=60, hidden_channels=128))
+    cfg = Config(lr=2e-4, epochs=80, hidden_channels=128)
+    object.__setattr__(cfg, "_explicit", frozenset({"epochs"}))
+    adopt_checkpoint_config(cfg, ckpt, is_main=False)
+    assert cfg.epochs == 80, "an explicitly typed flag must override the checkpoint"
+
+
+def test_architecture_mismatch_fails_readably(tmp_path):
+    """Better than a shape error deep inside load_state_dict."""
+    import pytest as _pytest
+
+    from vngat.config import Config
+    from vngat.training.trainer import adopt_checkpoint_config
+
+    ckpt = tmp_path / "last.pt"
+    _write_stub_checkpoint(ckpt, dict(hidden_channels=128, num_layers=6))
+    cfg = Config(hidden_channels=64, num_layers=6)
+    object.__setattr__(cfg, "_explicit", frozenset({"hidden_channels"}))
+    with _pytest.raises(SystemExit, match="Architecture mismatch"):
+        adopt_checkpoint_config(cfg, ckpt, is_main=False)
+
+
+def test_resume_restores_the_data_definition(tmp_path):
+    """
+    The worst silent failure available: dropping `--split_source official` on a
+    resume would revert to `hash`, a DIFFERENT train/val split. Validation
+    objects leak into training and every number afterwards is meaningless, with
+    nothing in the log to say so.
+    """
+    from vngat.config import Config
+    from vngat.training.trainer import adopt_checkpoint_config
+
+    ckpt = tmp_path / "last.pt"
+    _write_stub_checkpoint(ckpt, dict(
+        split_source="official", data_subsets="everyday_compressed",
+        steps_per_epoch=80, val_steps=8, max_scenes=0, input_source="full"))
+    cfg = Config()                       # defaults: hash, both subsets, 50 steps
+    object.__setattr__(cfg, "_explicit", frozenset())
+    adopt_checkpoint_config(cfg, ckpt, is_main=False)
+
+    assert cfg.split_source == "official"
+    assert cfg.data_subsets == "everyday_compressed"
+    assert cfg.steps_per_epoch == 80 and cfg.val_steps == 8
+
+
+def test_resume_restores_the_architecture(tmp_path):
+    """A resume must not need the architecture re-typed; only an EXPLICIT
+    mismatch is an error."""
+    from vngat.config import Config
+    from vngat.training.trainer import adopt_checkpoint_config
+
+    ckpt = tmp_path / "last.pt"
+    _write_stub_checkpoint(ckpt, dict(hidden_channels=128, num_layers=6, num_vn_slots=12))
+    cfg = Config()                       # defaults: 64 / 4 / 8
+    object.__setattr__(cfg, "_explicit", frozenset())
+    adopt_checkpoint_config(cfg, ckpt, is_main=False)
+    assert (cfg.hidden_channels, cfg.num_layers, cfg.num_vn_slots) == (128, 6, 12)
+
+
+def test_platform_flags_are_never_restored(tmp_path):
+    """batch_size is per RANK, so 16 on two GPUs and 32 on one are the same
+    effective batch. Restoring it would break moving between machines."""
+    from vngat.config import Config
+    from vngat.training.trainer import _RESTORED_FIELDS
+
+    for name in ("batch_size", "num_gpus", "num_workers", "save_every",
+                 "time_budget_hours", "checkpoint_dir", "root_dir",
+                 "grad_checkpointing", "device", "tag"):
+        assert name not in _RESTORED_FIELDS, name

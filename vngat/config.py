@@ -282,9 +282,15 @@ def parse_config(argv: Optional[List[str]] = None) -> Config:
     args = parser.parse_args(argv)
 
     cfg = Config.from_yaml(args.config) if args.config else Config()
+    explicit = set()
     for f in fields(Config):
         value = getattr(args, f.name, None)
         if value is not None:
             setattr(cfg, f.name, value)
+            explicit.add(f.name)
+    # Which fields the CALLER actually typed. A resume restores everything else
+    # from the checkpoint, so continuing a run needs no flags at all -- and an
+    # explicit flag still wins, so overriding stays possible.
+    object.__setattr__(cfg, "_explicit", frozenset(explicit))
     cfg.validate()
     return cfg

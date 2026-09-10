@@ -118,6 +118,26 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader, BreakingBadD
     return DataLoader(train_set, **loader_kwargs), DataLoader(val_set, **loader_kwargs), train_set
 
 
+class _CosineOnce:
+    """
+    Cosine decay to a floor, clamped so it never rises again.
+
+    A class rather than a closure so `LambdaLR.state_dict()` captures `t_max`
+    and `floor` -- see the note in `build_scheduler`. `__dict__` is what gets
+    serialised, so both must be plain attributes.
+    """
+
+    def __init__(self, t_max: int, floor: float):
+        self.t_max = max(1, int(t_max))
+        self.floor = float(floor)
+
+    def __call__(self, epoch: int) -> float:
+        import math
+
+        phase = min(epoch, self.t_max) / self.t_max      # clamped: never rises
+        return self.floor + (1.0 - self.floor) * (1.0 + math.cos(math.pi * phase)) / 2.0
+
+
 def build_scheduler(cfg: Config, optimizer, span: int | None = None):
     """
     Returns (scheduler, needs_metric).
@@ -136,28 +156,112 @@ def build_scheduler(cfg: Config, optimizer, span: int | None = None):
     if kind == "constant":
         return None, False
     if kind == "cosine":
-        # CosineAnnealingLR is PERIODIC: it falls to eta_min at last_epoch =
-        # T_max, then CLIMBS BACK toward the base rate over the next T_max
-        # steps. A real run resumed past its original horizon did exactly that
-        # -- the rate went from 1.0e-5 back up to 6.9e-4 over 75 epochs and the
-        # loss rose with it. Wrapping it in a lambda that clamps the phase at
-        # T_max makes it anneal once and stay down, which is what "cosine
-        # schedule" is normally taken to mean.
-        import math
+        # CosineAnnealingLR is PERIODIC: past T_max it climbs back toward the
+        # base rate. A real run resumed past its horizon did exactly that -- the
+        # rate went 1.0e-5 -> 6.9e-4 over 75 epochs and the loss rose with it.
+        # `_CosineOnce` clamps the phase so it anneals once and stays down.
+        #
+        # It is a CALLABLE CLASS, not a closure, and that is load-bearing:
+        # LambdaLR.state_dict() serialises a lambda's __dict__ only when the
+        # lambda is not a plain function. With a closure the horizon is never
+        # written to the checkpoint, so on resume it silently reverts to
+        # cfg.epochs while last_epoch continues -- a 23-epoch anneal became a
+        # 60-epoch one and never reached its floor.
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer, _CosineOnce(span, cfg.lr_min / max(cfg.lr, 1e-12))), False
 
-        t_max = span
-        floor = cfg.lr_min / max(cfg.lr, 1e-12)
-
-        def cosine_once(epoch: int) -> float:
-            phase = min(epoch, t_max) / t_max          # clamped: never rises again
-            return floor + (1.0 - floor) * (1.0 + math.cos(math.pi * phase)) / 2.0
-
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, cosine_once), False
     if kind == "plateau":
         return torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=cfg.lr_factor, patience=cfg.lr_patience,
             min_lr=cfg.lr_min), True
     raise ValueError(f"lr_schedule must be 'plateau', 'cosine' or 'constant', got {kind!r}")
+
+
+_RESTORED_FIELDS = (
+    # --- what is being learned: schedule and objective -------------------
+    "lr", "lr_min", "lr_schedule", "lr_monitor", "lr_patience", "lr_factor",
+    "lr_warmup_epochs", "epochs", "weight_decay", "grad_clip",
+    "w_rot", "w_pos", "w_node", "w_mid", "w_face", "w_emb_v", "w_emb_e",
+    "emb_pull_margin", "emb_push_margin", "symmetry_axis",
+    # --- WHAT IT IS BEING LEARNED FROM -----------------------------------
+    # These define the dataset and the train/val split. Letting them fall back
+    # to defaults mid-run is the worst failure mode available: dropping
+    # `--split_source official` silently reverts to `hash`, which is a
+    # DIFFERENT SPLIT -- validation objects leak into training and every
+    # number afterwards is meaningless, with nothing in the log to say so.
+    "data_subsets", "split_source", "val_frac", "test_frac", "split_seed",
+    "max_scenes", "fracture_pattern", "input_source", "correspondence",
+    "correspondence_tol", "min_fragments",
+    # --- what an "epoch" means -------------------------------------------
+    # The schedule is indexed in epochs, so changing these mid-run rescales the
+    # horizon: 150 epochs of 80 steps is not 150 epochs of 50.
+    "steps_per_epoch", "val_steps",
+    # --- architecture ------------------------------------------------------
+    # Restored like everything else, but ALSO checked: weights of one shape
+    # cannot load into another, so an explicit mismatch must fail loudly rather
+    # than be silently overridden.
+    "hidden_channels", "num_layers", "num_vn_slots", "heads", "embed_dim",
+    "gram_bottleneck", "norm",
+)
+_ARCHITECTURE_FIELDS = (
+    "hidden_channels", "num_layers", "num_vn_slots", "heads", "embed_dim",
+    "gram_bottleneck", "norm",
+)
+# Deliberately NOT restored -- genuinely per-machine, and the caller must be
+# free to change them between platforms:
+#   batch_size, num_gpus, num_workers, save_every, time_budget_hours,
+#   checkpoint_dir, root_dir, device, amp, grad_checkpointing,
+#   micro_batch_scenes, pin_memory, prefetch_factor, tag, resume, drive_*
+# `batch_size` is per RANK, so 16 on two GPUs and 32 on one are the same
+# effective batch -- which is why it must stay caller-controlled.
+
+
+def adopt_checkpoint_config(cfg: Config, resume_path, is_main: bool) -> None:
+    """
+    Make a checkpoint SELF-SUFFICIENT, so resuming needs no flags.
+
+    `--resume auto --checkpoint_dir X` continues a run exactly as it was --
+    same schedule, same horizon, same loss weights -- on Kaggle, on Colab, or
+    moving between them. Anything typed on the command line still wins, and is
+    logged when it differs.
+
+    Called BEFORE the model is built, so the architecture check below fails with
+    a readable message instead of a shape error deep inside load_state_dict.
+    """
+    if resume_path is None or not resume_path.is_file():
+        return
+    stored = (torch.load(resume_path, map_location="cpu", weights_only=False)
+              .get("config") or {})
+    if not stored:
+        return
+
+    explicit = getattr(cfg, "_explicit", frozenset())
+    for name in _ARCHITECTURE_FIELDS:
+        # Only an EXPLICIT mismatch is an error. Saying nothing means "use the
+        # checkpoint's architecture", which is restored below.
+        if name in explicit and name in stored and stored[name] != getattr(cfg, name):
+            raise SystemExit(
+                f"Architecture mismatch: the checkpoint has {name}={stored[name]}, "
+                f"this run specifies {getattr(cfg, name)}. Weights of one shape cannot "
+                f"load into another. Drop the flag to use the checkpoint's value, or "
+                f"start fresh with --resume none."
+            )
+
+    restored, overridden = [], []
+    for name in _RESTORED_FIELDS:
+        if name not in stored:
+            continue
+        if name in explicit:
+            if stored[name] != getattr(cfg, name):
+                overridden.append(f"{name}: {stored[name]} -> {getattr(cfg, name)}")
+        else:
+            setattr(cfg, name, stored[name])
+            restored.append(name)
+    if is_main and restored:
+        write(f"  [ckpt] using the checkpoint's settings for: {', '.join(restored)}")
+    for line in overridden:
+        if is_main:
+            write(f"  [ckpt] command line overrides {line}")
 
 
 def build_model(cfg: Config, device: torch.device) -> VNGATModel:
@@ -550,6 +654,13 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
 
     train_loader, val_loader, train_set = build_dataloaders(cfg)
+    # Peek at the checkpoint first: its stored config decides the architecture
+    # and the schedule, so nothing may be constructed before this.
+    _probe = CheckpointManager(cfg.checkpoint_dir, cfg.save_every, None, cfg.tag)
+    _resume_path = (_probe.locate(cfg.resume)
+                    if cfg.resume not in ("", "none", "None") else None)
+    adopt_checkpoint_config(cfg, _resume_path, is_main)
+
     model = build_model(cfg, device)
 
     if is_main:
@@ -624,8 +735,9 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
                   f"(best val {manager.best_val:.4f})")
             remaining = cfg.epochs - start_epoch
             if remaining <= 0:
-                write(f"!! --epochs {cfg.epochs} is a TOTAL and this checkpoint is already "
-                      f"at epoch {start_epoch}. Nothing will run. Raise --epochs.")
+                write(f"!! this checkpoint is already at epoch {start_epoch} of "
+                      f"{cfg.epochs}, so there is nothing left to run. Pass a larger "
+                      f"--epochs to extend the schedule.")
             else:
                 write(f"  [ckpt] --epochs {cfg.epochs} is a TOTAL, so {remaining} epoch(s) "
                       f"remain from here")

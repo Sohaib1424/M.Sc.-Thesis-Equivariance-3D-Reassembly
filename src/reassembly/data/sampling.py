@@ -1,12 +1,21 @@
 """
 Samplers.
 
-One class, because the combination it provides does not exist in torch:
-weighted *and* distributed *and* reproducible. ``WeightedRandomSampler`` is not
-distributed, ``DistributedSampler`` is not weighted, and stacking them gives
-each rank a different weighted draw with no guarantee the ranks pull the same
-number of batches -- which under DDP is not a statistical wrinkle but a hang,
-since the rank that finishes first waits forever in the gradient all-reduce.
+Three, each for a combination torch does not provide:
+
+* :class:`WeightedDistributedSampler` -- weighted *and* distributed *and*
+  reproducible, for a full pass over a balanced training set.
+* :class:`EpochSampler` -- a **fixed number** of draws per rank per epoch,
+  weighted or not, for fixed-length epochs (``Config.steps_per_epoch``).
+* :class:`ShardSampler` -- every index exactly once across the ranks, with no
+  padding, for validation.
+
+``WeightedRandomSampler`` is not distributed, ``DistributedSampler`` is not
+weighted and pads by repeating samples, and stacking them gives each rank a
+different weighted draw with no guarantee the ranks pull the same number of
+batches. For training that last point is not a statistical wrinkle: every rank
+must reach every optimizer step, so the training samplers here always give
+every rank the same count.
 """
 from __future__ import annotations
 
@@ -102,3 +111,105 @@ class WeightedDistributedSampler(Sampler[int]):
                 pad = self.total_size - drawn.numel()
                 drawn = torch.cat([drawn, drawn[:pad]])
         return iter(drawn[self.rank::self.num_replicas].tolist())
+
+
+class EpochSampler(Sampler[int]):
+    """
+    Exactly ``per_rank`` indices per rank per epoch, however large the dataset.
+
+    This is what makes an epoch a fixed amount of *training* rather than a pass
+    over whatever the data happens to be. With ``modes_per_scene``, balancing,
+    ``limit_train`` and the split all changing how many items there are, "one
+    pass" has no stable meaning: it is 1,600 steps on one setting and 900 on the
+    next, and the validation curve, the checkpoint cadence and the time per
+    epoch all move with it. A fixed count keeps them put.
+
+    Without ``weights``: seeded permutations of the whole dataset, concatenated
+    until the epoch is full, so every item is drawn ``floor`` or ``ceil`` of
+    ``total / len`` times and none is starved. With ``weights``: a multinomial
+    draw with replacement, as :class:`WeightedDistributedSampler` does.
+
+    Either way the draw is made **once, identically on every rank** and sliced
+    ``[rank::world]``, so the ranks see disjoint parts of one epoch and every
+    rank gets the same number of indices -- which every rank needs, because
+    every rank must reach every optimizer step.
+    """
+
+    def __init__(
+        self,
+        num_items: int,
+        per_rank: int,
+        num_replicas: int = 1,
+        rank: int = 0,
+        seed: int = 0,
+        weights: Optional[Sequence[float]] = None,
+    ) -> None:
+        if num_items < 1:
+            raise ValueError("EpochSampler needs at least one item")
+        if per_rank < 1:
+            raise ValueError("per_rank must be >= 1")
+        if num_replicas < 1:
+            raise ValueError("num_replicas must be >= 1")
+        if not 0 <= rank < num_replicas:
+            raise ValueError(f"rank {rank} out of range for {num_replicas} replicas")
+        self.num_items = int(num_items)
+        self.per_rank = int(per_rank)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.weights = None
+        if weights is not None:
+            tensor = torch.as_tensor(list(weights), dtype=torch.double)
+            if tensor.numel() != self.num_items:
+                raise ValueError(
+                    f"{tensor.numel()} weights for {self.num_items} items")
+            if bool((tensor < 0).any()) or float(tensor.sum()) <= 0.0:
+                raise ValueError("sampling weights must be non-negative and not all zero")
+            self.weights = tensor
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self.per_rank
+
+    def __iter__(self) -> Iterator[int]:
+        total = self.per_rank * self.num_replicas
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + 977 * self.epoch)
+        if self.weights is not None:
+            drawn = torch.multinomial(self.weights, total, replacement=True,
+                                      generator=generator)
+        else:
+            rounds = -(-total // self.num_items)
+            drawn = torch.cat([torch.randperm(self.num_items, generator=generator)
+                               for _ in range(rounds)])[:total]
+        return iter(drawn[self.rank::self.num_replicas].tolist())
+
+
+class ShardSampler(Sampler[int]):
+    """
+    Every index exactly once across the ranks, in order, with no padding.
+
+    For validation. ``DistributedSampler(drop_last=False)`` pads the last round
+    by *repeating* samples so every rank gets the same count, which is right for
+    training and wrong for measurement: the repeated scenes are counted twice
+    and the mean moves. Validation contains no collective operation, so the
+    ranks do not need equal counts -- their results are gathered once, at the
+    end, and every scene is counted once.
+    """
+
+    def __init__(self, num_items: int, num_replicas: int = 1, rank: int = 0) -> None:
+        if num_replicas < 1 or not 0 <= rank < num_replicas:
+            raise ValueError(f"rank {rank} out of range for {num_replicas} replicas")
+        self.indices = list(range(rank, int(num_items), int(num_replicas)))
+
+    def set_epoch(self, epoch: int) -> None:     # noqa: D401 -- sampler protocol
+        """Validation is the same every epoch."""
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self.indices)

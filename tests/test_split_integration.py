@@ -81,7 +81,7 @@ def _config(root, **kwargs):
         root=str(root), out_dir=str(Path(root).parent / "out"),
         channels=16, heads=4, head_dim=4, embedding_dim=8, workers=0,
         tokens_per_scene=32, batch_size=2, epochs=1, modes_per_scene=None,
-        schedule=("intra", "cross"), check_init=False,
+        schedule=("intra", "cross"), check_init=False, steps_per_epoch=0,
     )
     defaults.update(kwargs)
     return Config(**defaults)
@@ -211,6 +211,50 @@ def test_the_balanced_loader_yields_a_full_epoch(root):
     loader = training._loader(dataset, config, shuffle=True, rank=0, world=1,
                               epoch=0)
     assert len(loader.sampler) == len(dataset)
+
+
+@pytest.mark.parametrize("balance", ["none", "category"])
+@pytest.mark.parametrize("world", [1, 2, 3])
+def test_a_fixed_length_epoch_is_the_same_length_on_every_gpu(root, balance, world):
+    """
+    ``steps_per_epoch`` batches per GPU, whatever the split size, the balancing
+    or the number of GPUs -- and the GPUs' shares never overlap. Equal counts are
+    not a nicety: every GPU takes part in every optimizer step, so a GPU with
+    one batch fewer would leave the others waiting at the last one.
+    """
+    config = _config(root, balance=balance, steps_per_epoch=7)
+    dataset = BreakingBadScenes(config, "train")
+    shares = [list(training._loader(dataset, config, shuffle=True, rank=r,
+                                    world=world, epoch=3).sampler)
+              for r in range(world)]
+    assert all(len(share) == 7 * config.batch_size for share in shares)
+    loaders = [training._loader(dataset, config, shuffle=True, rank=r, world=world,
+                                epoch=3) for r in range(world)]
+    assert all(len(loader) == 7 for loader in loaders)
+    if balance == "none":
+        # One seeded draw, sliced by rank: no index twice until the draw
+        # wraps around the dataset.
+        drawn = [i for share in shares for i in share]
+        assert len(set(drawn)) == min(len(drawn), len(dataset))
+    again = list(training._loader(dataset, config, shuffle=True, rank=0,
+                                  world=world, epoch=3).sampler)
+    assert again == shares[0], "an epoch's draw must be reproducible"
+
+
+@pytest.mark.parametrize("world", [2, 3])
+def test_validation_shards_cover_every_scene_exactly_once(root, world):
+    """
+    ``DistributedSampler`` pads the last round by repeating scenes, which is
+    right for training and wrong for a measurement: the repeats are counted
+    twice. Validation shards are unpadded and disjoint.
+    """
+    config = _config(root)
+    val = BreakingBadScenes(config, "val")
+    shards = [list(training._loader(val, config, shuffle=False, rank=r,
+                                    world=world, epoch=0).sampler)
+              for r in range(world)]
+    drawn = sorted(i for shard in shards for i in shard)
+    assert drawn == list(range(len(val)))
 
 
 # --------------------------------------------------------------------------

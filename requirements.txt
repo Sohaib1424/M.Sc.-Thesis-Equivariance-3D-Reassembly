@@ -21,5 +21,11 @@ pandas>=2.0
 # networks and the CUDA wheels are on PyPI anyway.
 torch>=2.2
 
+# Figures and the reassembly animation (scripts/render_gif.py,
+# scripts/visualize_reassembly.py). Optional; pyglet only for an on-screen window.
+matplotlib>=3.7
+pillow>=10.0
+# pyglet<2
+
 # Tests.
 pytest>=7.4

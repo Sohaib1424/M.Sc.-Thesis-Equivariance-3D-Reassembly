@@ -44,6 +44,7 @@ cores have little to offer. Measure before trusting it.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
@@ -210,6 +211,29 @@ class Config:
 
     # -- optimisation -----------------------------------------------------
     epochs: int = 40
+    steps_per_epoch: int = 800
+    """
+    Batches per GPU per epoch. ``0`` means one full pass over the training
+    split, which is what an epoch used to be.
+
+    An epoch is the unit the validation curve, the checkpoints, the time
+    projection and the learning-rate schedule are counted in, so it should be a
+    fixed amount of training. A pass is not one: it moves with
+    ``modes_per_scene``, the split, ``limit_train``, the number of GPUs and
+    balancing -- which draws with replacement, so under it "a pass" is not even
+    well defined. A fixed count keeps every one of those fixed.
+
+    800 is roughly one pass over the Everyday training split on two GPUs at
+    ``batch_size=2`` (800 x 2 x 2 = 3,200 scenes, against about 400 objects x 8
+    modes), so the two-GPU Kaggle numbers stay comparable with earlier runs. On
+    one GPU the same epoch is 1,600 scenes: half the data, the same number of
+    optimizer steps. The draws are seeded and every GPU gets exactly the same
+    number of them, which it must -- every GPU takes part in every step.
+
+    For a smoke test with ``limit_train``, set this small or to 0: 800 steps
+    over 40 scenes is forty passes. The startup banner says how many passes an
+    epoch is.
+    """
     batch_size: int = 2
     """
     Scenes per step *per device*. A scene is a whole graph, so this is not
@@ -230,12 +254,14 @@ class Config:
     """
     Skip any batch with more vertices than this, before attempting it. 0 is off.
 
-    The point is *when* the decision is made. An out-of-memory error arrives on
-    whichever rank happened to be tighter, so a skip decided from one cannot be
-    made consistently across ranks -- and a rank that skips while its peer
-    proceeds leaves the peer waiting forever in the gradient all-reduce. Vertex
-    count is knowable before the forward and identical on every rank, so this
-    skips collectively by construction.
+    Optional. A batch that runs out of memory is retried once with gradient
+    checkpointing and skipped only if that fails too, on one GPU or several:
+    each GPU's batches are its own business until the optimizer step, so a GPU
+    that skips cannot leave another waiting. (This setting used to be sold as
+    the one safe way to skip under DDP, "identical on every rank". It was not
+    identical -- each rank holds different scenes -- and the skip it made was
+    one of the ways the ranks fell out of step.) The limit only saves the two
+    doomed attempts on a batch known not to fit.
 
     Preflight reports the value to use: it is the largest batch it could
     actually fit, with a margin. Batches skipped this way are counted and named
@@ -260,14 +286,38 @@ class Config:
     expressed in forward passes, so changing it does not shift warmup.
     """
     amp: bool = False
+    perturb_on_device: bool = True
+    """
+    Ship only the assembled copy of each scene through the data loader and
+    derive the perturbed copy on the GPU, by rotation (see
+    :func:`reassembly.data.features.perturb_on_device`). The result is the same
+    tensors to float32 round-off; what changes is where the work happens.
+
+    Measured, per batch of two scenes, CPU side: 3% less loader time and 4%
+    fewer bytes on a median 10k-vertex scene, 23% and 18% on an 82k-vertex one.
+    Modest, because the perturbed copy was already made by rotating rather than
+    recomputing. The same measurement showed where the loader's time actually
+    went -- the cross-fragment pair lists, 89% of a batch's bytes -- and on a
+    GPU those are now built on the device too (``_collate_samples``); with
+    both, the loader does 18-40% of the work it did and ships 6-27% of the
+    bytes. The GPU's side of the trade (three batched matmuls and one index
+    build per step) could not be timed without a GPU. ``docs/PROJECT-STATE.md``
+    has the table.
+    """
 
     # -- runtime ----------------------------------------------------------
     out_dir: str = "runs/vgat"
     workers: int = 2
     seed: int = 0
     devices: int = -1
-    """GPUs to use. ``-1`` means all visible (2 on Kaggle), ``1`` forces a
-    single device, ``0`` forces CPU."""
+    """
+    GPUs to use: ``-1`` every visible GPU (2 on Kaggle), ``1`` one, ``N`` the
+    first N, ``0`` the CPU. More than one runs one process per GPU; each draws
+    its own share of every epoch, and the gradients are averaged over all of
+    them once per optimizer step (:mod:`reassembly.distributed`). With no GPU
+    at all, ``devices >= 2`` still runs that many processes on the CPU over
+    gloo -- slow, and meant for testing the multi-process path.
+    """
     max_hours: float = 11.0
     """Kaggle cuts a session at 12 hours. Stop cleanly before that with a
     checkpoint written, rather than losing the epoch in progress."""
@@ -302,6 +352,16 @@ class Config:
     objects of one category and neither a useful smoke test nor a representative
     subset.
     """
+    max_objects: Optional[int] = None
+    """
+    Train on only this many distinct OBJECTS (every break pattern of each),
+    evenly strided across the sorted training catalogue so every category can
+    appear. For the object-count scaling experiment
+    (``python -m scripts.scaling_sweep``), whose question is how error moves
+    with the number of *shapes* -- which ``limit_train`` cannot ask, since it
+    thins (object, pattern) pairs and so keeps nearly every shape. Validation
+    is unaffected.
+    """
 
     def __post_init__(self) -> None:
         if self.channels % self.heads:
@@ -312,6 +372,12 @@ class Config:
             raise ValueError(f"label_method must be dihedral or coincidence")
         if self.batch_size < 1 or self.epochs < 1:
             raise ValueError("batch_size and epochs must be >= 1")
+        if self.steps_per_epoch < 0:
+            raise ValueError("steps_per_epoch must be >= 0 (0 = one full pass)")
+        if self.max_objects is not None and self.max_objects < 1:
+            raise ValueError("max_objects must be >= 1, or None for every object")
+        if self.accumulate < 1:
+            raise ValueError("accumulate must be >= 1")
         from .data.catalog import BALANCE_SCHEMES, SPLIT_MODES
 
         if self.split_by not in SPLIT_MODES:
@@ -441,6 +507,12 @@ class BreakingBadScenes:
         )
         if config.split_by == "object" and split in ("train", "val") and official:
             _assert_splits_disjoint(full, config, official)
+        if split == "train" and config.max_objects:
+            objects = list(self.catalog.objects)
+            if config.max_objects < len(objects):
+                keep = np.linspace(0, len(objects) - 1, config.max_objects).round().astype(int)
+                self.catalog = dataclasses.replace(
+                    self.catalog, objects=tuple(objects[i] for i in dict.fromkeys(keep.tolist())))
         if not self.catalog.objects:
             raise FileNotFoundError(
                 f"no objects left in split {split!r} "
@@ -525,17 +597,68 @@ class BreakingBadScenes:
             self._order.append(directory)
         return self._readers[directory]
 
-    def __getitem__(self, i: int):
-        from .data.features import build_scene
-        from .mesh.correspondence import compute_scene_correspondence
+    def key(self, i: int) -> str:
+        """``<object key>/<mode>`` -- the name every log, tally and script uses."""
+        scene_index, mode = self.items[i]
+        return f"{self.catalog.objects[scene_index].key}/{mode}"
+
+    def index_of(self, key: str) -> Optional[int]:
+        """The item whose :meth:`key` is ``key``, or ``None``."""
+        for i in range(len(self.items)):
+            if self.key(i) == key:
+                return i
+        return None
+
+    def meshes(self, i: int) -> list:
+        """Item ``i``'s fragments as loaded, in the ASSEMBLED frame (trimesh)."""
+        scene_index, mode = self.items[i]
+        return self._reader(self._directories[(scene_index, mode)]).load_mode(mode).fragments
+
+    def labels(self, meshes) -> list:
+        """Per-fragment boolean fracture masks, by ``config.label_method``."""
         from .mesh.fracture import fracture_face_mask, fracture_vertex_masks
 
         config = self.config
-        scene_index, mode = self.items[i]
-        key = f"{self.catalog.objects[scene_index].key}/{mode}"
+        if config.label_method == "coincidence":
+            return fracture_vertex_masks(meshes)
+        masks = []
+        for mesh in meshes:
+            v, f = np.asarray(mesh.vertices, dtype=np.float64), np.asarray(mesh.faces)
+            labelled = fracture_face_mask(
+                v, f, sharp_threshold=config.sharp_threshold,
+                min_faces=config.min_fracture_faces,
+            ).face_mask
+            mask = np.zeros(len(v), bool)
+            if labelled.any():
+                mask[np.unique(f[labelled])] = True
+            masks.append(mask)
+        return masks
 
-        result = self._reader(self._directories[(scene_index, mode)]).load_mode(mode)
-        meshes = result.fragments
+    def clusters(self, meshes) -> Optional[np.ndarray]:
+        """Coincidence clusters for the embedding loss, or ``None`` when off."""
+        from .mesh.correspondence import compute_scene_correspondence
+
+        if not self.config.supervise_embedding:
+            return None
+        # Coincidence clusters are defined in the ASSEMBLED frame. Computed
+        # here, before any perturbation -- afterwards nothing coincides and the
+        # labels come back empty while looking like a result.
+        per_fragment, _ = compute_scene_correspondence(meshes)
+        return np.concatenate(per_fragment) if per_fragment else None
+
+    def build(self, i: int, *, rotations=None, seed=None, perturb=None):
+        """
+        Item ``i`` as the loop sees it, with the perturbation overridable:
+        ``rotations`` (per fragment) or ``seed`` replace the item's own stable
+        draw, ``perturb`` overrides ``config.perturb_on_device``. The scripts
+        use this to rebuild exactly what training saw, or a chosen variant.
+        """
+        from .data.features import build_scene
+
+        config = self.config
+        scene_index, _mode = self.items[i]
+        key = self.key(i)
+        meshes = self.meshes(i)
         if len(meshes) < 2:
             # A single-fragment mode has no cross-fragment structure and no
             # relative pose to learn from. Returned as a named Skipped rather
@@ -544,41 +667,49 @@ class BreakingBadScenes:
 
         vertices = [np.asarray(m.vertices, dtype=np.float64) for m in meshes]
         faces = [np.asarray(m.faces) for m in meshes]
+        if not all(np.isfinite(v).all() for v in vertices):
+            # A non-finite coordinate cannot be repaired the way a degenerate
+            # normal can -- there is no right value to put there -- and it would
+            # reach every feature through the centroid and the scale. Named, so
+            # a scene that does this every epoch shows up as the same name.
+            return Skipped(key, "non-finite vertex coordinates")
 
-        if config.label_method == "coincidence":
-            masks = fracture_vertex_masks(meshes)
-        else:
-            masks = []
-            for v, f in zip(vertices, faces):
-                labelled = fracture_face_mask(
-                    v, f, sharp_threshold=config.sharp_threshold,
-                    min_faces=config.min_fracture_faces,
-                ).face_mask
-                mask = np.zeros(len(v), bool)
-                if labelled.any():
-                    mask[np.unique(f[labelled])] = True
-                masks.append(mask)
-
-        cluster = None
-        if config.supervise_embedding:
-            # Coincidence clusters are defined in the ASSEMBLED frame. Computed
-            # here, before any perturbation -- afterwards nothing coincides and
-            # the labels come back empty while looking like a result.
-            per_fragment, _ = compute_scene_correspondence(meshes)
-            cluster = np.concatenate(per_fragment) if per_fragment else None
-
-        seed = (hash((key, self.epoch_seed)) ^ config.seed) & 0xFFFFFFFF
+        draw = stable_seed(key, self.epoch_seed, config.seed) if seed is None else seed
         return build_scene(
-            vertices, faces, masks,
+            vertices, faces, self.labels(meshes),
             category=self.catalog.objects[scene_index].category or "(uncategorised)",
-            rng=np.random.default_rng(seed),
+            rotations=rotations,
+            rng=np.random.default_rng(draw),
             normalize_mode=config.normalize_mode,
             token_mode=config.token_mode,
             token_metric=config.token_metric,
             tokens_per_scene=config.tokens_per_scene,
             max_tokens_per_fragment=None,
-            cluster=cluster,
+            cluster=self.clusters(meshes),
+            key=key,
+            perturb=(not config.perturb_on_device) if perturb is None else perturb,
         )
+
+    def __getitem__(self, i: int):
+        return self.build(i)
+
+
+def stable_seed(*parts) -> int:
+    """
+    A seed that is the same in every process, every session and every Python.
+
+    The scene seed used to be ``hash((key, epoch))``. Python salts ``str``
+    hashes per *interpreter* (``PYTHONHASHSEED``), so the same scene drew a
+    different perturbation and different tokens in every session and in every
+    spawned GPU process -- including the validation set, whose rotations are
+    meant to stay fixed so that the numbers before and after a resume measure
+    the same thing. Within one session it looked stable, which is why it went
+    unnoticed. A cryptographic digest has no salt.
+    """
+    import hashlib
+
+    text = "\x1f".join(str(part) for part in parts).encode()
+    return int.from_bytes(hashlib.blake2b(text, digest_size=8).digest(), "little")
 
 
 class Skipped(NamedTuple):
@@ -624,7 +755,7 @@ def _assert_splits_disjoint(catalog, config: Config, official: Dict) -> None:
             )
 
 
-def _collate_samples(samples):
+def _collate_samples(samples, pairs: bool = False):
     """
     Separate the unusable samples from the real ones, and pass the *names* of
     what was dropped through to the loop.
@@ -639,7 +770,11 @@ def _collate_samples(samples):
 
     kept = [s for s in samples if not isinstance(s, Skipped)]
     dropped = [s for s in samples if isinstance(s, Skipped)]
-    return (collate(kept) if kept else None), dropped
+    # No pair lists by default: they are ~90% of a batch's bytes and are built
+    # on the device in `_forward` instead (`data.features.complete_batch`).
+    # `pairs=True` builds them here -- right when training on the CPU, where
+    # the loader's worker processes are the parallel part.
+    return (collate(kept, pairs=pairs) if kept else None), dropped
 
 
 # ==========================================================================
@@ -746,9 +881,13 @@ def _to_device(batch, device):
     return type(batch)(**moved)
 
 
-def _forward(model, batch, criterion, config):
+def _forward(model, batch, criterion, config, keep=None):
     """
     One forward pass and the full loss breakdown.
+
+    ``keep``, a dict, receives the completed batch and the whole prediction --
+    for evaluation, which assembles from the embeddings as well as the
+    rotations.
 
     The predicted rotation is applied to the *centred, normalised* input and
     compared against the assembled target, which is the convention derived in
@@ -757,9 +896,10 @@ def _forward(model, batch, criterion, config):
     """
     import torch
 
-    from .data.features import clustered_vertices
+    from .data.features import clustered_vertices, complete_batch
     from .nn.model import apply_rotation
 
+    batch = complete_batch(batch)
     prediction = model(
         batch.node_features, batch.edge_index, batch.edge_attr,
         batch.vertex_fragment, batch.num_fragments,
@@ -767,6 +907,8 @@ def _forward(model, batch, criterion, config):
         token_query=batch.token_query, token_key=batch.token_key,
     )
     R = prediction.rotation
+    if keep is not None:
+        keep["batch"], keep["prediction"] = batch, prediction
     fragment = batch.vertex_fragment
     edge_fragment = fragment[batch.edge_index[0]]
 
@@ -852,252 +994,572 @@ def _metrics(predicted, target,
 def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
               device="cpu", step=0, total_steps=1, label="train",
               show_progress=True, deadline=None, stop_signal=None,
-              on_checkpoint=None, distributed=False):
+              on_checkpoint=None, distributed=False, on_prediction=None):
     """
     One pass over ``loader``. Training when ``optimizer`` is given, else eval.
 
     Returns ``(summary, step, stopped)``. ``summary`` carries every loss term
     separately as well as the total, because the terms have very different
     natural scales and the only way to learn the balance is to watch them move.
+
+    How a step is built -- the same on one GPU or several
+    ------------------------------------------------------
+    Every batch is one *micro-batch*. Its gradient is computed on its own, with
+    the gradient accumulated so far set aside (:func:`_train_micro_batch`), and
+    merged in only if it came out usable. So anything can happen to one batch
+    -- too many vertices, a non-finite loss or gradient, an out-of-memory error
+    even after a retry with gradient checkpointing -- and it is simply absent
+    from the step, while every other batch's contribution stands.
+
+    Every ``accumulate`` batches, by *position* rather than by success, the step
+    is finished (:func:`_finish_step`): the fragments that contributed are
+    counted across every GPU, the summed gradient is all-reduced, divided by
+    that count, clipped and applied. Because the step boundary depends only on
+    the batch position, every GPU reaches every boundary -- whatever each one
+    skipped -- and that is the only place the GPUs wait for each other. A
+    trailing group cut short by the end of the loader is stepped rather than
+    carried into the next epoch.
+
+    Stopping (the time budget, or a SIGTERM) is voted at the same boundaries,
+    so the GPUs stop together at one step instead of one leaving the others
+    blocked in a collective.
+
+    ``distributed=True`` requires a running process group; the summary is then
+    gathered from every GPU, so it describes the whole epoch rather than one
+    GPU's share of it.
+
+    ``on_prediction(batch, prediction)`` is called in eval mode for every batch
+    that was scored -- :func:`evaluate` uses it to assemble.
     """
     import torch
 
+    from . import distributed as dist
+
     training = optimizer is not None
     model.train(training)
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    world_rank = dist.rank() if distributed else 0
+    prefix = f"[gpu{world_rank}] " if distributed else ""
 
-    sums: Dict[str, float] = {}
-    counts = 0
-    fragments = 0
-    skipped = 0
-    oom = 0
-    # Counted separately from `skipped`, because the two mean different things:
-    # a skip is usually a size decision, a non-finite loss is a defect in the
-    # data or the numerics and deserves to be named in the epoch summary.
-    nonfinite = 0
-    # Fragments accumulated since the last optimizer step. Resets on every step,
-    # so a group cut short by the end of an epoch cannot normalise the next
-    # epoch's first step by the wrong total.
-    group_weight = 0.0
-    dropped: Dict[str, str] = {}
-    predictions, targets = [], []
-    categories: List[str] = []
+    tally = _new_tally()
+    # Fragments this GPU has contributed since the last optimizer step, and
+    # how many batch positions that group has used.
+    pending = 0.0
+    in_group = 0
     bar = Progress(len(loader), prefix=f"  {label:5s}", enabled=show_progress)
     stopped = False
 
     interval = max(config.checkpoint_every_minutes, 0.0) * 60.0
     next_save = time.time() + interval if (training and on_checkpoint and interval) else None
 
+    def want_stop() -> bool:
+        if stop_signal is not None and stop_signal.triggered:
+            return True
+        return deadline is not None and time.time() > deadline
+
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
         for index, (batch, unusable) in enumerate(loader):
+            tally["attempted"] += 1
             for item in unusable:
-                dropped[item.key] = item.reason
-            if batch is None or batch.num_fragments == 0:
-                skipped += 1
-                bar.update(1)
-                continue
-            batch = _to_device(batch, device)
+                tally["dropped"][item.key] = item.reason
+                _note_failure(tally, item.key, item.reason)
 
             if training:
+                # Position-based, like everything that decides a step: the
+                # rate must be the same on every GPU, whatever each skipped.
                 rate = learning_rate(step, total_steps, config)
                 for group in optimizer.param_groups:
                     group["lr"] = rate
 
-            # Decided *before* the forward, and identically on every rank, so
-            # the ranks stay in step. A skip decided from a caught
-            # OutOfMemoryError cannot be: the error arrives on whichever rank
-            # happened to be tighter on memory, and a rank that skips while its
-            # peer proceeds leaves the peer waiting forever in the gradient
-            # all-reduce. Size is knowable in advance and agrees across ranks
-            # by construction.
-            vertices = int(batch.node_features.shape[0])
-            if config.max_vertices_per_batch and vertices > config.max_vertices_per_batch:
-                oom += 1
-                dropped[f"toobig:batch{index}"] = (
-                    f"{vertices:,} vertices over the "
-                    f"{config.max_vertices_per_batch:,} limit, "
-                    f"{batch.num_fragments} fragments"
-                )
-                bar.update(1)
-                continue
+            report = None
+            if batch is None or batch.num_fragments == 0:
+                tally["skipped"] += 1
+            else:
+                _note_repairs(tally, batch)
+                batch = _to_device(batch, device)
+                vertices = int(batch.vertex_fragment.numel())
+                names = _batch_name(batch, index)
+                if config.max_vertices_per_batch and vertices > config.max_vertices_per_batch:
+                    # Decided before the forward. It no longer has to be decided
+                    # identically on every GPU -- nothing here waits on another
+                    # GPU -- but attempting a batch known not to fit costs a
+                    # forward and an allocator flush for nothing.
+                    reason = (f"{vertices:,} vertices over the "
+                              f"{config.max_vertices_per_batch:,} limit, "
+                              f"{batch.num_fragments} fragments")
+                    tally["oom"] += 1
+                    tally["skipped"] += 1
+                    tally["dropped"][f"toobig:{names}"] = reason
+                    _note_batch_failure(tally, batch, "too many vertices")
+                elif training:
+                    contributed, report, outcome, detail = _train_micro_batch(
+                        model, batch, criterion, config, scaler=scaler,
+                        parameters=parameters, device=device)
+                    pending += contributed
+                    _count_outcome(tally, outcome, batch, names, vertices, detail,
+                                   prefix, label, index)
+                else:
+                    holder = {} if on_prediction is not None else None
+                    report, R, outcome, detail = _eval_batch(
+                        model, batch, criterion, config, device=device, keep=holder)
+                    _count_outcome(tally, outcome, batch, names, vertices, detail,
+                                   prefix, label, index)
+                    if R is not None and holder:
+                        on_prediction(holder["batch"], holder["prediction"])
+                    if R is not None:
+                        tally["predictions"].append(R.detach().float().cpu())
+                        tally["targets"].append(batch.target_rotation.detach().float().cpu())
+                        # One category label per FRAGMENT, not per scene, so it
+                        # lines up with the per-fragment angles `_metrics`
+                        # produces. Taken from the batch rather than from the
+                        # loader's position, because samples get dropped and
+                        # position stops indexing the item list from the first
+                        # drop onward.
+                        if batch.categories:
+                            scene_of = batch.fragment_scene.detach().cpu().tolist()
+                            tally["categories"].extend(batch.categories[s] for s in scene_of)
 
-            try:
-                with torch.autocast(device_type=torch.device(device).type,
-                                    enabled=bool(scaler)):
-                    loss, report, R = _forward(model, batch, criterion, config)
-                # BEFORE the backward, not after it. This check used to sit
-                # below the backward, where it was decorative: by the time it
-                # ran, `backward` had already written NaN into `.grad` for every
-                # parameter, and on a syncing micro-batch DDP had already
-                # all-reduced that NaN to the peer. The step counter said
-                # "skipped" while the optimizer state said otherwise -- and once
-                # Adam's moments are NaN they never recover, so the run
-                # continues for hours producing nothing.
-                #
-                # `continue` inside the try is deliberate: it leaves
-                # `group_weight` untouched, which is correct, because this
-                # micro-batch contributed no gradient at all.
-                if not torch.isfinite(loss):
-                    skipped += 1
-                    nonfinite += 1
-                    dropped[f"nonfinite:batch{index}"] = (
-                        f"{vertices:,} vertices, {batch.num_fragments} fragments, "
-                        f"loss={float(loss.detach()):.4g}"
-                    )
-                    print(f"\n  [warn] non-finite loss at {label} batch {index}; "
-                          f"skipped before the backward")
-                    bar.update(1)
-                    continue
-                if training:
-                    # Weighted by the micro-batch's fragment count, not divided
-                    # by `accumulate`. Every loss term is a *mean over
-                    # fragments*, so multiplying by the count turns it back into
-                    # a sum; the sum is divided by the group's total fragments
-                    # just before the optimizer steps. That makes
-                    # `--batch-size 1 --accumulate 2` produce the same gradient
-                    # as `--batch-size 2`, which `loss / accumulate` does not:
-                    # it weights each *scene* equally, and a scene holds 2 to 35
-                    # fragments. Measured on a 2-fragment and an 8-fragment
-                    # scene, the two gradients had cosine similarity 0.80 and
-                    # norms 45% apart -- a silent re-weighting of the objective,
-                    # applied by a flag preflight recommends for memory reasons.
-                    #
-                    # It also fixes the skipped-batch case for free: a group
-                    # that loses a micro-batch to an OOM divides by what
-                    # actually contributed, where `/ accumulate` would have made
-                    # the step too small.
-                    micro_weight = float(batch.num_fragments)
-                    group_weight += micro_weight
-                    scaled = loss * micro_weight
-                    # Under DDP, every `backward` all-reduces the whole gradient
-                    # -- 928k parameters -- and during accumulation all but the
-                    # last of those is thrown away by the very next micro-batch.
-                    # `no_sync` skips the ones that cannot matter. It is not an
-                    # optimisation to reach for later: preflight *recommends*
-                    # `--accumulate 2` whenever the batch has to be halved, so
-                    # without this the recommended configuration pays double.
-                    syncing = (index + 1) % config.accumulate == 0
-                    if not syncing and hasattr(model, "no_sync"):
-                        with model.no_sync():
-                            (scaler.scale(scaled) if scaler else scaled).backward()
-                    else:
-                        (scaler.scale(scaled) if scaler else scaled).backward()
-            except torch.cuda.OutOfMemoryError:
-                # The backward is inside this block, not outside it. It was
-                # outside, which meant the guard covered the *cheaper* half:
-                # peak memory is in the backward, and that is exactly where a
-                # real run died -- an uncaught OutOfMemoryError in
-                # `scaled.backward()` ending epoch 6 of a six-epoch run.
-                #
-                # Breaking Bad's largest fragment is 83,039 vertices and a
-                # preflight sampling a dozen scenes will not have seen it, so a
-                # batch that fits everything measured can still be handed
-                # something several times larger at hour six.
-                oom += 1
-                vertices = int(batch.node_features.shape[0])
-                dropped[f"OOM:batch{index}"] = (
-                    f"{vertices:,} vertices, {batch.num_fragments} fragments")
-                model.zero_grad(set_to_none=True)
-                # `zero_grad` throws away the WHOLE accumulation group, not just
-                # this micro-batch -- so the weight bookkeeping has to be reset
-                # with it. It was not, and `group_weight` is only cleared at the
-                # optimizer step, so the next step divided the surviving
-                # gradients by a denominator that still counted the fragments
-                # whose gradients had just been discarded. A group of two 8- and
-                # 24-fragment scenes losing the second one stepped at 8/32 of
-                # the intended size, silently, on exactly the batches large
-                # enough to be interesting.
-                group_weight = 0.0
-                torch.cuda.empty_cache()
-                if distributed:
-                    # Under DDP this rank may already have all-reduced some
-                    # gradient buckets before running out, so its peer is now
-                    # waiting on buckets that will never come. Continuing would
-                    # hang the job silently, which is worse than stopping: the
-                    # caller checkpoints, and the run resumes with a limit set.
-                    print(f"\n  [oom] batch {index} ({vertices:,} vertices) did "
-                          f"not fit, and under DDP the ranks cannot recover "
-                          f"independently -- stopping cleanly so the epoch is "
-                          f"checkpointed.\n        Resume with "
-                          f"--max-vertices-per-batch {int(vertices * 0.9)} to "
-                          f"skip batches like it before they are attempted.")
-                    stopped = True
-                    break
-                print(f"\n  [oom] batch {index} ({vertices:,} vertices) did not "
-                      f"fit; skipped. Set --max-vertices-per-batch "
-                      f"{int(vertices * 0.9)} to skip these up front.")
-                bar.update(1)
-                continue
+            if report is not None:
+                weight = int(batch.num_fragments)
+                for name, value in report.items():
+                    tally["sums"][name] = tally["sums"].get(name, 0.0) + value * weight
+                tally["fragments"] += weight
+                tally["batches"] += 1
 
             if training:
-                if (index + 1) % config.accumulate == 0:
-                    if scaler:
-                        scaler.unscale_(optimizer)
-                    # Sum of fragment-weighted gradients -> mean over the
-                    # group's fragments. After `unscale_`, so the AMP scale is
-                    # already off, and before the clip, so `grad_clip` means the
-                    # same thing at every accumulation setting.
-                    if group_weight > 0:
-                        inverse = 1.0 / group_weight
-                        for parameter in model.parameters():
-                            if parameter.grad is not None:
-                                parameter.grad.mul_(inverse)
-                    group_weight = 0.0
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-                    if scaler:
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
                 step += 1
-            else:
-                predictions.append(R.detach().float().cpu())
-                targets.append(batch.target_rotation.detach().float().cpu())
-                # One category label per FRAGMENT, not per scene, so it lines
-                # up with the per-fragment angles `_metrics` produces. Taken
-                # from the batch rather than from the loader's position,
-                # because samples get dropped and position stops indexing the
-                # item list from the first drop onward.
-                if batch.categories:
-                    scene_of = batch.fragment_scene.detach().cpu().tolist()
-                    categories.extend(batch.categories[s] for s in scene_of)
-
-            weight = int(batch.num_fragments)
-            for name, value in report.items():
-                sums[name] = sums.get(name, 0.0) + value * weight
-            fragments += weight
-            counts += 1
-            bar.update(1, f"loss {report['total']:.4f}")
-
-            now = time.time()
-            if next_save is not None and now > next_save and step % config.accumulate == 0:
-                # Mid-epoch insurance. An epoch over the full training set can
-                # outlast a session, and a checkpoint written only at epoch
-                # boundaries would then never be written at all.
-                on_checkpoint(step, completed=False)
-                next_save = now + interval
-            if stop_signal is not None and stop_signal.triggered:
+                in_group += 1
+                if in_group == config.accumulate:
+                    stop_vote = _finish_step(
+                        optimizer, scaler, config, parameters, pending, tally,
+                        distributed=distributed, device=device, want_stop=want_stop())
+                    pending, in_group = 0.0, 0
+                    now = time.time()
+                    if next_save is not None and now > next_save and not stop_vote:
+                        # Mid-epoch insurance, right after a step so no half
+                        # accumulated gradient is in flight. Only rank 0
+                        # writes; the callback knows which rank it is on.
+                        on_checkpoint(step, completed=False)
+                        next_save = now + interval
+                    if stop_vote:
+                        stopped = True
+                        if show_progress:
+                            reason = ("signal" if stop_signal is not None and
+                                      stop_signal.triggered else "time budget")
+                            print(f"\n  [stop] {reason} -- every GPU stops at this "
+                                  f"step (batch {index + 1} of {len(loader)})")
+                        bar.update(1)
+                        break
+            elif want_stop():
+                # Validation holds no collective inside the loop, so a GPU may
+                # stop early on its own; the results are gathered afterwards.
                 stopped = True
+                if show_progress:
+                    print(f"\n  [time] budget reached during {label}; stopping cleanly")
+                bar.update(1)
                 break
-            if deadline is not None and now > deadline:
-                stopped = True
-                print(f"\n  [time] budget reached during {label}; stopping cleanly")
-                break
+            bar.update(1, f"loss {report['total']:.4f}" if report else "")
+
+        if training and in_group:
+            # Every GPU has the same number of batches, so every GPU is here
+            # with the same partial group. Stepping it is what keeps its
+            # gradient out of the next epoch's first step.
+            _finish_step(optimizer, scaler, config, parameters, pending, tally,
+                         distributed=distributed, device=device, want_stop=False)
     bar.close()
 
-    summary = {k: v / max(fragments, 1) for k, v in sums.items()}
-    summary["batches"] = counts
+    if distributed:
+        tally = _merge_tallies(dist.gather(tally))
+    return _summarise_tally(tally), step, stopped
+
+
+# --------------------------------------------------------------------------
+# One micro-batch, one step
+# --------------------------------------------------------------------------
+
+def _is_oom(error: BaseException) -> bool:
+    """A CUDA out-of-memory error, including the plain-RuntimeError forms
+    cuBLAS and cuDNN raise when their workspace allocation fails."""
+    import torch
+
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return True
+    return isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
+
+
+def _release_cache(device) -> None:
+    import torch
+
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+class _checkpointing:
+    """
+    Force gradient checkpointing on every attention layer, for one retry.
+
+    Intra layers keep their projections, cross layers their pair gathers, in
+    the forward pass by default; with this on, both are recomputed in the
+    backward instead. Outputs and gradients are identical -- only the peak
+    memory and the time change -- so a scene that fits this way contributes
+    exactly what it would have if it had fitted the first time.
+    """
+
+    def __init__(self, model, forced: bool):
+        self.model, self.forced, self.saved = model, forced, []
+
+    def __enter__(self):
+        if self.forced:
+            from .nn.cross import VNCrossFragmentAttention
+            from .nn.gat import VNGraphAttention
+
+            for module in self.model.modules():
+                if isinstance(module, (VNGraphAttention, VNCrossFragmentAttention)):
+                    self.saved.append((module, module.checkpoint))
+                    module.checkpoint = True
+        return self
+
+    def __exit__(self, *exc):
+        for module, flag in self.saved:
+            module.checkpoint = flag
+        self.saved = []
+        return False
+
+
+def _take_gradients(parameters) -> list:
+    """Set the accumulated gradient aside, leaving ``.grad`` empty."""
+    taken = [p.grad for p in parameters]
+    for p in parameters:
+        p.grad = None
+    return taken
+
+
+def _clear_gradients(parameters) -> None:
+    for p in parameters:
+        p.grad = None
+
+
+def _restore_gradients(parameters, stash) -> None:
+    for p, g in zip(parameters, stash):
+        p.grad = g
+
+
+def _merge_gradients(parameters, stash) -> None:
+    """``.grad`` (this micro-batch) plus the stash (everything before it)."""
+    for p, g in zip(parameters, stash):
+        if g is None:
+            continue
+        if p.grad is None:
+            p.grad = g
+        else:
+            p.grad.add_(g)
+
+
+def _gradients_finite(parameters) -> bool:
+    import torch
+
+    flags = [torch.isfinite(p.grad).all() for p in parameters if p.grad is not None]
+    return bool(torch.stack(flags).all()) if flags else True
+
+
+def _attempt(model, batch, criterion, config, scaler, weight, forced):
+    """One forward + backward. Raises on out-of-memory; returns its outcome."""
+    import torch
+
+    with _checkpointing(model, forced):
+        with torch.autocast(device_type=batch.vertex_fragment.device.type,
+                            enabled=bool(scaler)):
+            loss, report, _R = _forward(model, batch, criterion, config)
+        value = float(loss.detach())
+        # BEFORE the backward, not after it. A NaN that reaches `backward`
+        # writes NaN into every gradient, and once Adam's moments hold NaN they
+        # never recover: the run continues for hours producing nothing.
+        if not math.isfinite(value):
+            return "nonfinite-loss", report, value
+        # Weighted by the micro-batch's fragment count, not divided by
+        # `accumulate`. Every loss term is a *mean over fragments*, so
+        # multiplying by the count turns it back into a sum; the step divides
+        # the sum by the fragments that actually contributed, on every GPU.
+        # That makes `--batch-size 1 --accumulate 2` the same gradient as
+        # `--batch-size 2`, which `loss / accumulate` is not -- it weights each
+        # *scene* equally, and a scene holds 2 to 35 fragments. Measured on a
+        # 2- and an 8-fragment scene, the two had cosine similarity 0.80.
+        scaled = loss * weight
+        (scaler.scale(scaled) if scaler else scaled).backward()
+    return "ok", report, value
+
+
+def _train_micro_batch(model, batch, criterion, config, *, scaler, parameters,
+                       device):
+    """
+    Add one micro-batch's gradient to the step, or nothing at all.
+
+    Returns ``(fragments contributed, report, outcome, detail)``. The gradient
+    accumulated so far is taken out of ``.grad`` first and merged back at the
+    end, so a failure part-way through a backward -- which leaves a partial
+    gradient behind -- is discarded without touching what earlier micro-batches
+    contributed.
+
+    An out-of-memory error is retried once with gradient checkpointing forced
+    on every layer, which trades time for memory and changes nothing else.
+    Only if that also fails is the batch dropped -- and named, because the
+    batches that run out of memory are the largest scenes, and dropping them
+    silently biases training toward small objects.
+
+    The retry is outside the ``except`` block on purpose: the exception's
+    traceback pins every activation of the failed attempt, and retrying while
+    it is alive would measure the retry against a card that is still full.
+    """
+    weight = float(batch.num_fragments)
+    stash = _take_gradients(parameters)
+    outcome, report, value = "oom", None, float("nan")
+    for attempt in (0, 1):
+        if attempt:
+            _release_cache(device)
+        try:
+            outcome, report, value = _attempt(model, batch, criterion, config,
+                                              scaler, weight, forced=attempt > 0)
+        except Exception as error:                       # noqa: BLE001
+            if not _is_oom(error):
+                _restore_gradients(parameters, stash)
+                raise
+            outcome, report = "oom", None
+            _clear_gradients(parameters)
+            continue
+        if attempt and outcome == "ok":
+            outcome = "recovered"
+        break
+
+    if outcome in ("ok", "recovered") and scaler is None and not _gradients_finite(parameters):
+        # A finite loss can still produce a non-finite gradient -- a norm of a
+        # zero vector, a Gram-Schmidt step on parallel axes. Under AMP this is
+        # the GradScaler's job (it skips the step and lowers the scale), so the
+        # check is fp32 only.
+        outcome = "nonfinite-grad"
+        _clear_gradients(parameters)
+    if outcome in ("ok", "recovered"):
+        _merge_gradients(parameters, stash)
+        return weight, report, outcome, value
+    _restore_gradients(parameters, stash)
+    # No report either: the epoch's loss average describes what was trained
+    # on, and a dropped micro-batch was not.
+    return 0.0, None, outcome, value
+
+
+def _eval_batch(model, batch, criterion, config, *, device, keep=None):
+    """
+    One validation forward. An out-of-memory error skips the batch: under
+    ``no_grad`` checkpointing saves nothing, so there is nothing to retry with.
+    """
+    try:
+        if keep is None:
+            loss, report, R = _forward(model, batch, criterion, config)
+        else:
+            loss, report, R = _forward(model, batch, criterion, config, keep=keep)
+    except Exception as error:                           # noqa: BLE001
+        if not _is_oom(error):
+            raise
+        outcome = "oom"
+    else:
+        value = float(loss.detach())
+        if math.isfinite(value):
+            return report, R, "ok", value
+        return None, None, "nonfinite-loss", value
+    _release_cache(device)
+    return None, None, outcome, float("nan")
+
+
+def _finish_step(optimizer, scaler, config, parameters, pending, tally, *,
+                 distributed, device, want_stop):
+    """
+    Close one optimizer step on every GPU. Returns whether any GPU asked to stop.
+
+    1. One all-reduce of two numbers: the fragments contributed on each GPU,
+       and each GPU's stop vote.
+    2. If anything contributed anywhere, one all-reduce of the summed gradient,
+       then a division by the total fragment count -- so the step is the exact
+       mean over every fragment that contributed on any GPU, and a GPU that
+       dropped a batch shrinks the denominator rather than the step. The
+       division happens after the reduction, on identical numbers, so every
+       replica applies the identical update and they never drift apart.
+    3. Clip, then step -- unless the reduced gradient is non-finite, which
+       every GPU sees identically and so skips identically.
+
+    A step with nothing in it anywhere does not call the optimizer: AdamW would
+    still move the weights, on momentum and weight decay alone.
+    """
+    import torch
+
+    from . import distributed as dist
+
+    total, votes = (dist.sum_scalars([pending, 1.0 if want_stop else 0.0], device)
+                    if distributed else (pending, 1.0 if want_stop else 0.0))
+    if total > 0:
+        if distributed:
+            dist.sum_gradients(parameters)
+        inverse = 1.0 / total
+        for p in parameters:
+            if p.grad is not None:
+                p.grad.mul_(inverse)
+        if scaler:
+            scaler.unscale_(optimizer)
+        norm = torch.nn.utils.clip_grad_norm_(parameters, config.grad_clip)
+        norm = float(norm)
+        if scaler:
+            before = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            if scaler.get_scale() < before:
+                tally["nonfinite_steps"] += 1      # the scaler skipped it
+            else:
+                tally["steps"] += 1
+                tally["grad_norm"] += norm
+        elif math.isfinite(norm):
+            optimizer.step()
+            tally["steps"] += 1
+            tally["grad_norm"] += norm
+        else:
+            tally["nonfinite_steps"] += 1
+    else:
+        tally["empty_steps"] += 1
+    optimizer.zero_grad(set_to_none=True)
+    return votes > 0
+
+
+# --------------------------------------------------------------------------
+# What one pass measured, in a form that adds across GPUs
+# --------------------------------------------------------------------------
+
+def _new_tally() -> Dict:
+    return {
+        "sums": {}, "fragments": 0, "batches": 0, "attempted": 0,
+        "skipped": 0, "oom": 0, "oom_recovered": 0, "nonfinite": 0,
+        "steps": 0, "empty_steps": 0, "nonfinite_steps": 0, "grad_norm": 0.0,
+        "repaired_faces": 0, "zero_normals": 0, "repaired": {},
+        "dropped": {}, "failures": {},
+        "predictions": [], "targets": [], "categories": [],
+    }
+
+
+# Counted once per optimizer step on EVERY GPU -- the steps are shared events,
+# so summing them across GPUs would count each one `world` times.
+_PER_STEP = ("steps", "empty_steps", "nonfinite_steps", "grad_norm")
+
+
+def _merge_tallies(tallies: Sequence[Dict]) -> Dict:
+    merged = _new_tally()
+    for key in _PER_STEP:
+        merged[key] = tallies[0][key] if tallies else merged[key]
+    for tally in tallies:
+        for key, value in tally.items():
+            if key in _PER_STEP:
+                continue
+            if key == "sums":
+                for name, total in value.items():
+                    merged["sums"][name] = merged["sums"].get(name, 0.0) + total
+            elif key in ("dropped", "repaired"):
+                merged[key].update(value)
+            elif key == "failures":
+                for name, (count, reason) in value.items():
+                    previous = merged["failures"].get(name, (0, reason))
+                    merged["failures"][name] = (previous[0] + count, reason)
+            elif isinstance(value, list):
+                merged[key].extend(value)
+            else:
+                merged[key] += value
+    return merged
+
+
+def _summarise_tally(tally: Dict) -> Dict:
+    import torch
+
+    fragments = tally["fragments"]
+    summary = {name: value / max(fragments, 1) for name, value in tally["sums"].items()}
+    summary["batches"] = tally["batches"]
+    summary["attempted"] = tally["attempted"]
     summary["fragments"] = fragments
-    summary["skipped"] = skipped
-    summary["dropped"] = len(dropped)
-    summary["oom"] = oom
-    summary["nonfinite"] = nonfinite
-    summary["dropped_names"] = sorted(dropped)[:20]
-    if predictions:
-        summary.update(_metrics(torch.cat(predictions), torch.cat(targets),
-                                categories=categories))
-    return summary, step, stopped
+    summary["skipped"] = tally["skipped"]
+    summary["dropped"] = len(tally["dropped"])
+    summary["oom"] = tally["oom"]
+    summary["oom_recovered"] = tally["oom_recovered"]
+    summary["nonfinite"] = tally["nonfinite"]
+    summary["repaired_faces"] = tally["repaired_faces"]
+    summary["zero_normals"] = tally["zero_normals"]
+    if tally["steps"] or tally["empty_steps"] or tally["nonfinite_steps"]:
+        summary["steps"] = tally["steps"]
+        summary["empty_steps"] = tally["empty_steps"]
+        summary["nonfinite_steps"] = tally["nonfinite_steps"]
+        if tally["steps"]:
+            summary["grad_norm"] = tally["grad_norm"] / tally["steps"]
+    summary["dropped_names"] = sorted(tally["dropped"])[:20]
+    summary["most_repaired"] = sorted(tally["repaired"].items(),
+                                      key=lambda kv: (-kv[1], kv[0]))[:3]
+    summary["failures"] = dict(tally["failures"])
+    if tally["predictions"]:
+        summary.update(_metrics(torch.cat(tally["predictions"]),
+                                torch.cat(tally["targets"]),
+                                categories=tally["categories"]))
+    return summary
+
+
+def _batch_name(batch, index: int) -> str:
+    keys = [k for k in (batch.scene_keys or ()) if k]
+    return "+".join(keys) if keys else f"batch{index}"
+
+
+def _note_failure(tally: Dict, key: str, reason: str) -> None:
+    count, _ = tally["failures"].get(key, (0, reason))
+    tally["failures"][key] = (count + 1, reason)
+
+
+def _note_batch_failure(tally: Dict, batch, reason: str) -> None:
+    """
+    Charge a failed batch to every scene in it.
+
+    A batch of two that fails cannot say which scene did it -- but the culprit
+    is in every batch it lands in, while its partners change from epoch to
+    epoch, so across epochs the counts single it out.
+    """
+    for key in batch.scene_keys or ():
+        if key:
+            _note_failure(tally, key, reason)
+
+
+def _note_repairs(tally: Dict, batch) -> None:
+    for key, repairs in zip(batch.scene_keys or (), batch.repairs or ()):
+        faces, normals = int(repairs[0]), int(repairs[1])
+        tally["repaired_faces"] += faces
+        tally["zero_normals"] += normals
+        if faces or normals:
+            tally["repaired"][key or "?"] = faces + normals
+
+
+def _count_outcome(tally, outcome, batch, names, vertices, detail, prefix,
+                   label, index) -> None:
+    if outcome == "recovered":
+        tally["oom_recovered"] += 1
+        print(f"\n  {prefix}[oom] {label} batch {index} ({vertices:,} vertices) did "
+              f"not fit; retried with gradient checkpointing and it did")
+    elif outcome == "oom":
+        tally["oom"] += 1
+        tally["skipped"] += 1
+        tally["dropped"][f"OOM:{names}"] = (
+            f"{vertices:,} vertices, {batch.num_fragments} fragments")
+        _note_batch_failure(tally, batch, "out of memory")
+        print(f"\n  {prefix}[oom] {label} batch {index} ({vertices:,} vertices) did "
+              f"not fit even with gradient checkpointing; skipped. "
+              f"--max-vertices-per-batch {int(vertices * 0.9)} skips these up front.")
+    elif outcome in ("nonfinite-loss", "nonfinite-grad"):
+        what = "loss" if outcome == "nonfinite-loss" else "gradient"
+        tally["nonfinite"] += 1
+        tally["skipped"] += 1
+        tally["dropped"][f"nonfinite:{names}"] = (
+            f"{vertices:,} vertices, {batch.num_fragments} fragments, "
+            + (f"loss={detail:.4g}" if what == "loss" else "non-finite gradient"))
+        _note_batch_failure(tally, batch, f"non-finite {what}")
+        print(f"\n  {prefix}[warn] non-finite {what} at {label} batch {index} "
+              f"({names}); dropped from the step")
 
 
 # ==========================================================================
@@ -1179,7 +1641,9 @@ def check_initial_losses(summary: Dict[str, float]) -> List[str]:
 
 def save_checkpoint(path: Path, model, optimizer, config: Config, epoch: int,
                     step: int, history: List[dict], best: float, scaler=None,
-                    completed: bool = True, elapsed: float = 0.0) -> None:
+                    completed: bool = True, elapsed: float = 0.0,
+                    epoch_step: Optional[int] = None,
+                    offenders: Optional[Dict] = None) -> None:
     """
     Everything needed to continue, not just weights.
 
@@ -1192,6 +1656,13 @@ def save_checkpoint(path: Path, model, optimizer, config: Config, epoch: int,
     skipping would silently drop the part of the epoch that never ran.
     ``elapsed`` is cumulative training seconds across *all* sessions, so a run
     spanning four Kaggle sessions still knows how long it has actually trained.
+
+    ``epoch_step`` is the step count when ``epoch`` began. A restarted epoch
+    goes back to it, so the learning-rate schedule of an interrupted run is the
+    schedule of an uninterrupted one instead of running ahead by the part of the
+    epoch that is about to be repeated. ``offenders`` is the run-long tally of
+    scenes that failed, so a scene that fails in every session is still named
+    as a repeat offender after a resume.
     """
     import torch
 
@@ -1207,6 +1678,8 @@ def save_checkpoint(path: Path, model, optimizer, config: Config, epoch: int,
         "history": history,
         "best": best,
         "elapsed": elapsed,
+        "epoch_step": step if epoch_step is None else epoch_step,
+        "offenders": offenders or {},
         "torch_rng": torch.get_rng_state(),
         "numpy_rng": np.random.get_state(),
         "python_rng": random.getstate(),
@@ -1262,7 +1735,8 @@ _DATA = ("label_method", "sharp_threshold", "tokens_per_scene", "token_mode",
          # model is shown, which is a change of problem even though the data on
          # disk is identical.
          "split_by", "fracture_pool", "val_frac", "test_frac", "split_seed",
-         "mode_filter", "official_subset", "balance", "balance_temperature")
+         "mode_filter", "official_subset", "balance", "balance_temperature",
+         "max_objects")
 
 
 def _resume_path(config: Config, default: Path) -> Optional[Path]:
@@ -1371,8 +1845,9 @@ class StopSignal:
 
     A SIGTERM arriving mid-epoch otherwise kills the process where it stands and
     the epoch's work is gone. The handler only sets a flag -- saving from inside
-    a signal handler risks a half-written file, and under DDP it would desync
-    the ranks -- and the batch loop checks it at the next boundary.
+    a signal handler risks a half-written file, and with several GPUs it would
+    desync them -- and the loop checks it at the next optimizer step, where the
+    GPUs vote, so they all stop at the same step.
     """
 
     def __init__(self) -> None:
@@ -1480,58 +1955,97 @@ def _seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def _steps_per_epoch(config: Config, items: int, world: int) -> int:
+    """Batches per GPU per epoch: the fixed count, or one full pass."""
+    if config.steps_per_epoch > 0:
+        return int(config.steps_per_epoch)
+    return max(math.ceil(items / (config.batch_size * max(world, 1))), 1)
+
+
 def _loader(dataset, config: Config, shuffle: bool, rank: int, world: int,
-            epoch: int):
+            epoch: int, pairs_in_worker: bool = False):
+    """
+    Training (``shuffle=True``) or validation loader for one GPU.
+
+    Training draws ``steps_per_epoch * batch_size`` scenes per GPU, or one full
+    pass when it is 0; either way every GPU gets the same number, because every
+    GPU must reach every optimizer step. Validation gives each GPU a disjoint,
+    unpadded shard, so every scene is scored exactly once.
+
+    ``pairs_in_worker`` builds the cross-fragment pair lists in the loader's
+    worker processes instead of on the device -- the right call on a CPU run,
+    the wrong one on a GPU (see ``_collate_samples``).
+    """
+    import functools
+
     import torch
     from torch.utils.data import DataLoader, DistributedSampler
 
-    from .data.sampling import WeightedDistributedSampler
+    from .data.sampling import EpochSampler, ShardSampler, WeightedDistributedSampler
 
+    world = max(int(world), 1)
+    rank = rank if world > 1 else 0
     sampler = None
-    # Balancing applies to TRAINING only -- `shuffle` is what distinguishes the
-    # two call sites. A reweighted validation set would move with the sampler
-    # setting, so two runs could not be compared on it, and the quantity being
-    # reported would no longer be "error on the val split" but "error on the
-    # val split as this run happened to weight it".
-    weights = dataset.sampling_weights() if shuffle else None
-    if weights is not None:
-        sampler = WeightedDistributedSampler(
-            weights, num_replicas=max(world, 1), rank=rank if world > 1 else 0,
-            seed=config.seed,
-        )
-        sampler.set_epoch(epoch)
+    if shuffle:
+        # Balancing applies to TRAINING only. A reweighted validation set would
+        # move with the sampler setting, so two runs could not be compared on
+        # it, and the quantity reported would no longer be "error on the val
+        # split" but "error on the val split as this run happened to weight it".
+        weights = dataset.sampling_weights()
+        if config.steps_per_epoch > 0:
+            sampler = EpochSampler(
+                len(dataset), config.steps_per_epoch * config.batch_size,
+                num_replicas=world, rank=rank, seed=config.seed, weights=weights,
+            )
+        elif weights is not None:
+            sampler = WeightedDistributedSampler(
+                weights, num_replicas=world, rank=rank, seed=config.seed)
+        elif world > 1:
+            sampler = DistributedSampler(dataset, num_replicas=world, rank=rank,
+                                         shuffle=True, drop_last=False,
+                                         seed=config.seed)
+        if sampler is not None:
+            sampler.set_epoch(epoch)
     elif world > 1:
-        sampler = DistributedSampler(dataset, num_replicas=world, rank=rank,
-                                     shuffle=shuffle, drop_last=False)
-        sampler.set_epoch(epoch)
+        sampler = ShardSampler(len(dataset), num_replicas=world, rank=rank)
     return DataLoader(
         dataset, batch_size=config.batch_size,
         shuffle=(shuffle and sampler is None), sampler=sampler,
-        num_workers=config.workers, collate_fn=_collate_samples,
+        num_workers=config.workers,
+        collate_fn=functools.partial(_collate_samples, pairs=pairs_in_worker),
         pin_memory=torch.cuda.is_available(), drop_last=False,
         persistent_workers=config.workers > 0,
     )
 
 
-def train(config: Config) -> List[dict]:
-    """
-    Run training. Spawns one process per GPU when more than one is available.
-
-    Returns the history. On multiple GPUs only rank 0's history is returned;
-    the others train and synchronise gradients but do not report.
-    """
+def _launch_size(config: Config) -> int:
+    """How many processes ``train`` starts: 0 = CPU inline, 1 = one GPU inline."""
     import torch
 
     visible = torch.cuda.device_count()
-    requested = visible if config.devices < 0 else min(config.devices, visible)
-    if config.devices > 1 and visible == 0:
+    if config.devices == 0:
+        return 0
+    if visible == 0:
         # Explicitly asked for several devices on a machine with none. Honoured
         # over gloo rather than silently downgraded -- a run that quietly used
         # one device when told to use two is a benchmark nobody can interpret.
-        requested = config.devices
+        return config.devices if config.devices > 1 else 0
+    return visible if config.devices < 0 else min(config.devices, visible)
+
+
+def train(config: Config) -> List[dict]:
+    """
+    Run training: inline on one GPU (or the CPU), one process per GPU on more.
+
+    Returns the history -- read back from ``out_dir`` when several processes
+    ran, since only rank 0 records it.
+    """
+    requested = _launch_size(config)
     if requested > 1:
         import __main__
         import torch.multiprocessing as mp
+
+        from .distributed import free_port
 
         if not hasattr(__main__, "__file__"):
             # `mp.spawn` re-imports __main__ in each child, and a notebook cell
@@ -1550,30 +2064,79 @@ def train(config: Config) -> List[dict]:
                 "      # then, in the next cell:  !python train_run.py\n"
                 "  Or set devices=1 to train on one GPU from the notebook."
             )
-        mp.spawn(_worker, args=(requested, config), nprocs=requested, join=True)
+        # A fresh port per launch unless one is pinned, so two runs on one
+        # machine -- or a run and the test suite -- cannot collide on it.
+        os.environ.setdefault("MASTER_PORT", str(free_port()))
+        context = mp.spawn(_worker, args=(requested, config), nprocs=requested,
+                           join=False)
+        with _ForwardTerminate(context.processes):
+            while not context.join():
+                pass
         path = Path(config.out_dir) / "history.json"
         return json.loads(path.read_text()) if path.exists() else []
-    return _worker(0, max(requested, 1) if visible else 0, config)
+    return _worker(0, requested, config)
+
+
+class _ForwardTerminate:
+    """
+    Pass a SIGTERM sent to the launching process on to every GPU process.
+
+    Under ``mp.spawn`` the launcher only waits; the GPU processes are its
+    children. A SIGTERM aimed at the launcher -- which is what ``kill`` and most
+    schedulers send -- would otherwise never reach them, and the launcher would
+    die leaving them training into the void. Each GPU process catches it
+    (:class:`StopSignal`), they vote to stop at the next step, rank 0
+    checkpoints, and all of them exit. SIGINT is not forwarded: a terminal
+    delivers Ctrl+C to the whole process group already.
+    """
+
+    def __init__(self, processes):
+        self.processes = processes
+        self.previous = None
+
+    def __enter__(self):
+        import signal
+
+        try:
+            self.previous = signal.signal(signal.SIGTERM, self._forward)
+        except (ValueError, OSError):
+            self.previous = None       # not the main thread: nothing to forward
+        return self
+
+    def _forward(self, signum, frame) -> None:
+        for process in self.processes:
+            if process.is_alive() and process.pid:
+                try:
+                    os.kill(process.pid, signum)
+                except OSError:
+                    pass
+
+    def __exit__(self, *exc):
+        import signal
+
+        if self.previous is not None:
+            signal.signal(signal.SIGTERM, self.previous)
+        return False
 
 
 def _worker(rank: int, world: int, config: Config) -> List[dict]:
+    """
+    One GPU's whole run. ``world`` processes run this at once; ``world <= 1``
+    means this is the only one (``0``: on the CPU).
+
+    Every rank does everything except the printing and the writing: it trains
+    on its share of each epoch, validates its shard, and takes part in the
+    per-step and per-epoch reductions, so every rank ends each epoch holding
+    the same weights and the same summary.
+    """
     import torch
 
-    from torch.nn.parallel import DistributedDataParallel
+    from . import distributed as dist
 
     cuda = torch.cuda.is_available()
     distributed = world > 1
     if distributed:
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29513")
-        # gloo when there is no CUDA, so the multi-process path can be
-        # exercised on a CPU machine. A DDP bug that only appears with two
-        # ranks is otherwise untestable until it wastes a GPU session.
-        torch.distributed.init_process_group("nccl" if cuda else "gloo",
-                                             rank=rank, world_size=world)
-        if cuda:
-            torch.cuda.set_device(rank)
-        device = f"cuda:{rank}" if cuda else "cpu"
+        device = dist.setup(rank, world, cuda)
     elif world >= 1 and cuda:
         device = "cuda:0"
     else:
@@ -1592,65 +2155,65 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
                                   weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler(device.split(":")[0]) if config.amp else None
 
-    if distributed:
-        # find_unused_parameters because a batch whose scenes all lack a
-        # fracture surface skips the cross-fragment layers entirely, leaving
-        # their parameters without gradient. Rare, and a hang six hours in.
-        model = DistributedDataParallel(
-            model, device_ids=[rank] if cuda else None,
-            find_unused_parameters=True,
-        )
-
     history: List[dict] = []
     start_epoch, step, best, elapsed = 0, 0, float("inf"), 0.0
+    offenders: Dict[str, Dict] = {}
     last_path, best_path = out_dir / "last.pt", out_dir / "best.pt"
     load_path = _resume_path(config, last_path)
 
     if config.resume and load_path is not None:
         state = torch.load(load_path, map_location=device, weights_only=False)
         _check_resume_compatible(config, state.get("config", {}), main)
-        core = model.module if hasattr(model, "module") else model
-        core.load_state_dict(state["model"])
+        model.load_state_dict(state["model"])
         if state.get("optimizer"):
             optimizer.load_state_dict(state["optimizer"])
         if scaler and state.get("scaler"):
             scaler.load_state_dict(state["scaler"])
-        # An incomplete epoch is restarted, not skipped past.
-        start_epoch = state["epoch"] + (1 if state.get("completed", True) else 0)
-        step = state["step"]
+        completed = state.get("completed", True)
+        # An incomplete epoch is restarted, not skipped past -- and from the
+        # step it began at, so the schedule does not run ahead by the part of
+        # it that is about to be repeated.
+        start_epoch = state["epoch"] + (1 if completed else 0)
+        step = state["step"] if completed else state.get("epoch_step", state["step"])
         history = state.get("history", [])
         best = state.get("best", float("inf"))
         elapsed = float(state.get("elapsed", 0.0))
+        offenders = dict(state.get("offenders") or {})
         _restore_rng(state, rank)
         if main:
-            partial = "" if state.get("completed", True) else " (epoch was partial, restarting it)"
+            partial = "" if completed else " (epoch was partial, restarting it)"
             print(f"resumed from {load_path}")
             print(f"  epoch {start_epoch}, step {step}, "
                   f"{_hms(elapsed)} trained so far{partial}")
             if history:
                 print(f"  best val geodesic so far: {best:.3f} deg")
-        if load_path.resolve() != last_path.resolve():
+        if main and load_path.resolve() != last_path.resolve():
             # Copy the resume point into *this* run's out_dir straight away.
             # Two failures otherwise break the chain: a session killed during
             # its first epoch leaves out_dir empty, and a session that finds
             # nothing left to do writes nothing at all -- so the next session,
             # resuming from this one's output, starts from scratch and silently
-            # discards every hour spent so far.
+            # discards every hour spent so far. Rank 0 only: every rank used to
+            # write the same file at once.
             save_checkpoint(last_path, model, optimizer, config,
-                            state["epoch"], step, history, best, scaler,
-                            completed=state.get("completed", True),
-                            elapsed=elapsed)
-            if main:
-                print(f"  carried the resume point into {last_path}")
+                            state["epoch"], state["step"], history, best, scaler,
+                            completed=completed, elapsed=elapsed,
+                            epoch_step=state.get("epoch_step"),
+                            offenders=offenders)
+            print(f"  carried the resume point into {last_path}")
     elif main and config.resume:
         # Announced, because "starting from scratch" is one line in a long log
         # and costs a whole session when missed.
         looked = load_path or config.resume_from or last_path
         print(f"no checkpoint at {looked} -- starting from scratch")
 
+    # Each rank initialised from its own seed. From here on the replicas stay
+    # identical by construction; this is where they become identical.
+    dist.broadcast_parameters(model)
+
     train_set = BreakingBadScenes(config, "train", epoch_seed=0)
     val_set = BreakingBadScenes(config, "val", epoch_seed=0)
-    per_epoch = max(math.ceil(len(train_set) / (config.batch_size * max(world, 1))), 1)
+    per_epoch = _steps_per_epoch(config, len(train_set), world)
     total_steps = per_epoch * config.epochs
 
     if main:
@@ -1659,23 +2222,32 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
 
     deadline = time.time() + config.max_hours * 3600
     stopped = False
-    signal_watch = StopSignal().install() if main else StopSignal()
+    # On EVERY rank. A signal that reaches one GPU process and not another
+    # used to kill the one without a handler, leaving its peer blocked in the
+    # next all-reduce; now each rank only sets a flag and they vote.
+    signal_watch = StopSignal().install()
     session_started = time.time()
+    epoch_step = step
 
-    def checkpoint(current_step: int, epoch_index: int, completed: bool):
-        """Only rank 0 writes; the others' weights are identical under DDP."""
+    def checkpoint(current_step: int, epoch_index: int, completed: bool) -> None:
+        """Only rank 0 writes; every rank holds the same weights."""
         if not main:
             return
         save_checkpoint(last_path, model, optimizer, config, epoch_index,
                         current_step, history, best, scaler, completed=completed,
-                        elapsed=elapsed + (time.time() - session_started))
+                        elapsed=elapsed + (time.time() - session_started),
+                        epoch_step=epoch_step, offenders=offenders)
 
     for epoch in range(start_epoch, config.epochs):
         if stopped:
             break
+        epoch_step = step
         train_set = BreakingBadScenes(config, "train", epoch_seed=epoch)
-        train_loader = _loader(train_set, config, True, rank, world, epoch)
-        val_loader = _loader(val_set, config, False, rank, world, epoch)
+        on_cpu = not str(device).startswith("cuda")
+        train_loader = _loader(train_set, config, True, rank, world, epoch,
+                               pairs_in_worker=on_cpu)
+        val_loader = _loader(val_set, config, False, rank, world, epoch,
+                             pairs_in_worker=on_cpu)
 
         if main:
             print(f"\nepoch {epoch + 1}/{config.epochs}"
@@ -1697,7 +2269,11 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
             model, val_loader, criterion, config, device=device,
             label="val", show_progress=main,
             deadline=time.time() + max(config.max_hours * 3600 * 0.05, 300),
+            distributed=distributed,
         )
+        new_failures = _record_offenders(offenders, epoch, train_summary, val_summary)
+        repaired = {"train": train_summary.pop("most_repaired", []),
+                    "val": val_summary.pop("most_repaired", [])}
 
         if epoch == start_epoch and main and config.check_init and not history:
             for complaint in check_initial_losses(train_summary):
@@ -1710,7 +2286,8 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
         print(f"  val    {format_losses(val_summary)}")
         print(f"  val    {format_metrics(val_summary)}")
         _report_category_gap(val_summary, config)
-        _report_dropped(train_summary, val_summary)
+        _report_dropped(train_summary, val_summary, repaired)
+        _report_offenders(offenders, new_failures)
 
         train_summary.pop("dropped_names", None)
         val_summary.pop("dropped_names", None)
@@ -1723,31 +2300,41 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
                "lr": learning_rate(step, total_steps, config),
                # Recorded so the time projection can work in seconds *per step*
                # and stay right when --limit-train changes between sessions.
-               "steps": max(per_epoch, 1),
+               "steps": max(step - epoch_step, 1),
+               "gpus": max(world, 1),
                "seconds": round(time.time() - began, 1)}
         row.update({f"train_{k}": v for k, v in train_summary.items()})
         row.update({f"val_{k}": v for k, v in val_summary.items()})
         history.append(row)
         write_history(out_dir, history)
+        _write_offenders(out_dir, offenders)
 
         # The always-current checkpoint is written unconditionally and the
         # best-so-far separately. A policy-gated file alone can freeze while
         # training continues, and a resume then silently discards the gap.
-        checkpoint(step, epoch, completed=not stopped)
+        #
+        # `best` is updated BEFORE last.pt is written. It used to be updated
+        # after, so last.pt carried the previous best; a run resumed from it
+        # then took the next epoch as a "new best" even when it was worse, and
+        # overwrote best.pt with it.
         score = val_summary.get("geodesic_deg", val_summary["total"])
-        if score < best:
+        improved = score < best
+        if improved:
             best = score
+        checkpoint(step, epoch, completed=not stopped)
+        if improved:
             save_checkpoint(best_path, model, optimizer, config, epoch, step,
                             history, best, scaler, completed=not stopped,
-                            elapsed=elapsed + (time.time() - session_started))
+                            elapsed=elapsed + (time.time() - session_started),
+                            epoch_step=epoch_step, offenders=offenders)
             print(f"  new best: {best:.3f} deg -> {best_path.name}")
         report = _time_report(history, config, elapsed + (time.time() - session_started),
                               start_epoch, steps_per_epoch=per_epoch)
         if report:
             print(report)
 
+    signal_watch.restore()
     if main:
-        signal_watch.restore()
         if signal_watch.triggered:
             print(f"\n[signal] stopped on {signal_watch.name}. Progress is in "
                   f"{last_path} -- rerun with the same --out-dir to continue.")
@@ -1756,10 +2343,62 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
             print(_resume_recipe(config, out_dir))
     if main and history:
         _final_report(history)
-    if distributed:
-        torch.distributed.barrier()
-        torch.distributed.destroy_process_group()
+    dist.teardown()
     return history
+
+
+def _record_offenders(offenders: Dict[str, Dict], epoch: int, *summaries) -> int:
+    """
+    Fold this epoch's failed scenes into the run-long tally; return how many
+    scenes failed this epoch.
+
+    One failure is noise -- a batch that happened to be too large together.
+    The same scene failing in epoch after epoch is a scene that has been removed
+    from training without anyone deciding to, and only a tally that outlives
+    the epoch, and the session, can see that.
+    """
+    failed = 0
+    for summary in summaries:
+        for key, (count, reason) in (summary.pop("failures", None) or {}).items():
+            entry = offenders.setdefault(key, {"count": 0, "epochs": [], "reason": reason})
+            entry["count"] += int(count)
+            entry["reason"] = reason
+            if epoch not in entry["epochs"]:
+                entry["epochs"].append(epoch)
+            failed += 1
+    return failed
+
+
+def _repeat_offenders(offenders: Dict[str, Dict]) -> List[Tuple[str, Dict]]:
+    """Scenes that failed in more than one epoch, worst first."""
+    repeat = [(key, entry) for key, entry in offenders.items()
+              if len(entry.get("epochs", ())) > 1]
+    return sorted(repeat, key=lambda kv: (-len(kv[1]["epochs"]), -kv[1]["count"], kv[0]))
+
+
+def _report_offenders(offenders: Dict[str, Dict], new_failures: int) -> None:
+    if not new_failures:
+        return
+    repeat = _repeat_offenders(offenders)
+    if not repeat:
+        return
+    print(f"  [offenders] {len(repeat)} scene(s) have failed in more than one "
+          f"epoch -- each is effectively excluded from training:")
+    for key, entry in repeat[:5]:
+        print(f"     {len(entry['epochs'])} epochs, {entry['count']}x  {key}  "
+              f"({entry['reason']})")
+    if len(repeat) > 5:
+        print(f"     (+{len(repeat) - 5} more in offenders.json)")
+    print("     diagnose one with: python -m scripts.check_scene --scene <key> --locate")
+
+
+def _write_offenders(out_dir: Path, offenders: Dict[str, Dict]) -> None:
+    if not offenders:
+        return
+    ordered = dict(sorted(offenders.items(),
+                          key=lambda kv: (-len(kv[1]["epochs"]), -kv[1]["count"], kv[0])))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "offenders.json").write_text(json.dumps(ordered, indent=2))
 
 
 def _split_banner(config, train_set, val_set) -> List[str]:
@@ -1822,19 +2461,35 @@ def _balance_banner(config, train_set) -> List[str]:
     ]
 
 
+def _epoch_lines(config, items: int, world: int, per_epoch: int) -> List[str]:
+    """What one epoch is, in scenes and in passes over the training split."""
+    gpus = max(world, 1)
+    scenes = per_epoch * config.batch_size * gpus
+    passes = scenes / max(items, 1)
+    kind = "fixed length" if config.steps_per_epoch > 0 else "one full pass"
+    lines = [f"  epoch         {per_epoch} steps/GPU x {gpus} GPU(s) x batch "
+             f"{config.batch_size} = {scenes:,} scenes = {passes:.2f} passes ({kind})"]
+    if config.accumulate > 1:
+        lines.append(f"                optimizer step every {config.accumulate} batches")
+    if config.steps_per_epoch > 0 and passes > 4:
+        lines.append(f"                every scene is drawn ~{passes:.0f}x per epoch -- "
+                     f"for a smoke test use --steps-per-epoch 0 (one pass)")
+    return lines
+
+
 def _banner(config, train_set, val_set, parameters, device, world, per_epoch) -> str:
     lines = [
         "=" * 74,
         "V-GAT reassembly training",
         "=" * 74,
-        f"  device        {device}" + (f"  x{world} (DDP)" if world > 1 else ""),
+        f"  device        {device}" + (f"  x{world} (one process per GPU)" if world > 1 else ""),
         f"  parameters    {parameters:,}",
         f"  channels      {config.channels}  heads {config.heads}  "
         f"schedule {'+'.join(config.schedule)}",
         f"  objects       {len(train_set.scenes)} train / {len(val_set.scenes)} val"
         + ("  (official split)" if train_set.official else "  (hashed split)"),
-        f"  samples       {len(train_set)} train / {len(val_set)} val"
-        f"   {per_epoch} steps/epoch",
+        f"  samples       {len(train_set)} train / {len(val_set)} val",
+        *_epoch_lines(config, len(train_set), world, per_epoch),
         *_split_banner(config, train_set, val_set),
         *_balance_banner(config, train_set),
         f"  labels        {config.label_method}"
@@ -1904,31 +2559,54 @@ def _final_report(history: List[dict]) -> None:
 
 
 def evaluate(config: Config, checkpoint: str = "best.pt",
-             split: str = "test") -> Dict[str, float]:
+             split: str = "test", assemble: bool = True,
+             collision: bool = False,
+             data_from_checkpoint: bool = True) -> Dict[str, float]:
     """
-    Score a saved checkpoint on a held-out split.
+    Score a saved checkpoint on a held-out split: rotation, and -- with
+    ``assemble`` -- the full assembly the benchmark scores.
 
-    Separate from training and single-device on purpose: an evaluation that
-    shards across GPUs has to gather predictions to be correct, and getting
-    that subtly wrong produces a plausible number.
+    ``assemble`` runs the translation solver on the predicted rotations
+    (:mod:`reassembly.assembly`) and reports translation RMSE, Chamfer distance
+    and part accuracy in world units, averaged per scene then over scenes as
+    the benchmark does. Without it, only rotation is reported -- and said to be,
+    rather than the other numbers being silently absent.
+
+    The model, and by default the DATA definition, come from the checkpoint's
+    own config: a model is scored on the split, labels, tokens and
+    normalisation it was trained with, whatever the flags say, and every
+    setting that differed is printed. ``data_from_checkpoint=False`` keeps the
+    flags' data settings (to score a fracture-split model on the object split,
+    say); the architecture is always the checkpoint's.
+
+    Single-device on purpose: an evaluation that shards across GPUs has to
+    gather predictions to be correct, and getting that subtly wrong produces a
+    plausible number.
     """
     import torch
 
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    path = Path(config.out_dir) / checkpoint
-    if not path.exists():
-        raise FileNotFoundError(f"no checkpoint at {path}")
+    from .assembly import mean_over_scenes, score_batch
 
-    state = torch.load(path, map_location=device, weights_only=False)
-    model = build_model(config).to(device)
-    model.load_state_dict(state["model"])
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    model, config, state, path = load_checkpoint(
+        checkpoint, config, device, data_from_checkpoint=data_from_checkpoint)
 
     dataset = BreakingBadScenes(config, split, epoch_seed=0)
-    loader = _loader(dataset, config, False, 0, 1, 0)
-    summary, _, _ = run_epoch(model, loader, build_criterion(config), config,
-                              device=device, label=split)
+    loader = _loader(dataset, config, False, 0, 1, 0,
+                     pairs_in_worker=not device.startswith("cuda"))
+    scenes: List[Dict] = []
 
-    print(f"\n{split} ({len(dataset)} samples, checkpoint from epoch "
+    def collect(batch, prediction) -> None:
+        scores = score_batch(batch, prediction, collision=collision)
+        for key, category, score in zip(batch.scene_keys, batch.categories, scores):
+            score["_scene"], score["_category"] = key, category
+            scenes.append(score)
+
+    summary, _, _ = run_epoch(model, loader, build_criterion(config), config,
+                              device=device, label=split,
+                              on_prediction=collect if assemble else None)
+
+    print(f"\n{split} ({len(dataset)} samples, checkpoint {path.name} from epoch "
           f"{state['epoch'] + 1})")
     print(f"  {format_losses(summary)}")
     print(f"  {format_metrics(summary)}")
@@ -1949,9 +2627,128 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
           f"with GARF's tables. Compare against the VANILLA Everyday "
           f"supplementary\n  table -- SE(3)-Equiv 79.30 deg, GARF-mini 10.41 deg "
           f"-- not the headline row.")
+
+    if assemble:
+        public = [{k: v for k, v in scene.items() if not k.startswith("_")}
+                  for scene in scenes]
+        assembly = mean_over_scenes(public)
+        by_category: Dict[str, Dict[str, float]] = {}
+        for category in sorted({scene["_category"] for scene in scenes}):
+            rows = [p for p, scene in zip(public, scenes) if scene["_category"] == category]
+            by_category[category] = dict(mean_over_scenes(rows), scenes=len(rows))
+        summary["assembly"] = assembly
+        summary["assembly_by_category"] = by_category
+        summary["assembly_scenes"] = [dict(scene) for scene in scenes]
+        _print_assembly(assembly, by_category, len(scenes))
+    else:
+        print("  (rotation only: --no-assemble skipped the translation solver, so "
+              "there is no RMSE(T), Chamfer or part accuracy)")
+
+    summary.pop("failures", None)
+    summary.pop("most_repaired", None)
     out = Path(config.out_dir) / f"{split}_metrics.json"
-    out.write_text(json.dumps(summary, indent=2))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(summary, indent=2, default=str))
     return summary
+
+
+def load_checkpoint(checkpoint, config: Optional[Config] = None, device="cpu",
+                    data_from_checkpoint: bool = True):
+    """
+    ``(model, config, state, path)`` for a saved checkpoint, the model in eval
+    mode on ``device``.
+
+    ``checkpoint`` is a path, or a file name inside ``config.out_dir``. The
+    architecture is always the checkpoint's; the data definition too unless
+    ``data_from_checkpoint=False``. Every setting that differs from ``config``
+    is printed, because a model scored or inspected on data it was not trained
+    for gives a number that looks fine and means something else.
+    """
+    import torch
+
+    config = config if config is not None else Config()
+    path = Path(checkpoint)
+    if not path.exists():
+        path = Path(config.out_dir) / checkpoint
+    if not path.exists():
+        raise FileNotFoundError(f"no checkpoint at {checkpoint} or {path}")
+    state = torch.load(path, map_location=device, weights_only=False)
+    config = _adopt_checkpoint_settings(config, state.get("config") or {},
+                                        data=data_from_checkpoint)
+    model = build_model(config).to(device)
+    model.load_state_dict(state["model"])
+    model.eval()
+    return model, config, state, path
+
+
+def find_scene(config: Config, key: str, splits=("train", "val", "test")):
+    """
+    ``(dataset, index, split)`` for the scene named ``key`` --
+    ``<object key>/<mode>``, as training logs, ``offenders.json`` and
+    ``dump_prediction --list`` print it. Every break pattern is searched, not
+    only the ones an epoch samples. Raises ``KeyError`` with the nearest names
+    when there is no such scene.
+    """
+    searched = dataclasses.replace(config, modes_per_scene=None, limit_train=None,
+                                   limit_val=None, max_objects=None)
+    names: List[str] = []
+    for split in splits:
+        try:
+            dataset = BreakingBadScenes(searched, split, epoch_seed=0)
+        except FileNotFoundError:
+            continue
+        index = dataset.index_of(key)
+        if index is not None:
+            return dataset, index, split
+        names += [dataset.key(i) for i in range(len(dataset))]
+    import difflib
+
+    close = difflib.get_close_matches(key, names, n=3, cutoff=0.3)
+    raise KeyError(f"no scene {key!r} under {config.root}"
+                   + (f"; closest: {', '.join(close)}" if close else ""))
+
+
+def _adopt_checkpoint_settings(config: Config, stored: Dict, data: bool) -> Config:
+    """
+    The checkpoint's architecture (always) and data definition (by default),
+    with every change announced.
+    """
+    import dataclasses
+
+    names = {field.name for field in dataclasses.fields(Config)}
+    keys = _ARCHITECTURE + (_DATA if data else ())
+    changes = {key: stored[key] for key in keys
+               if key in stored and key in names and _differs(stored[key], getattr(config, key))}
+    for key, value in changes.items():
+        print(f"[checkpoint] using the checkpoint's {key}={value!r} "
+              f"(the config said {getattr(config, key)!r})")
+    if "schedule" in changes:
+        changes["schedule"] = tuple(changes["schedule"])
+    return dataclasses.replace(config, **changes) if changes else config
+
+
+def _print_assembly(assembly: Dict[str, float], by_category: Dict[str, Dict],
+                    scenes: int) -> None:
+    if not assembly:
+        print("  assembly: no scene could be scored")
+        return
+    print(f"\n  assembly ({scenes} scenes, translation solver on the predicted "
+          f"rotations, world units, per-scene means):")
+    print(f"    RMSE(T)        {assembly.get('rmse_t', float('nan')):.4f}")
+    print(f"    Chamfer (CD)   {assembly.get('chamfer', float('nan')):.5f}   "
+          f"(whole shape; per part {assembly.get('part_chamfer', float('nan')):.5f})")
+    print(f"    part accuracy  {assembly.get('part_accuracy', float('nan')):.3f}   "
+          f"(Chamfer < 0.01 per fragment)")
+    print(f"    geodesic       {assembly.get('geodesic_deg', float('nan')):.2f} deg   "
+          f"Euler RMSE {assembly.get('euler_rmse_deg', float('nan')):.2f} deg   "
+          f"(per scene, as the benchmark averages)")
+    print(f"    matches/scene  {assembly.get('matches', float('nan')):.0f}")
+    if len(by_category) > 1:
+        print(f"    {'category':<20}{'scenes':>7}{'PA':>8}{'RMSE(T)':>10}{'CD':>10}")
+        for name, row in sorted(by_category.items(),
+                                key=lambda kv: -kv[1].get("part_accuracy", 0.0)):
+            print(f"    {name:<20}{row['scenes']:>7}{row.get('part_accuracy', float('nan')):>8.3f}"
+                  f"{row.get('rmse_t', float('nan')):>10.4f}{row.get('chamfer', float('nan')):>10.5f}")
 
 
 def _report_category_gap(summary: Dict, config: Config, spread: float = 15.0) -> None:
@@ -1982,7 +2779,8 @@ def _report_category_gap(summary: Dict, config: Config, spread: float = 15.0) ->
               f"shapes each category happens to have.")
 
 
-def _report_dropped(train_summary: Dict, val_summary: Dict) -> None:
+def _report_dropped(train_summary: Dict, val_summary: Dict,
+                    repaired: Optional[Dict[str, list]] = None) -> None:
     """
     Name what was dropped, not just how much.
 
@@ -1991,25 +2789,40 @@ def _report_dropped(train_summary: Dict, val_summary: Dict) -> None:
     and reports nothing -- and even a count hides *which* items, which is what
     turns "3 dropped" into a diagnosable fact.
     """
+    repaired = repaired or {}
     for label, summary in (("train", train_summary), ("val", val_summary)):
         names = summary.get("dropped_names") or []
         if summary.get("dropped"):
             shown = ", ".join(names[:3])
             more = f" (+{summary['dropped'] - len(names[:3])} more)" if summary["dropped"] > 3 else ""
-            print(f"  {label}: {summary['dropped']} sample(s) unusable: {shown}{more}")
+            print(f"  {label}: {summary['dropped']} sample(s)/batch(es) unusable: {shown}{more}")
         if summary.get("skipped"):
-            print(f"  {label}: {summary['skipped']} batch(es) skipped entirely")
+            print(f"  {label}: {summary['skipped']} of {summary.get('attempted', '?')} "
+                  f"batch(es) contributed nothing")
+        if summary.get("oom_recovered"):
+            print(f"  {label}: {summary['oom_recovered']} batch(es) ran out of memory "
+                  f"and fitted on the retry with gradient checkpointing -- kept, "
+                  f"at the cost of a second forward.")
         if summary.get("oom"):
-            print(f"  {label}: {summary['oom']} batch(es) hit OOM and were "
-                  f"skipped. A handful is survivable; more than that means "
-                  f"--batch-size is too high and the largest objects are being "
-                  f"dropped from training.")
+            print(f"  {label}: {summary['oom']} batch(es) did not fit even with "
+                  f"gradient checkpointing and were skipped. A handful is "
+                  f"survivable; more than that means --batch-size is too high and "
+                  f"the largest objects are being dropped from training.")
         if summary.get("nonfinite"):
             print(f"  {label}: {summary['nonfinite']} batch(es) produced a "
-                  f"non-finite loss and were dropped before the backward. This "
-                  f"is a defect, not a capacity limit -- run "
-                  f"`python -m scripts.check_scene` on the named samples. "
-                  f"Repeat offenders are effectively excluded from training.")
+                  f"non-finite loss or gradient and were dropped from the step. "
+                  f"This is a defect, not a capacity limit -- run "
+                  f"`python -m scripts.check_scene --scene <name> --locate` on "
+                  f"the named samples. Repeat offenders are effectively excluded "
+                  f"from training.")
+        if summary.get("nonfinite_steps"):
+            print(f"  {label}: {summary['nonfinite_steps']} optimizer step(s) had a "
+                  f"non-finite gradient after averaging and were not applied.")
+        if summary.get("repaired_faces") or summary.get("zero_normals"):
+            worst = ", ".join(f"{key} ({count})" for key, count in repaired.get(label, [])[:3])
+            print(f"  {label}: repaired {summary.get('repaired_faces', 0):,} zero-area "
+                  f"face(s) and {summary.get('zero_normals', 0):,} zero-length vertex "
+                  f"normal(s) -- set to 0, not NaN" + (f"; most in {worst}" if worst else ""))
 
 
 def _resume_recipe(config: Config, out_dir: Path) -> str:
@@ -2106,7 +2919,7 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     requested = devices if config.devices < 0 else config.devices
     if requested > devices:
         problems.append(f"devices={config.devices} but only {devices} GPU(s) visible")
-    # Under DDP the worker count is per *rank*, so the machine actually runs
+    # With several GPUs the worker count is per *process*, so the machine runs
     # `workers * devices` of them plus one main process each. Comparing the
     # per-rank number to the CPU count understates it by the world size, which
     # on a 2-GPU 4-CPU Kaggle box is the difference between "fine" and
@@ -2205,7 +3018,7 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             unusable.append(item)
             continue
         built.append(item)
-        vertices = sum(len(f.vertices) for f in item.fragments)
+        vertices = sum(len(f.target_vertices) for f in item.fragments)
         tokens = sum(len(f.token_vertices) for f in item.fragments)
         sizes.append((vertices, tokens, len(item.fragments)))
     build_time = (time.time() - began) / max(samples, 1)
@@ -2371,12 +3184,13 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
           + (f"   -- pass --max-vertices-per-batch {suggested}"
              if not config.max_vertices_per_batch else ""))
     if not config.max_vertices_per_batch:
-        warnings.append(
-            f"--max-vertices-per-batch is not set, so a batch larger than "
-            f"anything sampled here is attempted and can fail mid-epoch. Under "
-            f"DDP that cannot be skipped safely and the run stops. Pass "
-            f"--max-vertices-per-batch {suggested}."
-        )
+        # A note, no longer a warning. A batch that does not fit is retried
+        # with gradient checkpointing and skipped only if that fails too, on
+        # one GPU or several -- the run survives it either way. The limit just
+        # saves the two doomed attempts.
+        print(f"  (a larger batch that runs out of memory is retried with "
+              f"gradient checkpointing, then skipped; --max-vertices-per-batch "
+              f"{suggested} skips such batches before attempting them)")
     dead = [n for n, p in model.named_parameters()
             if p.grad is None or p.grad.abs().sum() == 0]
     # Release step 5's batch and autograd graph before step 6 allocates its own.
@@ -2549,25 +3363,28 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     val_per_step = (time.time() - val_began) / max(val_done, 1)
 
     world = max(requested, 1)
-    steps = math.ceil(len(train_set) / (timing_batch * world))
+    steps = (config.steps_per_epoch if config.steps_per_epoch > 0
+             else math.ceil(len(train_set) / (timing_batch * world)))
     val_steps = math.ceil(len(val_set) / (timing_batch * world))
     epoch_seconds = per_step * steps + val_per_step * val_steps
     total_seconds = epoch_seconds * config.epochs
     sessions = math.ceil(total_seconds / (config.max_hours * 3600))
     print(f"  {per_step:.2f} s/step train, {val_per_step:.2f} s/step val")
-    print(f"  {steps} train + {val_steps} val steps/epoch at "
+    print(f"  {steps} train + {val_steps} val steps/epoch per GPU at "
           f"batch_size={timing_batch} on {world} device(s) "
-          f"-> ~{_hms(epoch_seconds)}/epoch")
+          f"-> ~{_hms(epoch_seconds)}/epoch"
+          + ("  (--steps-per-epoch)" if config.steps_per_epoch > 0 else "  (one pass)"))
     if timing_batch != config.batch_size:
         print(f"  (--accumulate does not change this: it changes how often the "
               f"optimizer steps, not how many forward/backward passes run)")
     print(f"  {config.epochs} epochs -> ~{_hms(total_seconds)} "
           f"= {sessions} session(s) at {config.max_hours:g}h")
     if world > 1:
-        # Measured in one process on one GPU. Under DDP every step also
-        # all-reduces the gradients, and the ranks contend for the same CPUs to
-        # build scenes. On the real run that gap was about 45%.
-        print(f"  measured on 1 rank -- under {world}-way DDP expect roughly "
+        # Measured in one process on one GPU. With several, every optimizer
+        # step also all-reduces the gradient (a few milliseconds at this model
+        # size) and the processes contend for the same CPUs to build scenes.
+        # On the earlier two-GPU run the total gap was about 45%.
+        print(f"  measured on 1 GPU -- with {world} processes expect roughly "
               f"{_hms(epoch_seconds * 1.45)}/epoch "
               f"({_hms(total_seconds * 1.45)} total)")
     if epoch_seconds > config.max_hours * 3600:
@@ -2627,7 +3444,7 @@ def _token_reach(samples, hops: int) -> List[float]:
     vertices = 0
     for sample in samples:
         batch, _ = _collate_samples([sample])
-        n = int(batch.node_features.shape[0])
+        n = int(batch.vertex_fragment.numel())
         if n == 0 or batch.token_index is None:
             continue
         src, dst = batch.edge_index[0], batch.edge_index[1]

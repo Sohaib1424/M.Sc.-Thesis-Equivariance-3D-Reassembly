@@ -53,6 +53,7 @@ def _config(root, **kwargs):
         channels=16, heads=4, head_dim=4, embedding_dim=8, workers=0,
         tokens_per_scene=32, batch_size=1, epochs=1, modes_per_scene=None,
         schedule=("intra",), check_init=False, val_frac=0.34, test_frac=0.0,
+        steps_per_epoch=0,
     )
     defaults.update(kwargs)
     return Config(**defaults)
@@ -132,14 +133,30 @@ def test_a_nonfinite_batch_is_counted_and_named(root, monkeypatch):
 # 2. An OOM must leave the accumulation group as if the batch never existed
 # --------------------------------------------------------------------------
 
-def _gradient_at_the_last_step(config, items, oom_at=None):
-    """
-    Run one epoch over ``items`` and return the gradients the optimizer was
-    handed at the final step.
+class _Positions(torch.utils.data.Dataset):
+    """The real dataset, with chosen positions made unusable."""
 
-    Captured at ``clip_grad_norm_``, which the loop calls immediately after the
-    group normalisation and before the step -- so this is exactly the quantity
-    the normalisation is supposed to produce.
+    def __init__(self, dataset, unusable=()):
+        self.dataset, self.unusable = dataset, set(unusable)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, i):
+        if i in self.unusable:
+            return training.Skipped(f"unusable{i}", "made unusable by the test")
+        return self.dataset[i]
+
+
+def _gradients_at_every_step(config, items, oom=(), unusable=()):
+    """
+    Run one epoch over ``items`` and return the gradient the optimizer was
+    handed at every step, in order.
+
+    Captured at ``clip_grad_norm_``, which the loop calls right after dividing
+    by the contributing fragments and before the step -- so this is exactly the
+    quantity the normalisation is supposed to produce. ``oom`` positions run out
+    of memory on every attempt, the checkpointed retry included.
     """
     import unittest.mock as mock
 
@@ -147,103 +164,215 @@ def _gradient_at_the_last_step(config, items, oom_at=None):
     model = training.build_model(config)
     dataset = BreakingBadScenes(config, "train")
     dataset.items = [dataset.items[i] for i in items]
-    loader = training._loader(dataset, config, shuffle=False, rank=0, world=1,
-                              epoch=0)
+    doomed = {f"{dataset.catalog.objects[dataset.items[p][0]].key}/{dataset.items[p][1]}"
+              for p in oom}
+    loader = torch.utils.data.DataLoader(
+        _Positions(dataset, unusable), batch_size=config.batch_size,
+        collate_fn=training._collate_samples)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
-    captured, seen = {}, {"n": 0}
+    captured = []
     real_forward = training._forward
     real_clip = torch.nn.utils.clip_grad_norm_
 
     def maybe_oom(model_, batch, criterion, config_):
-        index = seen["n"]
-        seen["n"] += 1
-        if index == oom_at:
+        if doomed & set(batch.scene_keys):
             raise torch.cuda.OutOfMemoryError("simulated")
         return real_forward(model_, batch, criterion, config_)
 
     def capture(parameters, *args, **kwargs):
         parameters = list(parameters)
-        captured["grads"] = [None if p.grad is None else p.grad.detach().clone()
-                             for p in parameters]
+        captured.append([None if p.grad is None else p.grad.detach().clone()
+                         for p in parameters])
         return real_clip(parameters, *args, **kwargs)
 
     with mock.patch.object(training, "_forward", maybe_oom), \
          mock.patch.object(torch.nn.utils, "clip_grad_norm_", capture):
-        training.run_epoch(model, loader, build_criterion(config), config,
-                           optimizer=optimizer, device="cpu", label="train",
-                           show_progress=False)
-    return captured.get("grads")
+        summary, _s, _t = training.run_epoch(
+            model, loader, build_criterion(config), config, optimizer=optimizer,
+            device="cpu", label="train", show_progress=False)
+    return captured, summary
 
 
-def test_an_oom_mid_group_does_not_shrink_the_next_step(root):
+def _same(a, b):
     """
-    THE regression guard.
-
-    ``zero_grad`` in the OOM handler discards the whole accumulation group, but
-    ``group_weight`` was only cleared at the optimizer step. So after an OOM
-    that landed *after* an earlier micro-batch had already contributed, the
-    next step divided the surviving gradients by a denominator that still
-    counted the fragments whose gradients had just been thrown away.
-
-    The layout matters and is why this is not the obvious test: the OOM has to
-    fall in the MIDDLE of a group. An OOM on a group's first micro-batch is
-    raised before anything is added to ``group_weight``, so the bug does not
-    show. With ``accumulate=2`` over four batches and the failure at index 1:
-
-        group A   batch 0 contributes, batch 1 OOMs -> everything discarded
-        group B   batches 2 and 3 -> the only optimizer step
-
-    correct:  divide by fragments(2) + fragments(3)
-    buggy:    divide by fragments(0) + fragments(2) + fragments(3)
-
-    which is a step roughly a third too small, silently, on exactly the batches
-    large enough to run out of memory in the first place.
+    Equal up to CPU scheduling. With several threads the reductions run in a
+    nondeterministic order and two identical runs differ by ~1e-6 relative;
+    a wrong normalisation is off by tens of percent.
     """
-    config = _config(root, accumulate=2)
-    after_oom = _gradient_at_the_last_step(config, items=[0, 1, 2, 3], oom_at=1)
-    # The same group B, with the failed group never having existed.
-    reference = _gradient_at_the_last_step(config, items=[2, 3], oom_at=None)
-
-    assert after_oom is not None and reference is not None, "no step was taken"
     compared = 0
-    for a, b in zip(after_oom, reference):
-        if a is None or b is None:
-            assert a is b
+    for x, y in zip(a, b):
+        if x is None or y is None:
+            assert x is y
             continue
         compared += 1
-        assert torch.allclose(a, b, atol=1e-6), (
-            "the step after a mid-group OOM is not normalised by the surviving "
-            "fragments alone -- group_weight leaked past the zero_grad"
-        )
+        assert float((x - y).norm()) <= 1e-5 * float(y.norm()) + 1e-8
     assert compared > 0, "no gradients were compared"
 
 
-def test_the_oom_is_counted_and_named(root):
+def test_an_oom_mid_group_is_exactly_a_batch_that_never_existed(root):
+    """
+    THE regression guard, for both halves of the old failure.
+
+    The old handler zeroed the whole accumulation group on an OOM -- throwing
+    away the micro-batches before it -- and forgot to reset the fragment count,
+    so the next step divided by fragments whose gradients were gone. Now each
+    micro-batch's gradient is computed with the running total set aside, so a
+    failure discards that micro-batch alone.
+
+    The layout: ``accumulate=2`` over four batches, the one at position 1
+    running out of memory on every attempt (the retry with checkpointing
+    included)::
+
+        group A   batch 0 contributes, batch 1 fails -> step on batch 0 alone
+        group B   batches 2 and 3 -> step on both
+
+    which must be *identical*, step for step, to the same epoch with batch 1
+    simply unusable -- and group A must equal a run over batch 0 alone.
+    """
     config = _config(root, accumulate=2)
+    after_oom, summary = _gradients_at_every_step(config, [0, 1, 2, 3], oom=[1])
+    never_there, _ = _gradients_at_every_step(config, [0, 1, 2, 3], unusable=[1])
+    alone, _ = _gradients_at_every_step(config, [0])
+
+    assert summary["oom"] == 1 and summary["oom_recovered"] == 0
+    assert len(after_oom) == len(never_there) == 2, "one step per group"
+    for a, b in zip(after_oom, never_there):
+        _same(a, b)
+    _same(after_oom[0], alone[0])
+
+
+def test_the_oom_is_counted_and_named_by_scene(root):
+    """
+    A batch that fails even with checkpointing is counted and named -- by the
+    scenes in it, not by its position, so the same scene failing in the next
+    epoch is recognisably the same failure. One that fits on the retry is
+    counted separately, because it was kept.
+    """
+    config = _config(root, accumulate=2)
+    _steps, summary = _gradients_at_every_step(config, [0, 1, 2, 3], oom=[1])
+    assert summary["oom"] == 1
+    named = [n for n in summary["dropped_names"] if n.startswith("OOM:")]
+    assert len(named) == 1 and "mug_" in named[0], named
+    assert list(summary["failures"].values())[0] == (1, "out of memory")
+
     torch.manual_seed(0)
     model = training.build_model(config)
     dataset = BreakingBadScenes(config, "train")
     dataset.items = dataset.items[:4]
     loader = training._loader(dataset, config, shuffle=False, rank=0, world=1,
                               epoch=0)
-
     import unittest.mock as mock
 
     real = training._forward
     seen = {"n": 0}
 
-    def maybe_oom(model_, batch, criterion, config_):
+    def once(model_, batch, criterion, config_):
         seen["n"] += 1
-        if seen["n"] == 2:
+        if seen["n"] == 2:                      # the second batch, first attempt only
             raise torch.cuda.OutOfMemoryError("simulated")
         return real(model_, batch, criterion, config_)
 
-    with mock.patch.object(training, "_forward", maybe_oom):
+    with mock.patch.object(training, "_forward", once):
         summary, _s, _t = training.run_epoch(
             model, loader, build_criterion(config), config,
             optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
             device="cpu", label="train", show_progress=False,
         )
-    assert summary["oom"] == 1
-    assert any(name.startswith("OOM:") for name in summary["dropped_names"])
+    assert summary["oom"] == 0 and summary["oom_recovered"] == 1
+    assert summary["batches"] == 4, "the recovered batch is kept"
+
+
+# --------------------------------------------------------------------------
+# 3. Resuming a partial epoch, and remembering what failed
+# --------------------------------------------------------------------------
+
+def test_a_restarted_epoch_goes_back_to_the_step_it_began_at(root):
+    """
+    A partial epoch is re-run from its start, so its step count must go back to
+    where the epoch began. It used to continue from the mid-epoch count, and
+    every interrupted session pushed the learning-rate schedule ahead of an
+    uninterrupted run by the part of the epoch that was repeated.
+    """
+    from reassembly.training import save_checkpoint
+
+    config = _config(root, epochs=2, steps_per_epoch=2)
+    torch.manual_seed(0)
+    model = training.build_model(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    out = Path(config.out_dir)
+    save_checkpoint(out / "last.pt", model, optimizer, config, epoch=1, step=3,
+                    history=[{"epoch": 0, "step": 2}], best=float("inf"),
+                    completed=False, epoch_step=2)
+    history = training.train(config)
+    assert history[-1]["epoch"] == 1
+    assert history[-1]["step"] == 4, "restarted from step 2, plus 2 batches"
+
+
+def test_repeat_offenders_are_named_across_epochs_and_sessions(tmp_path):
+    from reassembly.training import (_record_offenders, _repeat_offenders,
+                                     save_checkpoint)
+
+    offenders = {}
+    _record_offenders(offenders, 0, {"failures": {"a/m1": (1, "out of memory"),
+                                                  "b/m2": (1, "out of memory")}})
+    assert _repeat_offenders(offenders) == [], "one failure is not a pattern"
+    _record_offenders(offenders, 1, {"failures": {"a/m1": (1, "non-finite loss")}},
+                      {"failures": {"c/m3": (2, "out of memory")}})
+    repeat = _repeat_offenders(offenders)
+    assert [key for key, _ in repeat] == ["a/m1"]
+    assert repeat[0][1]["epochs"] == [0, 1] and repeat[0][1]["count"] == 2
+
+    # The tally travels in the checkpoint, so it outlives the session.
+    config = _config(tmp_path)
+    model = training.build_model(config)
+    save_checkpoint(tmp_path / "last.pt", model, None, config, epoch=1, step=10,
+                    history=[], best=1.0, offenders=offenders)
+    state = torch.load(tmp_path / "last.pt", map_location="cpu", weights_only=False)
+    assert state["offenders"] == offenders
+
+
+# --------------------------------------------------------------------------
+# 4. Evaluation assembles, and scores the data the model was trained on
+# --------------------------------------------------------------------------
+
+def test_evaluate_assembles_the_prediction_and_scores_it(root, capsys):
+    import dataclasses
+
+    config = _config(root, epochs=1, steps_per_epoch=2)
+    training.train(config)
+    capsys.readouterr()
+    summary = training.evaluate(config, checkpoint="last.pt", split="val")
+    assembly = summary["assembly"]
+    for key in ("rmse_t", "chamfer", "part_accuracy", "geodesic_deg", "matches"):
+        assert key in assembly and np.isfinite(assembly[key]), key
+    assert 0.0 <= assembly["part_accuracy"] <= 1.0
+    assert len(summary["assembly_scenes"]) == summary["batches"]
+    out = capsys.readouterr().out
+    assert "part accuracy" in out and "RMSE(T)" in out
+    assert (Path(config.out_dir) / "val_metrics.json").exists()
+
+    # The flags disagree with the checkpoint on a data setting: the checkpoint wins,
+    # out loud -- unless asked otherwise.
+    other = dataclasses.replace(config, tokens_per_scene=8)
+    training.evaluate(other, checkpoint="last.pt", split="val", assemble=False)
+    out = capsys.readouterr().out
+    assert "using the checkpoint's tokens_per_scene=32" in out
+    assert "rotation only" in out
+    training.evaluate(other, checkpoint="last.pt", split="val", assemble=False,
+                      data_from_checkpoint=False)
+    assert "tokens_per_scene" not in capsys.readouterr().out
+
+
+def test_last_pt_carries_the_best_so_far(root):
+    """
+    last.pt used to be written before `best` was updated, so it carried the
+    previous best. A run resumed from it then treated its next epoch as a new
+    best even when it was worse -- and overwrote best.pt with it.
+    """
+    config = _config(root, epochs=1, steps_per_epoch=1)
+    training.train(config)
+    out = Path(config.out_dir)
+    last = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
+    best = torch.load(out / "best.pt", map_location="cpu", weights_only=False)
+    assert np.isfinite(last["best"]) and last["best"] == best["best"]

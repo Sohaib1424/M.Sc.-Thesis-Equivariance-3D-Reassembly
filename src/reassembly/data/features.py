@@ -51,17 +51,49 @@ DEFAULT_TOKENS_PER_SCENE = 2048
 
 
 class FragmentArrays(NamedTuple):
-    """One fragment, both poses, sharing a single topology."""
-    vertices: np.ndarray          # (V, 3) perturbed, centred, normalised
-    target_vertices: np.ndarray   # (V, 3) assembled, centred, normalised
-    normals: np.ndarray           # (V, 3) perturbed vertex normals
-    target_normals: np.ndarray    # (V, 3) assembled vertex normals
-    edge_index: np.ndarray        # (2, 2E) directed, both copies
-    edge_normals: np.ndarray      # (2E, 3, 3) perturbed: n1, n2, p_src - p_dst
+    """
+    One fragment, both poses, sharing a single topology.
+
+    The perturbed copy (``vertices``, ``normals``, ``edge_normals``) is ``None``
+    when the scene was built with ``perturb=False``: it is then derived on the
+    device by :func:`perturb_on_device`, from the assembled copy and the label.
+    """
+    vertices: Optional[np.ndarray]      # (V, 3) perturbed, centred, normalised
+    target_vertices: np.ndarray         # (V, 3) assembled, centred, normalised
+    normals: Optional[np.ndarray]       # (V, 3) perturbed vertex normals
+    target_normals: np.ndarray          # (V, 3) assembled vertex normals
+    edge_index: np.ndarray              # (2, 2E) directed, both copies
+    edge_normals: Optional[np.ndarray]  # (2E, 3, 3) perturbed: n1, n2, p_src - p_dst
     target_edge_normals: np.ndarray
     rotation: np.ndarray          # (3, 3) label: maps perturbed -> assembled
     radius: float                 # world units, before normalisation
     token_vertices: np.ndarray    # (T,) local vertex indices for cross-attention
+    # What undoes the normalisation, so an assembly can be scored in WORLD
+    # units: ``world = normalised * divisor + centroid``. Kept because the
+    # translation solver and the part-accuracy threshold (0.01) are both defined
+    # there; a Chamfer distance in normalised units is a different number.
+    centroid: Optional[np.ndarray] = None   # (3,) world-frame centroid removed
+    divisor: float = 1.0                    # scale divided out
+    fracture: Optional[np.ndarray] = None   # (V,) bool, the fracture mask
+
+
+class Repairs(NamedTuple):
+    """
+    What :func:`build_scene` had to repair in one scene, counted.
+
+    Nothing here is NaN by the time it reaches a tensor -- ``face_normals`` and
+    ``vertex_normals`` are NaN-free by construction -- and that is exactly why
+    the counts matter: a repaired value is a *zero*, which trains quietly, and a
+    scene full of them is a scene the model is learning little from. trimesh
+    would have returned NaN for every one of these; an earlier run of the
+    previous design lost three objects that way, every epoch, for forty epochs.
+    """
+    degenerate_faces: int = 0     # zero-area triangles: face normal set to 0
+    zero_normals: int = 0         # vertices whose normal came out 0 (all faces degenerate, or none)
+
+    @property
+    def total(self) -> int:
+        return int(self.degenerate_faces) + int(self.zero_normals)
 
 
 class SceneSample(NamedTuple):
@@ -80,6 +112,9 @@ class SceneSample(NamedTuple):
     attributes each sample to the wrong category from the first drop onward,
     and looks perfectly plausible.
     """
+    key: str = ""
+    """``<object>/<mode>`` -- so a batch that fails can say which scenes were in it."""
+    repairs: Repairs = Repairs()
 
 
 def _scene_token_sets(vertices, faces, masks, *, mode, metric, total, max_per_fragment):
@@ -147,13 +182,13 @@ def _fragment_geometry(vertices: np.ndarray, faces: np.ndarray):
     away for nothing.
     """
     topology = edge_topology(faces, vertices.shape[0])
-    face_norms = face_normals(vertices, faces)
+    face_norms, degenerate = face_normals(vertices, faces, return_degenerate=True)
     canonical = canonical_edge_normals(vertices, faces, topology, face_norms)
     edge_index, n1, n2 = directed_edge_normals(canonical)
     # Taken from `edge_index`, so the reverse copy of each undirected edge gets
     # the negated vector automatically rather than by a second convention.
     delta = vertices[edge_index[0]] - vertices[edge_index[1]]
-    return topology, edge_index, np.stack([n1, n2, delta], axis=1)
+    return topology, edge_index, np.stack([n1, n2, delta], axis=1), degenerate
 
 
 def build_scene(
@@ -170,6 +205,8 @@ def build_scene(
     max_tokens_per_fragment: Optional[int] = None,
     cluster: Optional[np.ndarray] = None,
     category: str = "",
+    key: str = "",
+    perturb: bool = True,
 ) -> SceneSample:
     """
     Build one scene's arrays.
@@ -178,6 +215,12 @@ def build_scene(
     which is also the only frame where the coincidence labels mean anything, so
     if ``cluster`` is being computed it must already have happened. ``rotations``
     supplies the per-fragment perturbation; omitted, it is drawn from ``rng``.
+
+    ``perturb=False`` leaves the perturbed copy out: the rotation that makes it
+    is carried as the label anyway, so :func:`perturb_on_device` can produce it
+    on the GPU with three batched matrix products instead of shipping a second
+    copy of every position, normal and edge feature through the data loader.
+    The label, the tokens and everything else are identical either way.
 
     Tokens: a fixed number per *scene*
     ----------------------------------
@@ -219,7 +262,7 @@ def build_scene(
         )
     n = len(vertices)
     if n == 0:
-        return SceneSample([], np.zeros(0, np.int64), category)
+        return SceneSample([], np.zeros(0, np.int64), category, key)
     if rotations is None:
         rotations = random_rotations(n, rng)
     rotations = np.asarray(rotations, dtype=np.float64)
@@ -247,19 +290,25 @@ def build_scene(
     )
 
     fragments: List[FragmentArrays] = []
+    degenerate = zero_normals = 0
     for i in range(n):
         f = np.asarray(faces[i])
         target_v = normalized.vertices[i]
-        _, edge_index, target_edge_n = _fragment_geometry(target_v, f)
+        _, edge_index, target_edge_n, bad_faces = _fragment_geometry(target_v, f)
         target_n = vertex_normals(target_v, f)
+        degenerate += int(bad_faces)
+        zero_normals += int((np.abs(target_n).sum(axis=1) == 0.0).sum())
 
         Q = rotations[i]
-        moved_v = target_v @ Q.T
-        # Normals and edge normals are rotated rather than recomputed: they are
-        # the *same* geometry, and recomputing invites the two copies to differ
-        # by round-off in a quantity the loss compares directly.
-        moved_n = target_n @ Q.T
-        moved_edge_n = target_edge_n @ Q.T
+        if perturb:
+            moved_v = target_v @ Q.T
+            # Normals and edge normals are rotated rather than recomputed: they
+            # are the *same* geometry, and recomputing invites the two copies to
+            # differ by round-off in a quantity the loss compares directly.
+            moved_n = target_n @ Q.T
+            moved_edge_n = target_edge_n @ Q.T
+        else:
+            moved_v = moved_n = moved_edge_n = None
 
         tokens = token_sets[i]
         assert tokens.size == 0 or tokens.max() < target_v.shape[0]
@@ -275,12 +324,16 @@ def build_scene(
             rotation=Q.T,
             radius=float(normalized.radius[i]),
             token_vertices=tokens,
+            centroid=np.asarray(normalized.centroid[i], dtype=np.float64),
+            divisor=float(normalized.divisor[i]),
+            fracture=masks[i] if i < len(masks) else None,
         ))
 
     total = sum(len(v) for v in vertices)
     if cluster is None:
         cluster = np.full(total, -1, np.int64)
-    return SceneSample(fragments, np.asarray(cluster, dtype=np.int64), category)
+    return SceneSample(fragments, np.asarray(cluster, dtype=np.int64), category,
+                       key, Repairs(degenerate, zero_normals))
 
 
 # --------------------------------------------------------------------------
@@ -295,6 +348,11 @@ class Batch(NamedTuple):
     every index tensor here is already shifted -- nothing downstream needs to
     know where one scene ends and the next begins except through
     ``fragment_scene`` and the ``ptr`` vectors.
+
+    ``node_features`` and ``edge_attr`` -- the perturbed copy the network reads
+    -- are ``None`` when the scenes were built with ``perturb=False``;
+    :func:`perturb_on_device` fills them in from the assembled copy and the
+    label, on whatever device the batch has been moved to.
     """
     node_features: "object"       # (N, 2, 3) centred coordinate, vertex normal
     edge_index: "object"          # (2, E) global vertex indices
@@ -316,25 +374,48 @@ class Batch(NamedTuple):
     num_fragments: int
     num_scenes: int
     categories: Tuple[str, ...] = ()   # (S,) object category per scene
+    # -- for assembling and scoring in world units ---------------------------
+    unit: "object" = None         # (F,) divisor: world = normalised * unit + centroid
+    centroid: "object" = None     # (F, 3) world-frame centroid removed by centring
+    fracture: "object" = None     # (N,) bool: the fracture-surface mask
+    # -- for naming what failed ------------------------------------------------
+    scene_keys: Tuple[str, ...] = ()      # (S,) "<object>/<mode>"
+    repairs: Tuple[Repairs, ...] = ()     # (S,) what build_scene had to repair
 
 
-def collate(samples: Sequence[SceneSample], device=None, dtype=None) -> Batch:
+def collate(samples: Sequence[SceneSample], device=None, dtype=None,
+            pairs: bool = True) -> Batch:
     """
     Concatenate scenes into one batch, shifting every index.
 
     Order is ``(scene, fragment)``, so each fragment's vertices are contiguous
     and each scene's fragments are contiguous. Variable-length attention
     kernels need that, and so does the ``ptr`` form.
+
+    ``pairs=False`` leaves the cross-fragment pair lists out
+    (``token_query``/``token_key`` are ``None``); :func:`complete_batch` builds
+    them where the batch is used. They are a pure function of the token list
+    and the fragment ids, and they are most of a batch: at 2,048 tokens a scene
+    of four fragments has ~3.1 million ordered pairs, two int64 lists of them --
+    89% of the bytes of a two-scene batch, measured, and ~0.6 s of one CPU
+    thread to build. On a GPU they take milliseconds and never cross the bus.
+
+    If any scene arrives without its perturbed copy (``perturb=False``), the
+    batch ships without one for all of them and :func:`perturb_on_device`
+    derives it later. Mixing the two paths inside one batch would buy nothing
+    and make the arrays' provenance depend on which scenes met in a batch.
     """
     import torch
 
     dtype = torch.float32 if dtype is None else dtype
+    perturbed = all(f.vertices is not None for s in samples for f in s.fragments)
 
     node, edges, edge_attr = [], [], []
     target_v, target_n, target_edge_n = [], [], []
     vertex_fragment, fragment_scene, rotations, radii = [], [], [], []
     tokens, clusters = [], []
     vertex_counts, fragment_counts = [], []
+    units, centroids, fracture = [], [], []
 
     vertex_offset = 0
     fragment_offset = 0
@@ -343,12 +424,17 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None) -> Batch:
     for scene_id, sample in enumerate(samples):
         scene_start = vertex_offset
         for fragment in sample.fragments:
-            v = fragment.vertices
-            count = v.shape[0]
-            node.append(np.stack([v, fragment.normals], axis=1))
+            count = fragment.target_vertices.shape[0]
+            if perturbed:
+                node.append(np.stack([fragment.vertices, fragment.normals], axis=1))
+                edge_attr.append(fragment.edge_normals)
             edges.append(fragment.edge_index + vertex_offset)
-            edge_attr.append(fragment.edge_normals)
             target_v.append(fragment.target_vertices)
+            units.append(fragment.divisor)
+            centroids.append(np.zeros(3) if fragment.centroid is None
+                             else fragment.centroid)
+            fracture.append(np.zeros(count, bool) if fragment.fracture is None
+                            else np.asarray(fragment.fracture, dtype=bool))
             target_n.append(fragment.target_normals)
             target_edge_n.append(fragment.target_edge_normals)
             vertex_fragment.append(np.full(count, fragment_offset, np.int64))
@@ -370,7 +456,7 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None) -> Batch:
                 cluster_offset += int(local.max()) + 1
         fragment_counts.append(len(sample.fragments))
         assert vertex_offset - scene_start == sum(
-            f.vertices.shape[0] for f in sample.fragments
+            f.target_vertices.shape[0] for f in sample.fragments
         )
 
     def cat(parts, kind=dtype):
@@ -383,13 +469,15 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None) -> Batch:
     fragment_scene_t = torch.as_tensor(fragment_scene, dtype=long, device=device)
     token_index = cat(tokens, long)
 
-    from ..nn.cross import cross_fragment_index
+    query = key = None
+    if pairs:
+        from ..nn.cross import cross_fragment_index
 
-    query, key = cross_fragment_index(
-        vertex_fragment_t[token_index],
-        fragment_scene_t[vertex_fragment_t[token_index]],
-        len(samples),
-    )
+        query, key = cross_fragment_index(
+            vertex_fragment_t[token_index],
+            fragment_scene_t[vertex_fragment_t[token_index]],
+            len(samples),
+        )
 
     radius = torch.as_tensor(radii, dtype=dtype, device=device).clamp(min=1e-12)
     cluster = cat(clusters, long) if clusters else torch.empty(0, dtype=long, device=device)
@@ -402,9 +490,9 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None) -> Batch:
         edge_index = torch.empty(2, 0, dtype=long, device=device)
 
     return Batch(
-        node_features=cat(node),
+        node_features=cat(node) if perturbed else None,
         edge_index=edge_index,
-        edge_attr=cat(edge_attr),
+        edge_attr=cat(edge_attr) if perturbed else None,
         vertex_fragment=vertex_fragment_t,
         fragment_scene=fragment_scene_t,
         vertex_ptr=_ptr(vertex_counts, device),
@@ -425,7 +513,60 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None) -> Batch:
         num_fragments=fragment_offset,
         num_scenes=len(samples),
         categories=tuple(sample.category for sample in samples),
+        unit=torch.as_tensor(units, dtype=dtype, device=device),
+        centroid=torch.as_tensor(np.asarray(centroids, dtype=np.float64).reshape(-1, 3),
+                                 dtype=dtype, device=device),
+        fracture=cat(fracture, torch.bool),
+        scene_keys=tuple(sample.key for sample in samples),
+        repairs=tuple(sample.repairs for sample in samples),
     )
+
+
+def perturb_on_device(batch: Batch) -> Batch:
+    """
+    Fill in the perturbed copy from the assembled one and the label.
+
+    The label is ``R = Q^T``, so the perturbation is ``Q = R^T`` and every
+    geometric quantity moves by ``x -> x Q^T``: centred positions (the centroid
+    co-moves), vertex normals, both face normals of an edge and its relative
+    position. It is exact rather than an approximation -- ``build_scene``
+    already makes the perturbed copy this way, by rotating instead of
+    recomputing -- and the edge-normal slot order survives it, because the
+    triple product that fixes the order is rotation-invariant.
+
+    A no-op on a batch that already carries its perturbed copy.
+    """
+    import torch
+
+    if batch.node_features is not None and batch.edge_attr is not None:
+        return batch
+    Q = batch.target_rotation.transpose(-1, -2)
+    node = torch.stack([batch.target_vertices, batch.target_normals], dim=1)
+    node = torch.einsum("nij,ncj->nci", Q[batch.vertex_fragment], node)
+    edge_fragment = batch.vertex_fragment[batch.edge_index[0]]
+    edge = torch.einsum("eij,ecj->eci", Q[edge_fragment], batch.target_edge_normals)
+    return batch._replace(node_features=node, edge_attr=edge)
+
+
+def pair_on_device(batch: Batch) -> Batch:
+    """Build the cross-fragment pair lists where the batch is. A no-op if present."""
+    if batch.token_query is not None and batch.token_key is not None:
+        return batch
+    from ..nn.cross import cross_fragment_index
+
+    fragment = batch.vertex_fragment[batch.token_index]
+    query, key = cross_fragment_index(fragment, batch.fragment_scene[fragment],
+                                      batch.num_scenes)
+    return batch._replace(token_query=query, token_key=key)
+
+
+def complete_batch(batch: Batch) -> Batch:
+    """
+    Everything a batch may have left to the device: the perturbed copy
+    (:func:`perturb_on_device`) and the pair lists (:func:`pair_on_device`).
+    Idempotent, so any consumer can call it.
+    """
+    return pair_on_device(perturb_on_device(batch))
 
 
 def _ptr(counts: Sequence[int], device=None):

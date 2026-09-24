@@ -11,11 +11,11 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 396 tests, clean under `-W error` |
+| Pipeline | **built** — 445 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
-| Training | **built** — loops, checkpoints, schedule, metrics, 2-GPU |
+| Training | **built** — loops, checkpoints, schedule, metrics; 1, 2 or N GPUs |
 | Trained result | **none yet** — nothing has been run on the real dataset |
 | First preflight | found a train/val split overlap and an OOM; both fixed |
 | Second preflight | found the memory ceiling: cross-attention was 7.2 GB of 15.6 GB, now 0.6 GB |
@@ -23,6 +23,7 @@ implementing anything from it.
 | First real run | 13 min on 400 objects — caught an embedding loss minimised by collapse |
 | Two full epochs | rotation flat at chance after 3,536 steps; OOM guard, DDP skip and both time projections fixed |
 | Audit against the earlier design | seven defects found and fixed, two experiment controls added — see §10 |
+| Multi-GPU rework | two silent faults (replica drift, collective desync) and five more fixed; stage two, fixed-length epochs, OOM retry, failure tracking, tools — see §11 |
 
 ---
 
@@ -255,9 +256,10 @@ first so segments are contiguous.
 ### Stage two: translation
 
 Not learned. Interface correspondences come from mutual nearest neighbours in
-embedding space, then translations are solved globally by minimising surface
-coincidence, normal cancellation and collision. Centring must stay reversible so
-the original per-fragment centroids can be recovered.
+embedding space, then translations are solved globally by weighted least
+squares on surface coincidence, with normal cancellation as a per-match weight
+and collision as an optional relief step. Centring is reversible — the batch
+carries each fragment's divisor and centroid. **Built** — see §11.
 
 ---
 
@@ -342,7 +344,7 @@ intra-fragment VN-GAT · cross-fragment attention · the composite loss · featu
 construction and batch collate · the backbone and rotation head**. 311 tests,
 no skips.
 
-**Not built** — the translation solver (stage two).
+**Not built** — nothing on this list any more: the translation solver (stage two) was built in Sept 2026, §11.
 
 **Built since** — `reassembly.training`: config, the Breaking Bad dataset,
 train/val/test loops, warmup-cosine schedule, checkpoint and resume, history,
@@ -532,6 +534,9 @@ near-coincident points) and part accuracy, ready for the translation solver.
 
 ### Still outstanding from the review
 
+*(Sept 2026: the first three items below are done — see §11, which also
+corrects the claim made about `rotate_per_fragment` here.)*
+
 - The translation solver itself — the corrected closed-form version: mutual-NN
   matching in embedding space, normal compatibility as a per-match weight, a
   weighted graph Laplacian solved in float64 with IRLS + Huber. Until it
@@ -544,3 +549,139 @@ near-coincident points) and part accuracy, ready for the translation solver.
   stop-signal are still local decisions, which is a latent DDP hang.
 - GARF's comparable row is the **vanilla Everyday supplementary** table
   (SE(3)-Equiv 79.30°, GARF-mini 10.41°), not the headline one the docs quote.
+
+---
+
+## 11 · One GPU, two or N — and the six additions (Sept 2026)
+
+### The multi-GPU path had two silent faults
+
+Both produced finite numbers and a descending curve.
+
+1. **Replicas drifted apart.** DDP all-reduces inside the syncing backward;
+   `run_epoch` then divided the gradient by the rank's *own* fragment count. Two
+   GPUs holding 5 and 4 fragments stepped by different amounts, and nothing in
+   DDP re-synchronises parameters, so they drifted for the rest of the run.
+2. **Rank-local skips desynchronised the collectives.** The oversized-batch
+   skip, the empty-batch skip and the non-finite-loss skip were decided per GPU,
+   while DDP meets inside every syncing backward. A GPU that skipped met its
+   peer one time fewer, and the last all-reduce of the epoch never completed —
+   a hang, not an error. (`max_vertices_per_batch` had been sold as the safe
+   skip because vertex counts are "identical on every rank". They are not: each
+   rank holds different scenes.)
+
+The same reading found five more, all fixed:
+
+- validation reported rank 0's half, and `DistributedSampler` padded it by
+  *repeating* scenes, so some were counted twice;
+- the time budget and the stop signal were checked per GPU (the signal handler
+  was installed on rank 0 only) — another way to leave a peer waiting;
+- an out-of-memory error under DDP stopped the whole run;
+- a trailing accumulation group cut short by the end of the loader was never
+  stepped, and its gradient leaked into the next epoch's first step;
+- every rank wrote the carried-over resume checkpoint to the same file at once.
+
+And one that was not multi-GPU at all: the scene seed was `hash((key, epoch))`.
+Python salts string hashes per interpreter, so every session and every spawned
+process drew a different perturbation for the same scene — validation included,
+so the numbers before and after a resume were not measured on the same rotations.
+It is now a `blake2b` digest.
+
+### What replaced it
+
+No DDP wrapper. Each GPU accumulates its own micro-batches; the GPUs meet only
+at optimizer steps, which are fixed by batch **position** (every `accumulate`
+batches, plus a flush at the end), so every GPU reaches every one whatever it
+skipped. At each: one all-reduce of two numbers (fragments contributed, stop
+votes), then one all-reduce of the summed gradient, divided by the global
+fragment count *after* the reduction. Every replica applies the bit-identical
+update. A parameter no GPU produced a gradient for stays `None` everywhere, so
+AdamW treats it exactly as on one GPU. Replicas are made identical once, at the
+start (`broadcast_parameters`), since each rank seeds itself differently. The
+cost DDP would have saved — overlapping the all-reduce with the backward — is a
+few milliseconds a step at 0.9M parameters.
+
+Stops are voted at the step. Validation runs on every GPU over unpadded,
+disjoint shards and is gathered, as is the training summary. `train()` forwards
+a SIGTERM aimed at the launcher to the GPU processes.
+
+**Tested with real processes** (gloo, CPU, 2 and 3 of them): every step against
+a single-process reference, the replicas compared bit for bit, in four cases —
+all contributing; one GPU with an unusable scene; one out of memory on every
+attempt; one skipping *every* batch — plus a stop on one GPU stopping all at the
+same step, and `train()` end to end with a resume. Every run has a timeout, so a
+hang fails instead of stalling. Moving the rescale back to its old place fails
+the test (checked).
+
+### The six additions
+
+1. **Stage two** — `reassembly.assembly`: mutual nearest neighbours in the
+   invariant embedding between fracture vertices of different fragments, normal
+   opposition as a per-match weight (not an energy over `t`, where it has zero
+   gradient), weighted Laplacian least squares in float64 with IRLS + Huber,
+   optional sphere collision relief. `evaluate` reports RMSE(T), Chamfer
+   (whole shape — the benchmark's CD — and per part) and part accuracy in world
+   units, per scene then over scenes, by category. A perfect prediction scores
+   RMSE 0, CD 0, PA 1 (tested). The batch now carries each fragment's divisor,
+   centroid and fracture mask to make world units recoverable.
+2. **The perturbed copy made on the device**, by rotation (`perturb_on_device`,
+   default on). **Measured, and the saving is small** — the copy was already
+   made by rotating, not recomputing. The same measurement found where the
+   loader's time actually went, so the pair lists moved to the device too
+   (on GPU runs; on CPU they stay in the parallel loader workers). Per batch of
+   two synthetic scenes, loader side (build + collate; reading and labelling are
+   the same in all three and excluded), one CPU thread:
+
+   | | median scene, ~10k vertices | large scene, ~82k vertices |
+   |---|---|---|
+   | before: copy + pairs in the loader | 810 ms, 112.5 MB | 1374 ms, 213.4 MB |
+   | copy on the device | 784 ms (97%), 107.6 MB (96%) | 1053 ms (77%), 174.0 MB (82%) |
+   | copy + pairs on the device | 147 ms (18%), 7.3 MB (6%) | 543 ms (40%), 57.9 MB (27%) |
+
+   The pair lists are ~3.1M ordered pairs per four-fragment scene at 2,048
+   tokens — two int64 lists, 89% of the batch's bytes — and took ~0.6 s of CPU to
+   build. **Not measured: the GPU's side** (three batched matmuls and one index
+   build per step), for want of a GPU here. `python -m scripts.benchmark_data`
+   measures all three ways on the real data and times the device side,
+   synchronised, on whatever GPU runs it — run it on Kaggle before relying on
+   these numbers.
+
+   **Retraction.** §10 called this change "the single largest attack on the
+   645 ms/scene CPU cost". That was carried over from the earlier design, where
+   the perturbed view was built by re-running feature extraction. Here it never
+   was, and the measured share is 3–23% of loader time; the pair lists were the
+   large cost.
+3. **An out-of-memory batch is retried** with gradient checkpointing forced on
+   every layer — identical gradient (bitwise, on one thread; tested), less
+   memory, more time — and skipped only if that fails too. Each micro-batch's
+   gradient is computed with the running total set aside, so a failure part-way
+   through a backward discards that micro-batch alone.
+4. **Repairs counted, failures named, repeat offenders tracked.** Zero-area
+   faces and zero-length vertex normals are counted per scene (repaired to zero,
+   never NaN — which is why they must be counted); non-finite coordinates skip
+   the scene by name; a finite loss with a non-finite gradient is dropped too. A
+   failed batch is charged to every scene in it — across epochs the culprit
+   accumulates while its partners change — in a tally kept in the checkpoint
+   and `offenders.json`. A scene failing in more than one epoch is printed as a
+   repeat offender with the command that diagnoses it.
+5. **Fixed-length epochs**, `steps_per_epoch = 800` batches per GPU by default
+   (`0` = one full pass). A restarted partial epoch now rewinds its step count to
+   where the epoch began, so an interrupted run's learning-rate schedule matches
+   an uninterrupted one.
+6. **Tools**: `benchmark_data`, `check_scene` (with `--locate`, and a gradient
+   stage), `dump_prediction` (with the solver's placement), `visualize_reassembly`,
+   `render_gif`, `scaling_sweep` (with `--max-objects`, a new Config field),
+   `check_version` (every file compiles, every fix present, no shadowed tests).
+   All take the training `Config` flags (`scripts/config_flags.py`).
+
+### Still outstanding
+
+- Everything above is verified on CPU and synthetic scenes. The first real
+  multi-GPU run should confirm replicas stay identical there too
+  (`reassembly.distributed.parameters_differ`), and `benchmark_data` should be run
+  on the real data on the T4s.
+- The perturbed-view edge arrays still ship both directions of every edge; the
+  reverse copy is derivable (`(n2, n1, −δ)`), which would halve the remaining
+  edge bytes.
+- GARF's comparable row is the **vanilla Everyday supplementary** table
+  (SE(3)-Equiv 79.30°, GARF-mini 10.41°), not the headline one.

@@ -3,7 +3,8 @@ Train, resume, or evaluate the V-GAT reassembly model.
 
     python -m scripts.train --root D:\\path\\to\\breaking_bad --preflight
     python -m scripts.train --root D:\\path\\to\\breaking_bad --epochs 40
-    python -m scripts.train --root ... --evaluate            # score best.pt
+    python -m scripts.train --root ... --evaluate            # score best.pt, assembled
+    python -m scripts.train --root ... --devices 2           # both GPUs (the default: all)
     python -m scripts.train --root ... --devices 1           # one GPU
 
 Interrupted runs continue by themselves: rerun the same command and it loads
@@ -83,41 +84,19 @@ than letting the spawn fail obscurely.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import sys
 from pathlib import Path
 
 # Same bootstrap as every other script here, so a clone runs without installing.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from reassembly.training import Config, evaluate, preflight, train
-
-
-_CHOICES = {
-    "split_by": ("object", "fracture"),
-    "fracture_pool": ("train", "all"),
-    "balance": ("none", "category", "object"),
-    "symmetry_axis": ("x", "y", "z"),
-    "label_method": ("dihedral", "coincidence"),
-    "normalize_mode": ("scene", "fragment"),
-}
-
-_CHOICE_HELP = {
-    "split_by": "what is held out: whole shapes (object, the benchmark) or "
-                "break patterns (fracture, an easier diagnostic question)",
-    "fracture_pool": "which objects the fracture split draws from: the official "
-                     "training shapes (train) or every shape (all)",
-    "balance": "correct the category imbalance when sampling training data: "
-               "uniform over categories then objects then modes (category), "
-               "over objects only (object), or not at all (none)",
-    "symmetry_axis": "the dataset's canonical up-axis, for the reported "
-                     "tilt/twist split only",
-}
+from reassembly.training import evaluate, preflight, train  # noqa: E402
+from scripts.config_flags import add_config_arguments, config_from_args  # noqa: E402,F401
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """One flag per config field, typed from the dataclass itself."""
-    config = Config()
+    """One flag per config field (``scripts.config_flags``), plus the modes."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -126,7 +105,20 @@ def build_parser() -> argparse.ArgumentParser:
                              "this machine, then exit without training")
     parser.add_argument("--evaluate", action="store_true",
                         help="score a checkpoint on a held-out split and exit")
-    parser.add_argument("--checkpoint", default="best.pt")
+    parser.add_argument("--checkpoint", default="best.pt",
+                        help="a path, or a file name inside --out-dir")
+    parser.add_argument("--no-assemble", dest="assemble", action="store_false",
+                        help="with --evaluate: rotation metrics only, no "
+                             "translation solver (so no RMSE(T), Chamfer or "
+                             "part accuracy)")
+    parser.add_argument("--collision", action="store_true",
+                        help="with --evaluate: push apart overlapping fragments "
+                             "after solving (off: it trades metric accuracy for "
+                             "looks)")
+    parser.add_argument("--data-from-flags", action="store_true",
+                        help="with --evaluate: use the flags' data settings "
+                             "instead of the checkpoint's (split, labels, "
+                             "tokens, normalisation)")
     parser.add_argument(
         "--split", default="val", choices=["train", "val", "test"],
         help="which split to score. Defaults to val, NOT test: Breaking Bad "
@@ -134,42 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
              "is no official test partition and asking for one falls back to a "
              "hashed split that is comparable with nothing. --split-by fracture "
              "does define a test partition, of held-out break patterns.")
-
-    for field in dataclasses.fields(Config):
-        flag = "--" + field.name.replace("_", "-")
-        current = getattr(config, field.name)
-        if isinstance(current, bool):
-            # Both directions, so a default-true flag can actually be turned off.
-            parser.add_argument(flag, dest=field.name, action="store_true",
-                                default=None)
-            parser.add_argument("--no-" + field.name.replace("_", "-"),
-                                dest=field.name, action="store_false")
-        elif field.name == "schedule":
-            parser.add_argument(flag, nargs="+", default=None,
-                                help="layer kinds in order, e.g. intra intra cross intra")
-        elif field.name == "subsets":
-            parser.add_argument(flag, nargs="+", default=None)
-        elif field.name in _CHOICES:
-            # Enumerated fields get their options on the flag itself, so a typo
-            # is caught by argparse with the alternatives printed rather than
-            # by a Config assertion after the dataset has been scanned.
-            parser.add_argument(flag, choices=_CHOICES[field.name], default=None,
-                                help=_CHOICE_HELP.get(field.name))
-        elif isinstance(current, int) or current is None and field.name in (
-            "modes_per_scene", "limit_train", "limit_val"
-        ):
-            parser.add_argument(flag, type=int, default=None)
-        elif isinstance(current, float):
-            parser.add_argument(flag, type=float, default=None)
-        else:
-            parser.add_argument(flag, type=str, default=None)
-    return parser
-
-
-def config_from_args(args: argparse.Namespace) -> Config:
-    names = {f.name for f in dataclasses.fields(Config)}
-    overrides = {k: v for k, v in vars(args).items() if k in names and v is not None}
-    return Config(**overrides)
+    return add_config_arguments(parser)
 
 
 def main() -> None:
@@ -178,7 +135,9 @@ def main() -> None:
     if args.preflight:
         raise SystemExit(0 if preflight(config) else 1)
     if args.evaluate:
-        evaluate(config, checkpoint=args.checkpoint, split=args.split)
+        evaluate(config, checkpoint=args.checkpoint, split=args.split,
+                 assemble=args.assemble, collision=args.collision,
+                 data_from_checkpoint=not args.data_from_flags)
     else:
         train(config)
 

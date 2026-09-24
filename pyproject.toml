@@ -37,7 +37,10 @@ stats = ["pandas>=2.0"]
 # download.pytorch.org. The CUDA wheels are on PyPI and the pytorch.org index
 # is blocked from some networks.
 torch = ["torch>=2.2"]
-dev = ["pytest>=7.4", "pandas>=2.0", "torch>=2.2"]
+# The reassembly GIFs and figures (scripts.render_gif). An on-screen viewer
+# window (scripts.visualize_reassembly) additionally needs "pyglet<2".
+figures = ["matplotlib>=3.7", "pillow>=10.0"]
+dev = ["pytest>=7.4", "pandas>=2.0", "torch>=2.2", "matplotlib>=3.7", "pillow>=10.0"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }

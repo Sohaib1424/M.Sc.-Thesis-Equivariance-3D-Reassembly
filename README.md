@@ -113,7 +113,8 @@ edge the model never sees while a spurious one is only noise.
 - `torch` ≥ 2.2 for the network and training (install from the **default** PyPI
   index; `download.pytorch.org` is blocked on some networks and the CUDA wheels
   are on PyPI anyway)
-- `pandas` for the summary tables and figures; `matplotlib` for the figures
+- `pandas` for the summary tables and figures; `matplotlib` for the figures;
+  `pillow` for the reassembly GIFs; `pyglet<2` only for an on-screen viewer window
 - The Breaking Bad dataset (not redistributable — [download it here](https://breaking-bad-dataset.github.io/))
 
 **The test suite does not need `libigl`.** It builds its meshes in
@@ -127,7 +128,7 @@ tests still pass and the network tests skip.
 git clone <this-repo> && cd <this-repo>
 python -m venv .venv && source .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest                                        # 396 passed
+python -m pytest                                        # 445 passed
 ```
 
 Installing is optional — `pytest.ini` sets `pythonpath = src .` and each script
@@ -263,6 +264,10 @@ src/reassembly/
 │   ├── transforms.py              SE(3) perturbation, centring, normalisation
 │   └── features.py                meshes → tensors, and the batch collate
 ├── training.py                 ★  config, dataset, loops, checkpoints, metrics
+├── distributed.py                 1, 2 or N GPUs: one all-reduce per optimizer step
+├── assembly/
+│   ├── translation.py             stage two: match in embedding space, solve for t
+│   └── scoring.py                 RMSE(T), Chamfer, part accuracy, in world units
 ├── nn/
 │   ├── vn.py                  ★   Vector Neuron primitives, Gram-Schmidt head
 │   ├── segment.py                 scatter reductions (no torch_scatter)
@@ -271,16 +276,27 @@ src/reassembly/
 │   ├── losses.py                  the composite objective, verified chance values
 │   └── model.py                   the backbone and the rotation convention
 ├── evaluation/metrics.py          reported-only: tilt/twist, head|cos|, Chamfer, PA
-└── viz/scene.py                   scene assembly for rendering
+└── viz/
+    ├── scene.py                   scene assembly for rendering
+    └── reassembly.py              poses and frames for animating a prediction
 
 scripts/
+├── train.py                       train, resume, preflight, evaluate
+├── config_flags.py                one flag per Config field, shared by the tools
+├── benchmark_data.py              where the data pipeline's time goes
+├── check_scene.py                 why a named scene fails (--locate: which module)
+├── dump_prediction.py             one prediction + its assembly, to a small .npz
+├── visualize_reassembly.py        watch a dump reassemble
+├── render_gif.py                  a dump as a GIF or PNG figure
+├── scaling_sweep.py               error vs number of objects, confounds controlled
+├── check_version.py               is this copy the edited copy?
 ├── extract_fracture_surfaces.py   exhaustive pass over the dataset
 ├── plot_fracture_stats.py         the README figure
 ├── analyze_graph_cost.py          graph size vs GARF
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             396 tests, no skips
+tests/                             445 tests, no skips
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -310,11 +326,67 @@ python -m scripts.train --root /path/to/breaking_bad --epochs 40
 python -m scripts.train --root /path/to/breaking_bad --evaluate
 ```
 
-On Kaggle's two T4s, `devices=2` spawns one process per GPU — from a *file*,
-not a notebook cell (`scripts/train.py` explains why). It refuses to print a
-verdict a run did not earn: a result at chance, one parked at the ~90°
-axis-only landmark, and one still descending at its cutoff are each flagged for
-what they are.
+It refuses to print a verdict a run did not earn: a result at chance, one
+parked at the ~90° axis-only landmark, and one still descending at its cutoff
+are each flagged for what they are.
+
+### One GPU, two, or more
+
+`--devices` picks them: `-1` (the default) every visible GPU, `1` one, `N` the
+first N, `0` the CPU. More than one runs one process per GPU — from a *file*,
+not a notebook cell (`scripts/train.py` explains why) — and each draws its own
+share of every epoch.
+
+The GPUs meet only where every one of them is guaranteed to arrive: once per
+optimizer step (how many fragments contributed on each, whether any wants to
+stop, then one all-reduce of the summed gradient) and once per epoch (the
+summaries, so the logged numbers cover every GPU's data). Between those, a GPU
+can skip a batch that is too large, drop one whose loss or gradient is not
+finite, or retry one that ran out of memory, and no other GPU is waiting on it.
+The step is the exact fragment-weighted mean over every fragment that
+contributed on any GPU, and every replica applies the identical update.
+
+That replaced a `DistributedDataParallel` path with two faults, both silent. It
+rescaled each GPU's gradient by its *own* fragment count after the all-reduce,
+so the replicas took different steps and drifted apart for good; and its skips
+were decided per GPU while DDP all-reduces inside every syncing backward, so a
+GPU that skipped met its peer one time fewer and the last all-reduce of the
+epoch waited forever. `tests/test_distributed.py` runs two and three real
+processes, checks every step against a one-process reference and the replicas
+bit for bit, and fails on a hang instead of stalling. (Mutation-checked: moving
+the rescale back to the old place fails it.)
+
+Stopping — the time budget, or SIGTERM — is voted at the step, so all GPUs stop
+at the same one and rank 0 checkpoints. Validation runs on every GPU over
+disjoint, unpadded shards, so each scene is scored once.
+
+### An epoch is a fixed amount of training
+
+`--steps-per-epoch 800` (the default) makes an epoch 800 batches per GPU,
+whatever the split size, `--modes-per-scene`, balancing or GPU count. On two
+T4s at `--batch-size 2` that is 3,200 scenes — about one pass over the Everyday
+training split, so earlier numbers stay comparable; on one GPU it is 1,600
+scenes and the same number of optimizer steps. `--steps-per-epoch 0` goes back
+to one full pass. The banner prints what an epoch is in scenes and passes. For a
+smoke test with `--limit-train`, use `--steps-per-epoch 0` or a small number —
+800 steps over 40 scenes is forty passes.
+
+### What happens to a batch that fails
+
+| | |
+|---|---|
+| out of memory | retried once with gradient checkpointing forced on every layer (same gradient, less memory, more time); skipped only if that fails too |
+| non-finite loss | dropped before the backward |
+| finite loss, non-finite gradient | dropped (fp32; under AMP the GradScaler does this job) |
+| more than `--max-vertices-per-batch` | skipped before it is attempted (optional) |
+
+Each is counted, and named by the scenes in it. A tally of failed scenes
+survives across epochs and sessions (in the checkpoint and `offenders.json`);
+a scene that fails in more than one epoch is printed as a **repeat offender**
+— it is effectively excluded from training — with the command that diagnoses
+it: `python -m scripts.check_scene --scene <name> --locate`. Degenerate
+geometry repaired to zero normals is counted every epoch too, and a scene with
+non-finite coordinates is skipped by name.
 
 ### Before you spend a session: preflight
 
@@ -341,10 +413,11 @@ from there. Preflight checks the things that are:
 
 The defaults — `batch_size=2`, `accumulate=1`, `checkpoint_cross=True` — are the
 ones **measured** to fit a 15.6 GB T4: 11.96 GB (76%) on the largest of twelve
-sampled Breaking Bad scenes. Watch the skipped-batch count in the first epoch;
-the dataset's largest single fragment is four times anything preflight samples,
-so some scenes will not fit. Training counts and reports those rather than
-swallowing them, and more than a percent or two means `--batch-size 1
+sampled Breaking Bad scenes. Watch the out-of-memory counts in the first
+epoch; the dataset's largest single fragment is four times anything preflight
+samples, so some scenes will not fit. Training retries those with gradient
+checkpointing and reports how many were rescued and how many were still
+skipped, and more than a percent or two skipped means `--batch-size 1
 --accumulate 4` — dropping the largest objects is a bias in the result, not a
 performance detail.
 
@@ -399,7 +472,39 @@ project how many more sessions are left:
   ~1:04:12/epoch, 31 epoch(s) left = ~33:10:12  (4 more session(s) at 11h)
 ```
 
-**Not in this repository yet:** the translation solver (stage two).
+### Stage two and the benchmark numbers
+
+`--evaluate` assembles as well as rotates: the translation solver
+(`reassembly.assembly`) matches fracture vertices across fragments in the
+network's invariant embedding, weights each match by how opposed its normals
+are, and solves the translations by weighted least squares with a Huber
+reweighting. Scores are Breaking Bad's — RMSE(T), Chamfer distance, part
+accuracy (per-fragment Chamfer below 0.01) — in world units, per scene then
+over scenes, with a per-category table. `--no-assemble` reports rotation only,
+and says so. The model and, by default, the data definition come from the
+checkpoint itself, with every setting that differs from the flags printed
+(`--data-from-flags` keeps the flags' data settings).
+
+```bash
+python -m scripts.train --root /path/to/breaking_bad --evaluate --checkpoint best.pt
+python -m scripts.dump_prediction --root ... --checkpoint best.pt --scene <object>/<mode> --out pred.npz
+python -m scripts.visualize_reassembly --dump pred.npz --mode compare
+python -m scripts.render_gif --dump pred.npz --out reassembly.gif
+```
+
+A dump is a small `.npz` with plain arrays, so it can be copied off Kaggle and
+watched on any machine with a clone and trimesh (no torch).
+
+### Tools
+
+| | |
+|---|---|
+| `scripts.benchmark_data` | per-stage data cost, loader throughput, and where to finish a batch — CPU or GPU, measured |
+| `scripts.check_scene` | why a named scene fails: the mesh, fp32, AMP, or the gradient; `--locate` names the module |
+| `scripts.scaling_sweep` | error against the number of objects, with a fixed budget *per object* and truncated runs excluded |
+| `scripts.check_version` | a copy of the project that compiles and carries every fix, checked in a second |
+
+Every tool takes the same `Config` flags as training (`scripts/config_flags.py`).
 
 An earlier VN-GAT implementation fit small subsets (43° train error against a
 126.5° chance baseline) but did not generalise — validation stayed near 94–102°

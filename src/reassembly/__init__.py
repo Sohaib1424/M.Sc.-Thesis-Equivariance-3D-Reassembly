@@ -12,6 +12,17 @@ Layout
 ``reassembly.data``
     Dataset traversal: scene discovery, fragment decompression, SE(3)
     perturbation.
+``reassembly.nn``
+    The network: Vector Neuron primitives, graph and cross-fragment
+    attention, the losses.
+``reassembly.training``
+    Config, dataset, the epoch loop, checkpoints, evaluation, preflight.
+``reassembly.distributed``
+    One process per GPU; the per-step gradient all-reduce.
+``reassembly.assembly``
+    Stage two: the translation solver and the benchmark scores.
+``reassembly.evaluation``
+    Reported-only diagnostics and metrics.
 ``reassembly.viz``
     Optional rendering. Nothing else in the package depends on it.
 

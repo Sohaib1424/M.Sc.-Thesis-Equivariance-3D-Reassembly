@@ -425,6 +425,12 @@ def test_config_rejects_settings_that_would_fail_later():
         Config(label_method="guess")
     with pytest.raises(ValueError):
         Config(epochs=0)
+    with pytest.raises(ValueError):
+        Config(steps_per_epoch=-1)
+    with pytest.raises(ValueError):
+        Config(max_objects=0)
+    with pytest.raises(ValueError):
+        Config(accumulate=0)
 
 
 def test_cli_flags_round_trip_into_the_config():
@@ -1080,29 +1086,124 @@ class _Lambda(torch.nn.Module):
         return self.fn(x)
 
 
-def test_under_ddp_an_out_of_memory_stops_instead_of_skipping():
-    """
-    Skipping is safe alone and *unsafe* under DDP.
+def _checkpointing_on(model) -> bool:
+    from reassembly.nn.gat import VNGraphAttention
 
-    A rank that runs out of memory has already all-reduced some gradient
-    buckets, so its peer is waiting on buckets that will never arrive. Skipping
-    the batch on one rank and not the other hangs the job silently -- which
-    costs the whole session, where stopping costs one epoch and checkpoints it.
+    return all(m.checkpoint for m in model.modules() if isinstance(m, VNGraphAttention))
+
+
+def _step_gradients(model, loader, config, forward=None):
+    """Run the real loop and capture the gradient handed to each optimizer step."""
+    import unittest.mock as mock
+
+    import reassembly.training as training
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)   # lr 0: grads survive
+    captured, real = [], optimizer.step
+    optimizer.step = lambda: (captured.append(_grad_vector(model)), real())
+    patch = (mock.patch.object(training, "_forward", forward) if forward
+             else mock.patch.object(training, "_forward", training._forward))
+    with patch:
+        summary, _, _ = run_epoch(model, loader, build_criterion(config), config,
+                                  optimizer=optimizer, step=0, total_steps=10,
+                                  label="train", show_progress=False)
+    return summary, captured
+
+
+def test_an_out_of_memory_is_retried_with_checkpointing_before_it_is_skipped():
     """
+    A batch that does not fit is retried once with gradient checkpointing on
+    every layer -- and if that fits, it contributes exactly what it would have
+    contributed the first time. It used to be dropped (one GPU) or to stop the
+    whole run (several), and the batches that run out of memory are the
+    largest scenes, so dropping them biases training toward small objects.
+    """
+    import reassembly.training as training
+
+    config = Config(channels=16, heads=4, workers=0, batch_size=1,
+                    checkpoint_cross=False, checkpoint_intra=False)
+    real = training._forward
+
+    def tight(model_, batch, criterion, config_):
+        """Only fits with checkpointing on -- the way a borderline scene does."""
+        if not _checkpointing_on(model_):
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return real(model_, batch, criterion, config_)
+
+    # One thread, so the comparison can be exact: with several, CPU reductions
+    # are scheduled nondeterministically and two identical plain runs already
+    # differ by ~1e-6 -- which would hide a real difference of that size.
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        torch.manual_seed(0)
+        model = build_model(config)
+        summary, retried = _step_gradients(model, _loader(3), config, forward=tight)
+        torch.manual_seed(0)
+        reference_model = build_model(config)
+        _, reference = _step_gradients(reference_model, _loader(3), config)
+    finally:
+        torch.set_num_threads(threads)
+    assert summary["oom"] == 0 and summary["oom_recovered"] == 3
+    assert not _checkpointing_on(model), "the forced setting must be undone"
+    assert len(retried) == len(reference) == 3
+    for a, b in zip(retried, reference):
+        assert torch.equal(a, b), "the retry changed the gradient"
+
+
+def test_the_gpus_meet_once_per_step_whatever_each_one_skipped(monkeypatch):
+    """
+    Problem (2) of the old multi-GPU path, pinned in one process.
+
+    The GPUs have to call the same collective operations the same number of
+    times, or one of them waits forever. They used to meet inside every
+    syncing backward -- so a GPU that skipped a batch (too big, empty,
+    non-finite, out of memory) met one time fewer than its peer, and the last
+    all-reduce of the epoch hung. Now they meet only at optimizer steps, which
+    are fixed by batch *position*: here, every batch is skipped and the count
+    of meetings is exactly what it is when none is.
+    """
+    import reassembly.distributed as dist
+
+    calls = {"scalars": 0}
+    real = dist.sum_scalars
+
+    def counting(values, device="cpu"):
+        calls["scalars"] += 1
+        return real(values, device)
+
+    monkeypatch.setattr(dist, "sum_scalars", counting)
+
+    def meetings(max_vertices, batches):
+        calls["scalars"] = 0
+        torch.manual_seed(0)
+        config = Config(channels=16, heads=4, workers=0, batch_size=1,
+                        accumulate=2, max_vertices_per_batch=max_vertices)
+        model = build_model(config)
+        run_epoch(model, _loader(batches), build_criterion(config), config,
+                  optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
+                  step=0, total_steps=10, label="train", show_progress=False,
+                  distributed=True)
+        return calls["scalars"]
+
+    assert meetings(0, 4) == 2, "four batches at accumulate=2 are two steps"
+    assert meetings(1, 4) == 2, "skipping every batch must not change that"
+    assert meetings(0, 5) == 3, "a trailing partial group is stepped, not carried over"
+
+
+def test_a_step_with_nothing_in_it_does_not_move_the_weights():
+    """AdamW moves weights on momentum and decay alone; an empty step must not call it."""
     torch.manual_seed(0)
-    config = Config(channels=16, heads=4, workers=0, batch_size=1)
+    config = Config(channels=16, heads=4, workers=0, batch_size=1,
+                    max_vertices_per_batch=1)
     model = build_model(config)
-    model.embedding = torch.nn.Sequential(model.embedding,
-                                          _Lambda(_OOMOnBackward.apply))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-
-    summary, _, stopped = run_epoch(
-        model, _loader(), build_criterion(config), config, optimizer=optimizer,
-        step=0, total_steps=10, label="train", show_progress=False,
-        distributed=True,
-    )
-    assert stopped is True, "DDP must stop rather than desynchronise the ranks"
-    assert summary["oom"] == 1, "it should stop on the first one, not keep trying"
+    before = [p.detach().clone() for p in model.parameters()]
+    summary, _, _ = run_epoch(model, _loader(2), build_criterion(config), config,
+                              optimizer=torch.optim.AdamW(model.parameters(), lr=1e-2),
+                              step=0, total_steps=10, label="train",
+                              show_progress=False)
+    assert summary["empty_steps"] == 2 and summary["steps"] == 0
+    assert all(torch.equal(a, b) for a, b in zip(before, model.parameters()))
 
 
 def test_an_oversized_batch_is_skipped_before_it_is_attempted():
@@ -1161,85 +1262,6 @@ def test_token_reach_survives_a_scene_with_no_tokens():
     from reassembly.training import _token_reach
 
     assert _token_reach([], 3) == [0.0, 0.0, 0.0]
-
-
-def test_accumulation_skips_the_gradient_sync_it_cannot_use():
-    """
-    Under DDP every `backward` all-reduces the full gradient. During
-    accumulation all but the last of those is overwritten by the next
-    micro-batch, so paying for it is pure waste — and preflight *recommends*
-    `--accumulate 2` whenever the batch has to be halved, which is exactly the
-    configuration this run uses.
-
-    Checked by counting `no_sync` entries rather than by timing: a wrapper that
-    records them stands in for DDP, so the test says which micro-batches skipped
-    the sync, not merely that the run got faster.
-    """
-    import contextlib
-
-    torch.manual_seed(0)
-    config = Config(channels=16, heads=4, workers=0, batch_size=1, accumulate=2)
-    model = build_model(config)
-    entered = []
-
-    class _CountsSync(torch.nn.Module):
-        """Stands in for DistributedDataParallel: forwards, and counts."""
-
-        def __init__(self, inner):
-            super().__init__()
-            self.inner = inner
-
-        def forward(self, *a, **k):
-            return self.inner(*a, **k)
-
-        @contextlib.contextmanager
-        def no_sync(self):
-            entered.append(len(entered))
-            yield
-
-    wrapped = _CountsSync(model)
-    loader = torch.utils.data.DataLoader(_Fixed(4), batch_size=1,
-                                         collate_fn=_collate_samples)
-    run_epoch(wrapped, loader, build_criterion(config), config,
-              optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
-              step=0, total_steps=10, label="train", show_progress=False)
-
-    # Four batches at accumulate=2: micro-batches 0 and 2 skip the sync, 1 and 3
-    # perform it because they close an accumulation group.
-    assert len(entered) == 2, (
-        f"expected 2 skipped syncs over 4 batches at accumulate=2, got {len(entered)}"
-    )
-
-
-def test_without_accumulation_every_step_syncs():
-    """`accumulate=1` closes a group every batch, so nothing may be skipped."""
-    import contextlib
-
-    torch.manual_seed(0)
-    config = Config(channels=16, heads=4, workers=0, batch_size=1, accumulate=1)
-    model = build_model(config)
-    entered = []
-
-    class _CountsSync(torch.nn.Module):
-        def __init__(self, inner):
-            super().__init__()
-            self.inner = inner
-
-        def forward(self, *a, **k):
-            return self.inner(*a, **k)
-
-        @contextlib.contextmanager
-        def no_sync(self):
-            entered.append(1)
-            yield
-
-    run_epoch(_CountsSync(model),
-              torch.utils.data.DataLoader(_Fixed(4), batch_size=1,
-                                          collate_fn=_collate_samples),
-              build_criterion(config), config,
-              optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
-              step=0, total_steps=10, label="train", show_progress=False)
-    assert entered == []
 
 
 def _grad_vector(model):

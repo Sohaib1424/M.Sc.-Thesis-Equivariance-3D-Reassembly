@@ -149,7 +149,7 @@ def head_collinearity(axes: Tensor) -> Tensor:
 # --------------------------------------------------------------- assembly --
 
 def chamfer_distance(predicted: Tensor, target: Tensor,
-                     chunk: int = 4096) -> Tensor:
+                     chunk: Optional[int] = None) -> Tensor:
     """
     Symmetric Chamfer distance between two point clouds, as a mean of **squared**
     distances, in float64.
@@ -177,24 +177,32 @@ def chamfer_distance(predicted: Tensor, target: Tensor,
     free: the direct difference costs the same memory once chunked, and float64
     on a point cloud of this size is not the bottleneck.
 
-    Chunked over the first cloud so a 100k-vertex fragment does not need a
-    100k x 100k matrix.
+    Chunked over each cloud in turn. A fixed row count bounds only one side of
+    the ``(rows, other, 3)`` difference tensor -- 4,096 rows against a
+    40,000-point assembly is 3.9 GB in float64 -- so by default the row count
+    is derived from the other cloud's size, keeping each block near 16M
+    elements (128 MB). Pass ``chunk`` to fix it.
     """
     a = predicted.double()
     b = target.double()
     if a.numel() == 0 or b.numel() == 0:
         return torch.tensor(float("nan"), dtype=torch.float64, device=a.device)
 
+    def rows(other: int) -> int:
+        return int(chunk) if chunk else max(1, (1 << 24) // (3 * max(other, 1)))
+
     forward = a.new_empty(a.shape[0])
-    for start in range(0, a.shape[0], chunk):
-        block = a[start:start + chunk]
+    step = rows(b.shape[0])
+    for start in range(0, a.shape[0], step):
+        block = a[start:start + step]
         distances = (block.unsqueeze(1) - b.unsqueeze(0)).pow(2).sum(-1)
-        forward[start:start + chunk] = distances.amin(dim=1)
+        forward[start:start + step] = distances.amin(dim=1)
     backward = b.new_empty(b.shape[0])
-    for start in range(0, b.shape[0], chunk):
-        block = b[start:start + chunk]
+    step = rows(a.shape[0])
+    for start in range(0, b.shape[0], step):
+        block = b[start:start + step]
         distances = (block.unsqueeze(1) - a.unsqueeze(0)).pow(2).sum(-1)
-        backward[start:start + chunk] = distances.amin(dim=1)
+        backward[start:start + step] = distances.amin(dim=1)
     return forward.mean() + backward.mean()
 
 

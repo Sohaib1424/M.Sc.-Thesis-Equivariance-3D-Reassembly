@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 311 tests, clean under `-W error` |
+| Pipeline | **built** — 396 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -22,6 +22,7 @@ implementing anything from it.
 | Third preflight | `batch_size=2` fits at 76%; preflight itself is now tested end to end |
 | First real run | 13 min on 400 objects — caught an embedding loss minimised by collapse |
 | Two full epochs | rotation flat at chance after 3,536 steps; OOM guard, DDP skip and both time projections fixed |
+| Audit against the earlier design | seven defects found and fixed, two experiment controls added — see §10 |
 
 ---
 
@@ -302,9 +303,9 @@ All measured by Monte Carlo in `tests/test_losses.py`, not assumed.
 | Quantity | Value |
 |---|---|
 | Chance geodesic error | 126.48° = π/2 + 2/π |
-| Chance Euler RMSE, **random** prediction | 86.29° |
-| Chance Euler RMSE, **identity** prediction | 83.14° |
-| Axis correct, azimuth random | 89.9° |
+| Chance Euler RMSE, **random** prediction (residual convention) | 83.25° |
+| Chance Euler RMSE, **identity** prediction | 83.18° |
+| Axis correct, azimuth random | 90.0° |
 | Untrained `L_normal`, `L_face` | 1.0, 2.0 |
 | `L_position`, unit sphere | 4/3 |
 | Perfect prediction, any term | 0 (geodesic exactly; others to the 1e-8 norm floor) |
@@ -363,6 +364,11 @@ validation error. The previous VN-GAT reached **43° on training data** and
 stalled at ~94° on *validation*; 89.9° is a validation floor. A training number
 cannot clear it, because training error was never what was stuck there. The
 comparison was not evidence of anything and has been withdrawn.
+
+A second correction, Sept 2026: "floor" is the wrong word for 89.9° in either
+column. It is where a model sits when it has found the symmetry axis and not
+the rotation about it — a state, not a limit — and the earlier design's own
+scaling run reached 30.9° on eight Everyday objects. See §10.
 
 **Verified, no longer assumed.** `torch` installs fine from the *default* PyPI
 index (the earlier failure was `download.pytorch.org` being blocked, not torch
@@ -458,3 +464,83 @@ throws away every check that had already passed.
 - **Nothing has been trained.** Every number above is a property of the
   architecture, not evidence that it learns. The training loop, the GARF-metric
   evaluation and the translation solver are next.
+
+---
+
+## 10 · Audit against the earlier design (Sept 2026)
+
+A full read of the previous VN-GAT codebase (`Thesis 1`, 71 files) against this
+one. `docs/thesis1-review.md` holds the complete findings list; this section
+records only what was **changed here** as a result.
+
+### Defects fixed
+
+| | what was wrong | why it was invisible |
+|---|---|---|
+| **Non-finite loss reached `backward()`** | the `isfinite` check ran *after* the backward, so a NaN was already in `.grad` and, under DDP, already all-reduced to the peer | the counter said "skipped"; Adam's moments said otherwise, and never recover |
+| **`group_weight` leaked past an OOM** | `zero_grad` discards the whole accumulation group, but the weight was only reset at the optimizer step | the next step was silently scaled down by the discarded fraction — only on batches large enough to be interesting |
+| **Euler RMSE used the wrong convention** | `euler(pred) − euler(target)` componentwise is not a metric on SO(3) | it manufactured a 3° gap making "collapse to identity" look better than guessing; that artefact was documented as a property of the metric |
+| **Objects were double-counted** | `volume_constrained-*` variants were separate scene directories, so one shape was two objects | 809/181 reported against an official 407/91 — and a shape could be in train under one directory and val under the other, so the object split was not one |
+| **No official test split** | Breaking Bad ships train and val lists only | `--split test` fell back silently to a hashed split comparable with nothing |
+| **The 89.9° "floor"** | described as a structural limit of a per-fragment canonicaliser on surfaces of revolution | it is not a floor: a fragment of a symmetric object is not itself symmetric, its fracture boundary is unique. The earlier design reached 30.9° on eight Everyday objects |
+| **`E_normal` in the translation energy** | normals are translation-invariant, so `∂E_normal/∂t ≡ 0` and the joint minimisation is `E_pos` alone | DesignV5 §1.10 reproduces the joint energy and is wrong as written; the term belongs as a per-match weight |
+
+### Two experiment controls added
+
+**`--split-by {object,fracture}`** — what is held out. `object` is the
+benchmark: val shapes are never seen. `fracture` holds out *break patterns*
+instead, so train and val share every shape. The pair is diagnostic in a way
+neither is alone:
+
+- object at chance, fracture well under it → per-shape canonical orientations
+  learned, no transferable rule. Changing the representation or the loss, not
+  the data or the epoch count.
+- both at chance → generalisation is not the problem yet; look upstream.
+
+`fracture` draws only from the official *training* shapes, so the official
+validation shapes stay clean for the benchmark. It is a diagnostic, never a
+reported result.
+
+**`--balance {none,category,object}` with `--balance-temperature`** — Everyday's
+categories hold 17 bottles against 5 cups, so uniform sampling shows the model
+three bottles per cup and a shape prior is cheaper to fit than an orientation
+rule. `category` makes category, then object, then mode uniform in turn;
+temperature interpolates geometrically to natural frequency. Training only —
+validation is never reweighted, so settings stay comparable — and the startup
+banner reports the effective sample size, because balancing buys
+representativeness with variance.
+
+### Three diagnostics added
+
+- **tilt / twist** (`reassembly.evaluation.metrics.swing_twist_error`) — splits
+  the residual into rotation *off* the symmetry axis and *about* it. ~90°
+  geodesic has two causes that call for opposite work, and the mean cannot tell
+  them apart: `tilt ≈ 90` is "the axis is not learned either"; `tilt ≈ 0,
+  twist ≈ 90` is "the axis is learned, the azimuth is not".
+- **`head|cos|`** — collinearity of the two channels the rotation head feeds to
+  Gram–Schmidt. Near 1 means the frame's second column is numerical noise and
+  the prediction is one direction plus a random roll. Invisible in the loss
+  (the output is still a proper rotation), and one dot product per fragment.
+- **per-category validation breakdown** — the honest counterpart to balancing:
+  it shows what the model *does* per category on a val set that is never
+  reweighted, so "validation improved" can be told apart from "validation is
+  now dominated by different categories".
+
+Also added: `reassembly.evaluation.metrics` carries Chamfer distance (float64,
+direct differences — `cdist`'s expansion puts a scale-dependent floor under
+near-coincident points) and part accuracy, ready for the translation solver.
+
+### Still outstanding from the review
+
+- The translation solver itself — the corrected closed-form version: mutual-NN
+  matching in embedding space, normal compatibility as a per-match weight, a
+  weighted graph Laplacian solved in float64 with IRLS + Huber. Until it
+  exists, Chamfer and part accuracy cannot be reported end to end.
+- `rotate_per_fragment`: compute features once per fragment on the clean mesh
+  and derive the perturbed view by rotating the extracted vectors on GPU. Exact
+  for a rigid transform, and the single largest attack on the 645 ms/scene CPU
+  cost.
+- Collective voting on early exits (`all_ranks_agree`) — the deadline and
+  stop-signal are still local decisions, which is a latent DDP hang.
+- GARF's comparable row is the **vanilla Everyday supplementary** table
+  (SE(3)-Equiv 79.30°, GARF-mini 10.41°), not the headline one the docs quote.

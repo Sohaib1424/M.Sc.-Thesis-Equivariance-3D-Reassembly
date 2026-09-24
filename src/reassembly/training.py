@@ -72,6 +72,62 @@ class Config:
     root: str = "data"
     subsets: Optional[Sequence[str]] = None
     official_subset: str = "everyday"
+    mode_filter: Optional[str] = None
+    """
+    Keep only fracture-mode directories whose name starts with this --
+    ``"fractured_"`` for the standard break patterns only, excluding the
+    ``mode_*`` variants. ``None`` keeps every mode, which is the default
+    because the variants are additional break patterns of the *same* shape and
+    discarding them throws away data for no stated reason.
+    """
+    split_by: str = "object"
+    """
+    What is held out: whole shapes (``"object"``) or break patterns
+    (``"fracture"``). See :func:`reassembly.data.catalog.split_catalog`.
+
+    ``"object"`` is the default and the only setting whose numbers are
+    comparable with published results. ``"fracture"`` answers a different and
+    strictly easier question -- can the model orient a fragment of a shape it
+    HAS seen, broken in a way it has not -- and exists so the two can be run
+    against each other. A model at chance on ``object`` and well under it on
+    ``fracture`` has learned per-shape canonical poses rather than a
+    transferable rule; at chance on both, generalisation is not the problem.
+    """
+    fracture_pool: str = "train"
+    """
+    Which objects the fracture split draws from: ``"train"`` (the official
+    training shapes only, leaving the official val/test shapes untouched for
+    the benchmark) or ``"all"``. ``"all"`` is fine for a diagnostic and
+    disqualifying for a reported number.
+    """
+    val_frac: float = 0.1
+    test_frac: float = 0.1
+    """
+    Held-out proportions. Under ``split_by="object"`` they are used only when
+    no official list is found; under ``split_by="fracture"`` they are always
+    used, as the proportion of each object's modes held out.
+    """
+    split_seed: int = 0
+    balance: str = "none"
+    """
+    Correct the category imbalance when drawing training samples: ``"none"``,
+    ``"category"`` (uniform over categories, then objects, then modes) or
+    ``"object"`` (uniform over objects only). Everyday holds 17 distinct
+    bottles against 5 cups, so natural sampling shows the model roughly three
+    bottles per cup and a shape prior is cheaper to fit than an orientation
+    rule.
+
+    Training only. Validation is never reweighted -- a val number that moved
+    with the sampler would not be comparable across settings -- so the
+    per-category validation breakdown is the honest way to see whether
+    balancing helped.
+    """
+    balance_temperature: float = 1.0
+    """
+    ``0`` natural, ``1`` full balance, ``0.5`` square-root softening.
+    Full balance is not obviously right: it also means each cup is drawn 3.4x
+    as often as each bottle, which is a different skew rather than none.
+    """
     modes_per_scene: Optional[int] = 8
     """
     Fracture modes sampled per object per epoch. Breaking Bad ships ~80 modes
@@ -92,6 +148,14 @@ class Config:
     token_mode: str = "sample"
     token_metric: str = "geodesic"
     normalize_mode: str = "scene"
+    symmetry_axis: str = "z"
+    """
+    The dataset's canonical up-axis, used *only* for the reported tilt/twist
+    split. Verify it rather than assume it -- run evaluation with x, y and z
+    and see which shows the signature. A wrong choice makes the diagnostic
+    meaningless; it cannot make the training wrong, because nothing optimises
+    it.
+    """
     supervise_embedding: bool = True
     """Compute coincidence clusters for the embedding loss. Costs a KD-tree
     pass per sample; without it that loss term is absent."""
@@ -134,7 +198,7 @@ class Config:
     the pooled signal (2,048 tokens against a median 9,149 vertices) comes from
     vertices that never heard from another fragment. The network can compensate
     by scaling token features up, but it does not start there. See
-    `nn/model.py` for what to try if it parks at the axis-only floor.
+    `nn/model.py` for what to try if it parks at the axis-only landmark.
     """
 
     # -- loss weights (all 1.0 and untuned, on purpose) --------------------
@@ -248,6 +312,33 @@ class Config:
             raise ValueError(f"label_method must be dihedral or coincidence")
         if self.batch_size < 1 or self.epochs < 1:
             raise ValueError("batch_size and epochs must be >= 1")
+        from .data.catalog import BALANCE_SCHEMES, SPLIT_MODES
+
+        if self.split_by not in SPLIT_MODES:
+            raise ValueError(
+                f"split_by must be one of {SPLIT_MODES}, got {self.split_by!r}")
+        if self.fracture_pool not in ("train", "all"):
+            raise ValueError(
+                f"fracture_pool must be 'train' or 'all', got {self.fracture_pool!r}")
+        if self.balance not in BALANCE_SCHEMES:
+            raise ValueError(
+                f"balance must be one of {BALANCE_SCHEMES}, got {self.balance!r}")
+        if not 0.0 <= self.balance_temperature <= 1.0:
+            raise ValueError("balance_temperature must be in [0, 1]")
+        if not 0.0 <= self.val_frac < 1.0 or not 0.0 <= self.test_frac < 1.0:
+            raise ValueError("val_frac and test_frac must be in [0, 1)")
+        if self.val_frac + self.test_frac >= 1.0:
+            raise ValueError("val_frac + test_frac must leave something for training")
+        if self.split_by == "fracture":
+            # Not an error, and it is the point of the mode -- but a result
+            # from it is not a result on the benchmark, and that has to be said
+            # once where it cannot be missed rather than inferred from a config
+            # key three months later.
+            print("[config] split_by=fracture: train and val share every SHAPE "
+                  "and differ only in break pattern. This measures "
+                  "generalisation to unseen fractures of known objects, which "
+                  "is a strictly easier question than the benchmark's. Do not "
+                  "report a number from it as an object-split result.")
         if not self.supervise_embedding and self.w_embedding:
             # Not an error -- it is a legitimate ablation -- but it must not be
             # silent. The embedding-consistency loss is the only supervision the
@@ -263,14 +354,33 @@ class Config:
 
 # Reference values every metric is read against. Measured by Monte Carlo in
 # tests/test_losses.py, not asserted from memory.
+#
+# `euler_identity_deg` used to sit 3 deg BELOW `euler_rmse_deg`, and that gap
+# was treated here, in the banner and in the design document as a property of
+# the metric worth warning about. It was a property of our own convention:
+# subtracting two Euler charts componentwise. `euler_rmse` now reports the
+# angles of the residual rotation, and the gap closes to Monte-Carlo noise --
+# so collapsing to the identity buys nothing and there is no trap left to warn
+# about. Both numbers are kept because a reference table with one row reads as
+# though the other were never checked.
 CHANCE = {
     "geodesic_deg": 126.48,      # pi/2 + 2/pi
-    "euler_rmse_deg": 86.29,     # random prediction
-    "euler_identity_deg": 83.14,  # ALWAYS-IDENTITY beats random on this metric
-    "axis_only_deg": 89.9,       # axis recovered, rotation about it not
+    "euler_rmse_deg": 83.25,     # random prediction, residual convention
+    "euler_identity_deg": 83.18,  # always-identity: the same, within noise
+    "axis_only_deg": 90.0,       # axis recovered, rotation about it uniform
     "normal": 1.0,
     "face": 2.0,
 }
+
+# `axis_only_deg` is a LANDMARK, not a floor. A model parked at ~90 deg has
+# found the object's symmetry axis and not the rotation about it -- which the
+# tilt/twist split in `reassembly.evaluation.metrics` distinguishes directly
+# (tilt ~ 0 with twist ~ 90). It was previously described as a floor that a
+# per-fragment canonicaliser could not beat on surfaces of revolution. That is
+# false, and measurably so: a fragment of a symmetric object is not itself
+# symmetric, because its fracture boundary is jagged and unique. The earlier
+# VN-GAT design reached 30.9 deg training error on eight Everyday objects --
+# bottles, bowls and mugs -- which is well under it.
 
 
 # ==========================================================================
@@ -294,7 +404,8 @@ class BreakingBadScenes:
 
     def __init__(self, config: Config, split: str, epoch_seed: int = 0,
                  cache_size: int = 4):
-        from .data.paths import filter_by_split, find_scenes, load_official_split
+        from .data.catalog import Catalog, build_catalog, split_catalog
+        from .data.paths import find_scenes, load_official_split
 
         self.config = config
         self.split = split
@@ -307,27 +418,58 @@ class BreakingBadScenes:
                 f"no Breaking Bad scenes under {config.root!r}. Expected "
                 "directories holding compressed_mesh.obj and compressed_data.npz."
             )
-        official = load_official_split(config.root, split, config.official_subset)
-        self.scenes = filter_by_split(scenes, split, official=official)
-        if split in ("train", "val") and official is not None:
-            _assert_splits_disjoint(scenes, config)
-        if not self.scenes:
-            raise FileNotFoundError(f"no scenes left in split {split!r}")
-        self.official = official is not None
+        # Group first, filter second. Doing it the other way round counts a
+        # shape once per variant directory, which is how the object count came
+        # out at twice the official one -- and, worse, lets the SAME shape land
+        # in train under `everyday_compressed` and in val under
+        # `volume_constrained-everyday_compressed`, so an object split is not
+        # one. Grouping keeps every break pattern and counts every shape once.
+        full = build_catalog(scenes, mode_filter=config.mode_filter)
+        official = {
+            name: load_official_split(config.root, name, config.official_subset)
+            for name in ("train", "val", "test")
+        }
+        official = {k: v for k, v in official.items() if v}
+        self.official = bool(official)
 
-        # (scene index, mode name) pairs, deterministic in order.
+        self.catalog: Catalog = split_catalog(
+            full, split,
+            split_by=config.split_by,
+            official=official or None,
+            val_frac=config.val_frac, test_frac=config.test_frac,
+            seed=config.split_seed, fracture_pool=config.fracture_pool,
+        )
+        if config.split_by == "object" and split in ("train", "val") and official:
+            _assert_splits_disjoint(full, config, official)
+        if not self.catalog.objects:
+            raise FileNotFoundError(
+                f"no objects left in split {split!r} "
+                f"(split_by={config.split_by!r}, {len(full)} objects on disk). "
+                + ("Breaking Bad ships train and val lists only, so there is no "
+                   "official test split -- use split_by='fracture' or the hash "
+                   "fallback if you need a third partition."
+                   if split == "test" and official else
+                   "Check --root and --official-subset.")
+            )
+
+        # (object index, mode name) pairs, deterministic in order. A mode's
+        # directory is carried alongside rather than derived from the object,
+        # because after grouping one shape's patterns can span more than one
+        # directory.
+        self.scenes = list(self.catalog.objects)
+        self._directories: Dict[Tuple[int, str], Path] = {}
         self.items: List[Tuple[int, str]] = []
-        for index, scene in enumerate(self.scenes):
-            modes = [d.name for d in scene.mode_dirs()]
-            if not modes:
-                continue
+        for index, entry in enumerate(self.catalog.objects):
+            modes = list(entry.modes)
             if config.modes_per_scene is not None and len(modes) > config.modes_per_scene:
                 # Deterministic per (object, epoch): every epoch shows a
                 # different slice of an object's break patterns, but two runs
                 # with the same seed see the same ones.
-                picker = random.Random(f"{scene.object_key}/{epoch_seed}")
+                picker = random.Random(f"{entry.key}/{epoch_seed}")
                 modes = sorted(picker.sample(modes, config.modes_per_scene))
-            self.items.extend((index, mode) for mode in modes)
+            self.items.extend((index, mode) for _directory, mode in modes)
+            self._directories.update(
+                {(index, mode): directory for directory, mode in modes})
 
         limit = config.limit_train if split == "train" else config.limit_val
         if limit is not None and limit < len(self.items):
@@ -341,22 +483,47 @@ class BreakingBadScenes:
             keep = np.linspace(0, len(self.items) - 1, limit).astype(int)
             self.items = [self.items[i] for i in dict.fromkeys(keep.tolist())]
 
-        self._readers: Dict[int, object] = {}
-        self._order: List[int] = []
+        # Keyed by DIRECTORY, not by object: a reader parses one
+        # compressed_mesh.obj plus its cell matrix, and a grouped object may own
+        # several. Keying by object index would hand a reader built from one
+        # directory a mode name that only exists in another.
+        self._readers: Dict[Path, object] = {}
+        self._order: List[Path] = []
         self.failures: Dict[str, str] = {}
 
     def __len__(self) -> int:
         return len(self.items)
 
-    def _reader(self, index: int):
+    def categories(self) -> List[str]:
+        """Category per item, for the per-category metric breakdown."""
+        return [self.catalog.objects[index].category or "(uncategorised)"
+                for index, _mode in self.items]
+
+    def sampling_weights(self) -> Optional[List[float]]:
+        """
+        Per-item weights for the balanced sampler, aligned with ``self.items``.
+
+        Computed from the item list rather than from the catalogue, because
+        ``modes_per_scene`` and ``limit_*`` both trim it -- and a weight vector
+        that is merely the right *length* while being misaligned would reweight
+        the wrong samples and look like it worked.
+        """
+        from .data.catalog import item_weights
+
+        object_ids = [index for index, _mode in self.items]
+        categories = [self.catalog.objects[index].category for index in object_ids]
+        return item_weights(categories, object_ids, self.config.balance,
+                            self.config.balance_temperature)
+
+    def _reader(self, directory: Path):
         from .data.scene import SceneReader
 
-        if index not in self._readers:
+        if directory not in self._readers:
             if len(self._order) >= self.cache_size:
                 self._readers.pop(self._order.pop(0), None)
-            self._readers[index] = SceneReader(self.scenes[index].path)
-            self._order.append(index)
-        return self._readers[index]
+            self._readers[directory] = SceneReader(directory)
+            self._order.append(directory)
+        return self._readers[directory]
 
     def __getitem__(self, i: int):
         from .data.features import build_scene
@@ -365,9 +532,9 @@ class BreakingBadScenes:
 
         config = self.config
         scene_index, mode = self.items[i]
-        key = f"{self.scenes[scene_index].object_key}/{mode}"
+        key = f"{self.catalog.objects[scene_index].key}/{mode}"
 
-        result = self._reader(scene_index).load_mode(mode)
+        result = self._reader(self._directories[(scene_index, mode)]).load_mode(mode)
         meshes = result.fragments
         if len(meshes) < 2:
             # A single-fragment mode has no cross-fragment structure and no
@@ -403,6 +570,7 @@ class BreakingBadScenes:
         seed = (hash((key, self.epoch_seed)) ^ config.seed) & 0xFFFFFFFF
         return build_scene(
             vertices, faces, masks,
+            category=self.catalog.objects[scene_index].category or "(uncategorised)",
             rng=np.random.default_rng(seed),
             normalize_mode=config.normalize_mode,
             token_mode=config.token_mode,
@@ -419,24 +587,30 @@ class Skipped(NamedTuple):
     reason: str
 
 
-def _assert_splits_disjoint(scenes, config: Config) -> None:
+def _assert_splits_disjoint(catalog, config: Config, official: Dict) -> None:
     """
-    Refuse to build a dataset whose train and val splits overlap.
+    Refuse to build a dataset whose train and val splits share a shape.
 
     An object in both makes validation partly a memorisation test, and the
     resulting number is *better* than the honest one -- so it never looks like
     an error, it looks like success. Checked here rather than only in preflight
     because a preflight is easy to skip and this must not be skippable.
-    """
-    from .data.paths import filter_by_split, load_official_split
 
-    keys = {}
-    for name in ("train", "val", "test"):
-        official = load_official_split(config.root, name, config.official_subset)
-        if official is None:
-            return
-        keys[name] = {s.object_key for s in filter_by_split(scenes, name,
-                                                            official=official)}
+    Applies to ``split_by="object"`` only. Under ``split_by="fracture"`` the
+    splits share every shape *by construction*, and that is the question being
+    asked -- so the equivalent guarantee there is that no break PATTERN is
+    shared, which :func:`~reassembly.data.catalog.partition_modes` gives by
+    partitioning a shuffled list rather than by hashing each mode.
+    """
+    from .data.catalog import split_catalog
+
+    keys = {
+        name: {entry.key for entry in split_catalog(
+            catalog, name, split_by="object", official=official,
+            val_frac=config.val_frac, test_frac=config.test_frac,
+            seed=config.split_seed).objects}
+        for name in ("train", "val", "test")
+    }
     for a, b in (("train", "val"), ("train", "test"), ("val", "test")):
         shared = keys[a] & keys[b]
         if shared:
@@ -617,11 +791,35 @@ def _forward(model, batch, criterion, config):
         edge_batch=edge_fragment,
         embeddings=embeddings, cluster=cluster, num_clusters=clusters,
     )
+    # Diagnostics ride along in `report`, which the epoch loop already averages
+    # weighted by fragment count and writes into the history. They are computed
+    # under no_grad and are not part of `total`, so they cannot influence what
+    # is optimised -- `tests/test_training.py` pins that the terms still sum to
+    # the total.
+    with torch.no_grad():
+        from .evaluation.metrics import head_collinearity, swing_twist_error
+
+        tilt, twist = swing_twist_error(R.detach(), batch.target_rotation,
+                                        axis=config.symmetry_axis)
+        report["tilt_deg"] = float(tilt.mean())
+        report["twist_deg"] = float(twist.mean())
+        if prediction.head_axes is not None:
+            report["head_cos"] = float(head_collinearity(prediction.head_axes.detach()))
     return total, report, R
 
 
-def _metrics(predicted, target) -> Dict[str, float]:
-    """Geodesic (primary) and Euler RMSE (GARF comparability), plus accuracy."""
+def _metrics(predicted, target,
+             categories: Optional[Sequence[str]] = None) -> Dict[str, float]:
+    """
+    Geodesic (primary) and Euler RMSE (GARF comparability), plus accuracy.
+
+    ``categories`` adds a per-category breakdown under the ``by_category`` key.
+    It is the honest counterpart to the balanced sampler: balancing changes
+    what the model is *shown*, and this shows what it then *does*, on a
+    validation set that is never reweighted. Without it, "validation improved"
+    cannot be told apart from "validation is now dominated by different
+    categories", and the second is what a sampler change produces for free.
+    """
     import torch
 
     from .nn.losses import euler_rmse, geodesic_angle
@@ -634,6 +832,20 @@ def _metrics(predicted, target) -> Dict[str, float]:
     }
     for threshold in (5.0, 10.0, 30.0):
         out[f"acc@{threshold:g}deg"] = float((angle < threshold).float().mean())
+
+    if categories and len(categories) == angle.numel():
+        from .evaluation.metrics import group_means
+
+        out["by_category"] = {
+            name: {"geodesic_deg": value, "fragments": count}
+            for name, (value, count) in group_means(
+                angle.tolist(), list(categories)).items()
+        }
+    elif categories:
+        # Length mismatch means the labels and the angles came from different
+        # things, and a breakdown built on that is worse than none: it looks
+        # right and attributes every number to the wrong category.
+        out["by_category"] = {}
     return out
 
 
@@ -658,12 +870,17 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
     fragments = 0
     skipped = 0
     oom = 0
+    # Counted separately from `skipped`, because the two mean different things:
+    # a skip is usually a size decision, a non-finite loss is a defect in the
+    # data or the numerics and deserves to be named in the epoch summary.
+    nonfinite = 0
     # Fragments accumulated since the last optimizer step. Resets on every step,
     # so a group cut short by the end of an epoch cannot normalise the next
     # epoch's first step by the wrong total.
     group_weight = 0.0
     dropped: Dict[str, str] = {}
     predictions, targets = [], []
+    categories: List[str] = []
     bar = Progress(len(loader), prefix=f"  {label:5s}", enabled=show_progress)
     stopped = False
 
@@ -708,6 +925,29 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
                 with torch.autocast(device_type=torch.device(device).type,
                                     enabled=bool(scaler)):
                     loss, report, R = _forward(model, batch, criterion, config)
+                # BEFORE the backward, not after it. This check used to sit
+                # below the backward, where it was decorative: by the time it
+                # ran, `backward` had already written NaN into `.grad` for every
+                # parameter, and on a syncing micro-batch DDP had already
+                # all-reduced that NaN to the peer. The step counter said
+                # "skipped" while the optimizer state said otherwise -- and once
+                # Adam's moments are NaN they never recover, so the run
+                # continues for hours producing nothing.
+                #
+                # `continue` inside the try is deliberate: it leaves
+                # `group_weight` untouched, which is correct, because this
+                # micro-batch contributed no gradient at all.
+                if not torch.isfinite(loss):
+                    skipped += 1
+                    nonfinite += 1
+                    dropped[f"nonfinite:batch{index}"] = (
+                        f"{vertices:,} vertices, {batch.num_fragments} fragments, "
+                        f"loss={float(loss.detach()):.4g}"
+                    )
+                    print(f"\n  [warn] non-finite loss at {label} batch {index}; "
+                          f"skipped before the backward")
+                    bar.update(1)
+                    continue
                 if training:
                     # Weighted by the micro-batch's fragment count, not divided
                     # by `accumulate`. Every loss term is a *mean over
@@ -758,6 +998,16 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
                 dropped[f"OOM:batch{index}"] = (
                     f"{vertices:,} vertices, {batch.num_fragments} fragments")
                 model.zero_grad(set_to_none=True)
+                # `zero_grad` throws away the WHOLE accumulation group, not just
+                # this micro-batch -- so the weight bookkeeping has to be reset
+                # with it. It was not, and `group_weight` is only cleared at the
+                # optimizer step, so the next step divided the surviving
+                # gradients by a denominator that still counted the fragments
+                # whose gradients had just been discarded. A group of two 8- and
+                # 24-fragment scenes losing the second one stepped at 8/32 of
+                # the intended size, silently, on exactly the batches large
+                # enough to be interesting.
+                group_weight = 0.0
                 torch.cuda.empty_cache()
                 if distributed:
                     # Under DDP this rank may already have all-reduced some
@@ -776,14 +1026,6 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
                 print(f"\n  [oom] batch {index} ({vertices:,} vertices) did not "
                       f"fit; skipped. Set --max-vertices-per-batch "
                       f"{int(vertices * 0.9)} to skip these up front.")
-                bar.update(1)
-                continue
-
-            if not torch.isfinite(loss):
-                # Not skipped silently: a non-finite loss means the inputs or
-                # the precision are wrong, and hiding it wastes a whole run.
-                skipped += 1
-                print(f"\n  [warn] non-finite loss at {label} batch {index}; skipped")
                 bar.update(1)
                 continue
 
@@ -812,6 +1054,14 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
             else:
                 predictions.append(R.detach().float().cpu())
                 targets.append(batch.target_rotation.detach().float().cpu())
+                # One category label per FRAGMENT, not per scene, so it lines
+                # up with the per-fragment angles `_metrics` produces. Taken
+                # from the batch rather than from the loader's position,
+                # because samples get dropped and position stops indexing the
+                # item list from the first drop onward.
+                if batch.categories:
+                    scene_of = batch.fragment_scene.detach().cpu().tolist()
+                    categories.extend(batch.categories[s] for s in scene_of)
 
             weight = int(batch.num_fragments)
             for name, value in report.items():
@@ -842,9 +1092,11 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
     summary["skipped"] = skipped
     summary["dropped"] = len(dropped)
     summary["oom"] = oom
+    summary["nonfinite"] = nonfinite
     summary["dropped_names"] = sorted(dropped)[:20]
     if predictions:
-        summary.update(_metrics(torch.cat(predictions), torch.cat(targets)))
+        summary.update(_metrics(torch.cat(predictions), torch.cat(targets),
+                                categories=categories))
     return summary, step, stopped
 
 
@@ -875,6 +1127,14 @@ def format_metrics(summary: Dict[str, float]) -> str:
         # zero by a collapsed embedding; this cannot -- it is stage two's own
         # retrieval, from ~0 at chance to 1.0.
         line += f"  match@1 {summary['match@1']:.3f}"
+    if "tilt_deg" in summary:
+        # The split that makes ~90 deg readable. Printed every epoch rather
+        # than only at the end, because which of the two regimes a run is in
+        # can change during training and the final number cannot show that.
+        line += (f"\n        tilt {summary['tilt_deg']:6.2f}  "
+                 f"twist {summary['twist_deg']:6.2f}")
+        if "head_cos" in summary:
+            line += f"  head|cos| {summary['head_cos']:.3f}"
     return line
 
 
@@ -992,7 +1252,17 @@ _ARCHITECTURE = ("channels", "heads", "head_dim", "embedding_dim", "schedule")
 # a different problem than the weights were trained for, and the loss curve has
 # a step in it that looks like noise.
 _DATA = ("label_method", "sharp_threshold", "tokens_per_scene", "token_mode",
-         "token_metric", "normalize_mode", "supervise_embedding", "subsets")
+         "token_metric", "normalize_mode", "supervise_embedding", "subsets",
+         # The split definition belongs here for the same reason and more
+         # sharply: changing `split_by` mid-run swaps the validation set for a
+         # different question, and changing `val_frac`, `split_seed` or
+         # `mode_filter` reshuffles it. Nothing raises, the curve just steps,
+         # and every number after the resume is about a set the earlier epochs
+         # were partly trained on. `balance` is here too -- it changes what the
+         # model is shown, which is a change of problem even though the data on
+         # disk is identical.
+         "split_by", "fracture_pool", "val_frac", "test_frac", "split_seed",
+         "mode_filter", "official_subset", "balance", "balance_temperature")
 
 
 def _resume_path(config: Config, default: Path) -> Optional[Path]:
@@ -1215,8 +1485,22 @@ def _loader(dataset, config: Config, shuffle: bool, rank: int, world: int,
     import torch
     from torch.utils.data import DataLoader, DistributedSampler
 
+    from .data.sampling import WeightedDistributedSampler
+
     sampler = None
-    if world > 1:
+    # Balancing applies to TRAINING only -- `shuffle` is what distinguishes the
+    # two call sites. A reweighted validation set would move with the sampler
+    # setting, so two runs could not be compared on it, and the quantity being
+    # reported would no longer be "error on the val split" but "error on the
+    # val split as this run happened to weight it".
+    weights = dataset.sampling_weights() if shuffle else None
+    if weights is not None:
+        sampler = WeightedDistributedSampler(
+            weights, num_replicas=max(world, 1), rank=rank if world > 1 else 0,
+            seed=config.seed,
+        )
+        sampler.set_epoch(epoch)
+    elif world > 1:
         sampler = DistributedSampler(dataset, num_replicas=world, rank=rank,
                                      shuffle=shuffle, drop_last=False)
         sampler.set_epoch(epoch)
@@ -1425,6 +1709,7 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
         print(f"  train  {format_losses(train_summary)}")
         print(f"  val    {format_losses(val_summary)}")
         print(f"  val    {format_metrics(val_summary)}")
+        _report_category_gap(val_summary, config)
         _report_dropped(train_summary, val_summary)
 
         train_summary.pop("dropped_names", None)
@@ -1477,6 +1762,66 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
     return history
 
 
+def _split_banner(config, train_set, val_set) -> List[str]:
+    """
+    What is actually held out, in words, at the top of every run.
+
+    "held out: whole shapes" and "held out: break patterns" are two different
+    experiments producing two numbers with the same name, and a config key
+    three scrolls up is not enough to tell them apart six weeks later when the
+    log is all that survives.
+    """
+    train_objects = {entry.key for entry in train_set.scenes}
+    val_objects = {entry.key for entry in val_set.scenes}
+    if config.split_by == "object":
+        return [f"  held out      whole SHAPES -- {len(val_objects)} val objects "
+                f"never seen in training"]
+    shared = len(train_objects & val_objects)
+    return [
+        f"  held out      BREAK PATTERNS -- {shared}/{len(val_objects)} val objects "
+        f"are also in train",
+        f"                measures unseen fractures of KNOWN shapes; easier than "
+        f"the benchmark,",
+        f"                so do not report it as an object-split result",
+    ]
+
+
+def _balance_banner(config, train_set) -> List[str]:
+    """
+    The projected sampling shares, and what balancing costs in variance.
+
+    A balancing setting that is silently a no-op -- or that over-corrects --
+    would otherwise be invisible for a whole run, and the only symptom would be
+    a validation number that moved for a reason nobody recorded.
+    """
+    from .data.catalog import effective_sample_size
+    from .evaluation.metrics import group_means
+
+    if config.balance == "none":
+        return []
+    weights = train_set.sampling_weights()
+    if weights is None:
+        return ["  balance       requested but inactive (temperature 0)"]
+
+    categories = train_set.categories()
+    total = sum(weights)
+    shares = group_means([w / total for w in weights], categories)
+    summed = {name: value * count for name, (value, count) in shares.items()}
+    ordered = sorted(summed.items(), key=lambda kv: -kv[1])
+    head = "  ".join(f"{name}:{100 * value:.1f}%" for name, value in ordered[:5])
+    more = f"  (+{len(ordered) - 5} more)" if len(ordered) > 5 else ""
+    ess = effective_sample_size(weights)
+    return [
+        f"  balance       {config.balance} @ T={config.balance_temperature:g}"
+        f"   ({len(ordered)} categories)",
+        f"                {head}{more}",
+        f"                spread {ordered[0][1] / max(ordered[-1][1], 1e-12):.1f}x"
+        f"   effective samples {ess:,.0f} of {len(weights):,}"
+        f"  ({100 * ess / max(len(weights), 1):.0f}%)",
+        f"                training only -- validation is never reweighted",
+    ]
+
+
 def _banner(config, train_set, val_set, parameters, device, world, per_epoch) -> str:
     lines = [
         "=" * 74,
@@ -1490,6 +1835,8 @@ def _banner(config, train_set, val_set, parameters, device, world, per_epoch) ->
         + ("  (official split)" if train_set.official else "  (hashed split)"),
         f"  samples       {len(train_set)} train / {len(val_set)} val"
         f"   {per_epoch} steps/epoch",
+        *_split_banner(config, train_set, val_set),
+        *_balance_banner(config, train_set),
         f"  labels        {config.label_method}"
         + (f" @ {config.sharp_threshold}" if config.label_method == "dihedral" else ""),
         f"  tokens        {config.tokens_per_scene}/scene, {config.token_mode}"
@@ -1500,9 +1847,10 @@ def _banner(config, train_set, val_set, parameters, device, world, per_epoch) ->
         "-" * 74,
         "  read every number against chance, not against zero:",
         f"    geodesic      {CHANCE['geodesic_deg']:.2f} deg   <- a model here has learned nothing",
-        f"    euler RMSE    {CHANCE['euler_rmse_deg']:.2f} deg random, "
-        f"{CHANCE['euler_identity_deg']:.2f} deg if it collapses to identity",
-        f"    axis only     {CHANCE['axis_only_deg']:.1f} deg   <- axis right, rotation about it not",
+        f"    euler RMSE    {CHANCE['euler_rmse_deg']:.2f} deg   <- residual convention; "
+        f"collapsing to identity scores the same",
+        f"    axis only     {CHANCE['axis_only_deg']:.1f} deg   <- axis right, rotation about it not"
+        f"  (tilt/twist tells them apart)",
         f"    normal/face   {CHANCE['normal']:.1f} / {CHANCE['face']:.1f} at initialisation",
         "=" * 74,
     ]
@@ -1528,9 +1876,23 @@ def _final_report(history: List[dict]) -> None:
         print("            report this as a small error; check the data and the")
         print("            loss conventions before tuning anything.")
     elif abs(best - CHANCE["axis_only_deg"]) < 5:
-        print("  [verdict] parked at the axis-only floor. That is the signature of")
-        print("            a model recovering a fragment's axis but not its rotation")
-        print("            about it -- a structural result, not a tuning failure.")
+        tilt = last.get("val_tilt_deg")
+        twist = last.get("val_twist_deg")
+        print("  [verdict] parked near the axis-only landmark. Read tilt/twist"
+              " before concluding anything:")
+        if tilt is not None and twist is not None:
+            print(f"            tilt {tilt:.1f} deg, twist {twist:.1f} deg.")
+            if tilt < 20 and twist > 70:
+                print("            The axis IS being recovered and the rotation about it")
+                print("            is not. That is a real finding about this geometry --")
+                print("            but it is not a hard floor: a fragment's fracture")
+                print("            boundary is unique even when the whole object is a")
+                print("            surface of revolution, so the information is there.")
+            elif tilt > 70:
+                print("            The axis is not being recovered either, so this is an")
+                print("            optimisation problem rather than a symmetry one.")
+        else:
+            print("            (tilt/twist not recorded for this run)")
     tail = [h.get("val_geodesic_deg") for h in history[-max(len(history) // 4, 2):]]
     tail = [t for t in tail if t is not None]
     if len(tail) >= 2 and tail[0] - tail[-1] > 0.5:
@@ -1570,12 +1932,54 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
           f"{state['epoch'] + 1})")
     print(f"  {format_losses(summary)}")
     print(f"  {format_metrics(summary)}")
-    print(f"  geodesic is the primary number. Euler RMSE is for comparability "
-          f"with GARF's tables\n  and rewards collapsing to the identity "
-          f"({CHANCE['euler_identity_deg']:.1f} deg), so never quote it alone.")
+    breakdown = summary.get("by_category")
+    if breakdown:
+        from .evaluation.metrics import format_group_table
+
+        print(format_group_table(
+            {name: (values["geodesic_deg"], values["fragments"])
+             for name, values in breakdown.items()},
+            "geodesic error by category"))
+        print("  A large spread means the headline mean is partly a statement "
+              "about which\n  categories are numerous. Symmetric categories "
+              "scoring worse than asymmetric\n  ones is evidence for the "
+              "azimuth-ambiguity reading; check tilt/twist to confirm.")
+    print(f"  geodesic is the primary number; Euler RMSE (residual convention, "
+          f"chance {CHANCE['euler_rmse_deg']:.1f} deg)\n  is for comparability "
+          f"with GARF's tables. Compare against the VANILLA Everyday "
+          f"supplementary\n  table -- SE(3)-Equiv 79.30 deg, GARF-mini 10.41 deg "
+          f"-- not the headline row.")
     out = Path(config.out_dir) / f"{split}_metrics.json"
     out.write_text(json.dumps(summary, indent=2))
     return summary
+
+
+def _report_category_gap(summary: Dict, config: Config, spread: float = 15.0) -> None:
+    """
+    One line, only when the categories actually disagree.
+
+    A full table every epoch is noise; silence when the spread is real is
+    worse. The threshold is on the gap between the worst and best category, in
+    degrees, because that is the quantity that decides whether the mean is
+    telling the truth about the model or about the category mix. When
+    balancing is off and the gap is large, the mean is partly a statement
+    about which categories happen to be numerous.
+    """
+    breakdown = summary.get("by_category")
+    if not breakdown or len(breakdown) < 2:
+        return
+    ordered = sorted(breakdown.items(), key=lambda kv: -kv[1]["geodesic_deg"])
+    worst_name, worst = ordered[0]
+    best_name, best = ordered[-1]
+    gap = worst["geodesic_deg"] - best["geodesic_deg"]
+    if gap < spread:
+        return
+    print(f"  val    by category: worst {worst_name} {worst['geodesic_deg']:.1f}deg "
+          f"(n={worst['fragments']}), best {best_name} {best['geodesic_deg']:.1f}deg "
+          f"(n={best['fragments']}), spread {gap:.1f}deg")
+    if config.balance == "none":
+        print(f"         balance=none, so the mean above is weighted by how many "
+              f"shapes each category happens to have.")
 
 
 def _report_dropped(train_summary: Dict, val_summary: Dict) -> None:
@@ -1600,6 +2004,12 @@ def _report_dropped(train_summary: Dict, val_summary: Dict) -> None:
                   f"skipped. A handful is survivable; more than that means "
                   f"--batch-size is too high and the largest objects are being "
                   f"dropped from training.")
+        if summary.get("nonfinite"):
+            print(f"  {label}: {summary['nonfinite']} batch(es) produced a "
+                  f"non-finite loss and were dropped before the backward. This "
+                  f"is a defect, not a capacity limit -- run "
+                  f"`python -m scripts.check_scene` on the named samples. "
+                  f"Repeat offenders are effectively excluded from training.")
 
 
 def _resume_recipe(config: Config, out_dir: Path) -> str:
@@ -1755,10 +2165,35 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
                         "hashed split. Results will not be comparable to "
                         "published numbers. Check that data_split/ is present.")
         print("  split:   HASHED (no official list found)")
-    overlap = {s.object_key for s in train_set.scenes} & {s.object_key for s in val_set.scenes}
-    if overlap:
-        problems.append(f"{len(overlap)} object(s) appear in BOTH train and val "
-                        f"-- validation would be measuring memorisation")
+
+    train_objects = {entry.key for entry in train_set.scenes}
+    val_objects = {entry.key for entry in val_set.scenes}
+    overlap = train_objects & val_objects
+    if config.split_by == "object":
+        print(f"  held out: whole SHAPES ({len(val_objects)} val objects unseen "
+              f"in training)")
+        if overlap:
+            problems.append(f"{len(overlap)} object(s) appear in BOTH train and "
+                            f"val -- validation would be measuring memorisation")
+    else:
+        # Here the overlap is the design, so the thing to verify is the other
+        # half: that no BREAK PATTERN is shared. Objects in val but not in
+        # train would mean the pool was built wrong.
+        shared_modes = set(train_set.items) & set(val_set.items)
+        print(f"  held out: BREAK PATTERNS ({len(overlap)} of {len(val_objects)} "
+              f"val objects also in train, by design)")
+        print(f"            this measures unseen fractures of KNOWN shapes -- "
+              f"an easier question\n            than the benchmark's; do not "
+              f"report it as an object-split result.")
+        if shared_modes:
+            problems.append(
+                f"{len(shared_modes)} (object, mode) pair(s) appear in both "
+                f"train and val -- the fracture split is not disjoint")
+        if val_objects - train_objects:
+            warnings.append(
+                f"{len(val_objects - train_objects)} val object(s) are absent "
+                f"from train, so part of this validation set is still an "
+                f"unseen-shape test and the two effects are mixed")
 
     # -- 4. build real samples --------------------------------------------
     print(f"\n[4/7] building {samples} real scenes")

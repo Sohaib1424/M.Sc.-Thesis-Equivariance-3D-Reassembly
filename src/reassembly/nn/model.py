@@ -26,7 +26,8 @@ from another fragment**.
 That is a dilution, not a wall: the network can learn to give token vertices a
 larger magnitude and dominate the mean, since VN layers scale features freely.
 But it starts at a disadvantage the interleaved form does not have, and the
-cross layers are the whole mechanism for beating the 89.9 deg axis-only floor.
+cross layers are the whole mechanism for beating the ~90 deg axis-only
+landmark (a landmark, not a floor -- see `evaluation/metrics.swing_twist_error`).
 If the floor turns out to be where this parks, ``intra x5, cross x3, intra`` --
 one extra layer -- is the first thing to try, and
 ``("intra",) * 2 + ("cross", "intra") * 3`` the second.
@@ -72,6 +73,21 @@ class Prediction(NamedTuple):
     vertex_embedding: Tensor    # (N, D) invariant, for correspondence and the
     #                             embedding-consistency loss
     vertex_features: Tensor     # (N, C, 3) equivariant, the backbone's output
+    head_axes: Optional[Tensor] = None
+    """
+    ``(F, 2, 3)`` -- the two vectors the head produces *before* Gram-Schmidt.
+
+    Exposed for one diagnostic. When the two become collinear the frame's
+    second column is decided by whatever is left of the second vector after
+    projecting out the first, which near-parallel means numerical noise: the
+    prediction degenerates to one direction plus a random roll. That state is
+    invisible in the rotation loss -- the output is still a proper rotation --
+    and it is the cheapest thing to measure that separates a bad basin from
+    slow progress. See :func:`reassembly.evaluation.metrics.head_collinearity`.
+
+    Last field and optional so that constructing a ``Prediction`` positionally,
+    as the tests do, keeps working.
+    """
 
 
 class ReassemblyNet(nn.Module):
@@ -186,12 +202,14 @@ class ReassemblyNet(nn.Module):
                 x = x.index_add(0, token_index, tokens - x[token_index])
 
         pooled = segment_mean(self.pool_proj(x), vertex_fragment, num_fragments)
-        frame = gram_schmidt(self.head(pooled))            # (F, 3, 3), columns
+        axes = self.head(pooled)                           # (F, 2, 3)
+        frame = gram_schmidt(axes)                         # (F, 3, 3), columns
         return Prediction(
             rotation=frame.transpose(-1, -2),
             frame=frame,
             vertex_embedding=self.embedding(self.readout(x)),
             vertex_features=x,
+            head_axes=axes,
         )
 
 

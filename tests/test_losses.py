@@ -9,20 +9,30 @@ assertions about exact numbers.
 
 Two chance baselines, not one
 -----------------------------
-"Chance" is ambiguous for rotations and the ambiguity is not harmless:
+"Chance" is ambiguous for rotations, so both are measured:
 
 * **random prediction** -- an independent Haar rotation. Geodesic 126.48 deg,
-  Euler RMSE 86.29 deg.
+  Euler RMSE 83.25 deg.
 * **identity prediction** -- always output no rotation at all. Geodesic is the
   *same* 126.48 deg, because a Haar rotation's angle is distributed the same
   way whether it is measured against the identity or against another Haar
-  rotation. But Euler RMSE drops to **83.14 deg**.
+  rotation. Euler RMSE is 83.18 deg -- also the same, within Monte-Carlo noise.
 
-So a model that collapses to predicting near-identity -- a very common failure,
-and the cheapest way to reduce a rotation loss early in training -- scores
-*better than random* on GARF's headline metric while having learned nothing.
-The geodesic angle does not reward the collapse, which is the argument for
-reporting it as the primary number and Euler RMSE only for comparability.
+That second row used to read 83.14 against the random prediction's 86.29, and
+the 3 deg gap was documented here and in the design document as a trap in
+GARF's headline metric: a model collapsing towards the identity could appear to
+beat chance having learned nothing. The gap was ours, not GARF's. ``euler_rmse``
+computed ``euler(predicted) - euler(target)`` componentwise, which is not a
+metric on SO(3) -- Euler angles are chart coordinates and subtracting two charts
+weights the same physical error differently depending on where in the chart the
+pair sits. Measuring the angles of the residual ``predicted^T @ target`` closes
+the gap to 0.07 deg.
+
+The geodesic angle is still the primary number, because it is the quantity the
+loss optimises and it needs no chart at all. Euler RMSE is reported for
+comparability with published tables, and the comparable row for this project is
+GARF's **vanilla Everyday supplementary** table -- SE(3)-Equiv 79.30 deg,
+GARF-mini 10.41 deg -- not the headline one.
 """
 from __future__ import annotations
 
@@ -120,11 +130,21 @@ def test_geodesic_gradient_stays_finite_where_arccos_would_not():
 
 def test_axis_correct_azimuth_random_reference():
     """
-    The 89.9 degree figure the previous model's validation error sat at. A
-    network that recovers a fragment's axis but not its rotation about that
-    axis lands here -- which is what a per-fragment canonicaliser with no
-    access to relative pose is limited to, and what the cross-fragment design
-    is meant to break past.
+    The ~90 degree level the previous model's validation error sat at: the
+    axis recovered, the rotation about it uniform.
+
+    A LANDMARK, NOT A FLOOR. It was described in this project as a structural
+    limit of a per-fragment canonicaliser on surfaces of revolution -- something
+    no amount of compute would move. That is false, and the earlier design's own
+    later measurements refute it: a fragment of a symmetric object is not itself
+    symmetric, because its fracture boundary is jagged and unique, and a scaling
+    run on eight Everyday objects (bottles, bowls, mugs) reached 30.9 degrees
+    training error.
+
+    What the number is still good for is reading a stalled run, and
+    ``reassembly.evaluation.metrics.swing_twist_error`` is what makes it
+    readable: tilt ~ 0 with twist ~ 90 is this situation, tilt ~ 90 is "nothing
+    learned", and the mean geodesic angle is the same for both.
     """
     generator = torch.Generator().manual_seed(7)
     axis = torch.nn.functional.normalize(
@@ -157,23 +177,32 @@ def test_euler_extraction_matches_scipy():
 
 def test_euler_rmse_chance_for_a_random_prediction():
     measured = euler_rmse(haar(SAMPLES, 1), haar(SAMPLES, 2)).item()
-    assert measured == pytest.approx(86.29, abs=0.5)
+    assert measured == pytest.approx(83.25, abs=0.5)
 
 
-def test_predicting_identity_beats_random_on_euler_rmse_but_not_geodesic():
+def test_collapsing_to_identity_does_not_beat_guessing_on_euler_rmse():
     """
-    The trap that makes Euler RMSE a bad primary metric.
+    The regression guard for the convention fix.
 
-    A model that collapses to the identity scores 83.1 deg -- three degrees
-    *better* than guessing -- while having learned nothing at all. The geodesic
-    angle is the same 126.5 deg for both, so it does not pay for the collapse.
+    Under the old componentwise convention a model that collapsed to the
+    identity scored 83.14 against a random prediction's 86.29 -- three degrees
+    *better* while having learned nothing -- and that artefact was reported as
+    a property of the metric. Measuring the residual rotation closes the gap to
+    noise, so there is nothing to be gained by collapsing. Both still read
+    126.48 deg geodesic, which never paid for the collapse in the first place.
     """
     target = haar(SAMPLES, 2)
     identity = torch.eye(3, dtype=DTYPE).expand_as(target)
     random_guess = haar(SAMPLES, 1)
 
-    assert euler_rmse(identity, target).item() == pytest.approx(83.14, abs=0.5)
-    assert euler_rmse(identity, target) < euler_rmse(random_guess, target)
+    collapsed = euler_rmse(identity, target).item()
+    guessed = euler_rmse(random_guess, target).item()
+    assert collapsed == pytest.approx(83.18, abs=0.5)
+    assert abs(collapsed - guessed) < 0.5, (
+        f"collapsing to the identity scored {collapsed:.2f} against a random "
+        f"prediction's {guessed:.2f}. A gap here means the metric rewards "
+        f"collapse again -- check that euler_rmse measures the RESIDUAL."
+    )
 
     assert math.degrees(geodesic_angle(identity, target).mean().item()) == pytest.approx(
         126.48, abs=0.6
@@ -181,6 +210,24 @@ def test_predicting_identity_beats_random_on_euler_rmse_but_not_geodesic():
     assert math.degrees(geodesic_angle(random_guess, target).mean().item()) == pytest.approx(
         126.48, abs=0.6
     )
+
+
+def test_euler_rmse_is_invariant_to_a_global_frame_change():
+    """
+    The property the componentwise convention lacked, stated directly.
+
+    Rotating BOTH the prediction and the target by the same fixed rotation
+    leaves the error between them unchanged, so any honest error metric must
+    return the same number. Euler charts are not frame-invariant, so
+    subtracting two of them is not either: the old convention moves by tens of
+    degrees under this, which is why its "chance" value depended on where in
+    the chart the pairs happened to sit.
+    """
+    predicted, target = haar(4000, 3), haar(4000, 4)
+    frame = haar(1, 5)[0]
+    base = euler_rmse(predicted, target).item()
+    moved = euler_rmse(frame @ predicted, frame @ target).item()
+    assert moved == pytest.approx(base, abs=1e-9)
 
 
 def test_euler_rmse_wraps_the_angle_difference():

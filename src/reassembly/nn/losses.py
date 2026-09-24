@@ -8,8 +8,8 @@ measuring something other than what its name says.
 ``tests/test_losses.py`` asserts these by Monte Carlo.
 
     L_rotation (geodesic)      126.48 deg = pi/2 + 2/pi rad
-    Euler RMSE, random guess    86.29 deg
-    Euler RMSE, always identity 83.14 deg  <- BETTER than guessing; see below
+    Euler RMSE, random guess    83.25 deg
+    Euler RMSE, always identity 83.18 deg  <- the same, and that is the point
     L_normal  (cosine)           1.0
     L_face    (two normals)      2.0
     L_position                   depends on fragment scale -- see the docstring
@@ -85,25 +85,47 @@ def rotation_loss(predicted: Tensor, target: Tensor) -> Tensor:
 
 def euler_rmse(predicted: Tensor, target: Tensor) -> Tensor:
     """
-    RMSE over XYZ Euler angles, in degrees -- GARF's table metric.
+    RMSE over the XYZ Euler angles of the **residual** rotation, in degrees --
+    GARF's table metric.
 
     Reported alongside the geodesic angle and never instead of it: the two are
     different numbers for the same error. A 30 deg error about one axis is
     30 deg geodesic but ``sqrt((30^2 + 0 + 0)/3)`` = 17.3 deg Euler RMSE, so
     quoting the smaller one without saying which is a 40% free improvement.
 
-    "Chance" also has two values here, and the gap is a trap. Guessing randomly
-    scores 86.29 deg; always predicting the **identity** scores 83.14 deg --
-    three degrees *better*. Collapsing towards the identity is the cheapest
-    early way to reduce a rotation loss, so a model can appear to beat chance on
-    this metric having learned nothing. The geodesic angle reads 126.48 deg for
-    both and does not pay for the collapse, which is why it is the primary
-    number and this one is only for comparability.
+    THE RESIDUAL, NOT A DIFFERENCE OF ANGLES
+    ----------------------------------------
+    This used to compute ``euler(predicted) - euler(target)`` componentwise,
+    which is not a metric on SO(3): Euler angles are chart coordinates, and
+    subtracting two charts weights the same physical error differently
+    depending on where in the chart the pair happens to sit. Taking the angles
+    of ``predicted^T @ target`` -- the rotation still needed after the
+    prediction -- measures the residual itself, and is what GARF reports.
+
+    The difference is not cosmetic. Measured over 400k Haar-uniform pairs:
+
+        convention                   random      identity     gap
+        euler(pred) - euler(target)   86.23        83.18      3.06
+        euler(pred^T @ target)        83.25        83.18      0.07
+
+    Under the old convention, a model that collapsed to the identity scored
+    **three degrees better than guessing** while the geodesic angle said it had
+    learned nothing -- and that artefact was documented here, in the reference
+    table and in the training banner as though it were a property of the
+    metric. It is a property of the chart. Under the residual convention the
+    gap is 0.07 deg, i.e. Monte-Carlo noise: collapsing to the identity buys
+    exactly nothing, which is the correct behaviour and one fewer trap to warn
+    about.
+
+    The geodesic angle remains the primary number; this one exists for
+    comparability with published tables.
     """
-    difference = _euler_xyz(predicted) - _euler_xyz(target)
+    residual = torch.matmul(predicted.transpose(-1, -2), target)
     # Wrap each angle into (-pi, pi] before squaring: 359 deg and 1 deg differ
-    # by 2 deg, not 358.
-    wrapped = torch.atan2(torch.sin(difference), torch.cos(difference))
+    # by 2 deg, not 358. Still needed -- `_euler_xyz` returns atan2 output in
+    # (-pi, pi], but the wrap costs nothing and documents the intent.
+    angles = _euler_xyz(residual)
+    wrapped = torch.atan2(torch.sin(angles), torch.cos(angles))
     return torch.sqrt(torch.mean(wrapped ** 2, dim=-1)).mean() * (180.0 / torch.pi)
 
 
@@ -237,9 +259,25 @@ def correspondence_loss(
         L = -mean_i  log[ sum_{p in pos(i)} exp(s_ip / T)
                           / sum_{k != i}    exp(s_ik / T) ]
 
-    with ``s`` the cosine similarity. Collapse now scores its *worst* value,
-    ``log(A - 1) - log|pos|``: identical embeddings make positives and negatives
-    indistinguishable, which is exactly what the term measures.
+    with ``s`` the cosine similarity. Collapse scores ``log(A - 1) - log|pos|``:
+    identical embeddings make positives and negatives indistinguishable, so
+    there is nothing for a collapsed head to gain here, unlike under the pure
+    agreement term.
+
+    COLLAPSE IS NOT THE WORST VALUE, and reading the curve depends on knowing
+    that. This docstring used to say it was. Measured on 260 clustered vertices
+    with 32-dimensional embeddings::
+
+        random (untrained)       7.29
+        collapsed (identical)    5.56      = log(259) - log(1)
+        perfect clusters         0.05
+
+    Random embeddings score *above* collapse: at temperature 0.1 the spread of
+    their similarities inflates the log-sum-exp in the denominator by about
+    ``var(s / T) / 2``. So the value can fall early in training by shrinking
+    that spread -- towards collapse -- as well as by learning to cluster, and
+    the curve alone cannot tell the two apart. ``match@1`` can: it stays near
+    zero for a collapsed head.
 
     Anchors are subsampled to ``max_anchors`` because the similarity matrix is
     quadratic in them and a scene can label thousands of vertices. 1024 anchors

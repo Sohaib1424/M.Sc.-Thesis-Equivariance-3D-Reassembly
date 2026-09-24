@@ -68,6 +68,18 @@ class SceneSample(NamedTuple):
     """One scene: its fragments, plus the coincidence clusters spanning them."""
     fragments: List[FragmentArrays]
     cluster: np.ndarray           # (sum V,) coincidence id, -1 where none
+    category: str = ""
+    """
+    The object category this scene came from ("Bottle", "Mug", ...), carried
+    only so metrics can be broken down by it.
+
+    It travels with the sample rather than being recovered afterwards from the
+    loader's position, because samples are DROPPED -- a single-fragment mode
+    returns ``Skipped`` -- so position in the output stream does not index the
+    dataset's item list. A breakdown built on that assumption silently
+    attributes each sample to the wrong category from the first drop onward,
+    and looks perfectly plausible.
+    """
 
 
 def _scene_token_sets(vertices, faces, masks, *, mode, metric, total, max_per_fragment):
@@ -157,6 +169,7 @@ def build_scene(
     tokens_per_scene: Optional[int] = DEFAULT_TOKENS_PER_SCENE,
     max_tokens_per_fragment: Optional[int] = None,
     cluster: Optional[np.ndarray] = None,
+    category: str = "",
 ) -> SceneSample:
     """
     Build one scene's arrays.
@@ -206,7 +219,7 @@ def build_scene(
         )
     n = len(vertices)
     if n == 0:
-        return SceneSample([], np.zeros(0, np.int64))
+        return SceneSample([], np.zeros(0, np.int64), category)
     if rotations is None:
         rotations = random_rotations(n, rng)
     rotations = np.asarray(rotations, dtype=np.float64)
@@ -267,7 +280,7 @@ def build_scene(
     total = sum(len(v) for v in vertices)
     if cluster is None:
         cluster = np.full(total, -1, np.int64)
-    return SceneSample(fragments, np.asarray(cluster, dtype=np.int64))
+    return SceneSample(fragments, np.asarray(cluster, dtype=np.int64), category)
 
 
 # --------------------------------------------------------------------------
@@ -302,6 +315,7 @@ class Batch(NamedTuple):
     num_clusters: int
     num_fragments: int
     num_scenes: int
+    categories: Tuple[str, ...] = ()   # (S,) object category per scene
 
 
 def collate(samples: Sequence[SceneSample], device=None, dtype=None) -> Batch:
@@ -410,6 +424,7 @@ def collate(samples: Sequence[SceneSample], device=None, dtype=None) -> Batch:
         num_clusters=cluster_offset,
         num_fragments=fragment_offset,
         num_scenes=len(samples),
+        categories=tuple(sample.category for sample in samples),
     )
 
 

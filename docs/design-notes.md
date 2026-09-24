@@ -520,9 +520,9 @@ than asserted here.
 | quantity | value |
 |---|---|
 | chance geodesic error | 126.48° = π/2 + 2/π |
-| chance Euler RMSE, **random** prediction | 86.29° |
-| chance Euler RMSE, **identity** prediction | 83.14° |
-| axis correct, azimuth random — geodesic | 89.9° |
+| chance Euler RMSE, **random** prediction (residual convention) | 83.25° |
+| chance Euler RMSE, **identity** prediction | 83.18° |
+| axis correct, azimuth random — geodesic | 90.0° |
 | untrained `L_normal`, `L_face` | 1.0, 2.0 |
 | `L_position` on the unit sphere | 4/3 |
 | perfect prediction | geodesic exactly 0; the rest to the 1e-8 norm floor |
@@ -751,7 +751,9 @@ depends on how the fracture surface is shaped — which is why preflight prints
 it for the dataset actually being trained on, and warns when the reach after the
 trailing layers falls below 50%.
 
-If the run still parks near the 89.9° axis-only floor, the next moves are a
+If the run still parks near the ~90° axis-only landmark — check tilt/twist
+first, it distinguishes "axis found, azimuth not" from "neither" — the next
+moves are a
 second trailing intra layer, then `intra x2, (cross, intra) x3` fully
 interleaved, then pooling the head over tokens instead of all vertices — the
 last removes the dilution at its source but changes what the frame is computed
@@ -928,8 +930,18 @@ VN-GAT reached **43° on training data** and stalled at ~94° on *validation*.
 89.9° is a validation floor. Comparing a training number to it is meaningless —
 training error was never what was stuck there, and the old model also got well
 below 89.9° in training. The claim has been withdrawn. Whether the
-cross-fragment redesign actually clears that floor is unmeasured, and only a
+cross-fragment redesign actually clears that level is unmeasured, and only a
 validation run on Breaking Bad can answer it.
+
+**And "floor" was the wrong word twice over** (Sept 2026). ~90° is where a
+model lands when it has the symmetry axis and not the rotation about it. That
+is a *state*, not a limit: a fragment of a symmetric object is not itself
+symmetric, because its fracture boundary is jagged and unique, and the earlier
+design's own scaling run reached 30.9° on eight Everyday objects. Calling it a
+floor made a stall look like a structural result, which is the most expensive
+kind of mistake available here -- it argues for stopping. `swing_twist_error`
+now reports tilt and twist separately so the state can be identified instead of
+inferred from a mean.
 
 ### Choices made against a specific failure
 
@@ -943,7 +955,7 @@ validation run on Breaking Bad can answer it.
 | Dropped samples tallied **by name** | An item failing every epoch has been removed from the dataset; a per-batch counter cannot see it, since a batch of four with one bad item still collates |
 | fp32 default, AMP opt-in | In fp16 an attention product overflows to `inf` past ~256, and the max-subtracting softmax then computes `inf − inf = NaN` — the stability trick manufactures the NaN |
 | `find_unused_parameters=True` under DDP | A batch whose scenes all lack a fracture surface skips the cross layers, leaving their parameters gradient-less — a hang six hours in |
-| Verdicts that refuse to flatter | A result at chance, one at the axis-only floor, and one still descending at its cutoff are each perfectly reportable numbers meaning something else |
+| Verdicts that refuse to flatter | A result at chance, one at the axis-only landmark, and one still descending at its cutoff are each perfectly reportable numbers meaning something else |
 
 ### Two things the build surfaced
 

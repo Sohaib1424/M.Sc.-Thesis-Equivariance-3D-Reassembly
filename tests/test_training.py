@@ -379,18 +379,39 @@ def test_initial_loss_check_catches_a_term_that_is_off():
 
 @pytest.mark.parametrize("curve,expected", [
     ([126.4, 126.3], "at chance"),
-    ([91.0, 89.5], "axis-only floor"),
+    ([91.0, 89.5], "axis-only landmark"),
     ([60.0, 50.0, 40.0, 20.0], "still descending"),
 ])
 def test_the_final_verdict_refuses_to_flatter_a_run(curve, expected, capsys):
     """
     Interpretation rules written before the results, and enforced. A run at
-    chance, one parked at the axis-only floor, and one truncated mid-descent all
-    produce a perfectly reportable number that means something quite different
-    from what it looks like.
+    chance, one parked at the axis-only landmark, and one truncated mid-descent
+    all produce a perfectly reportable number that means something quite
+    different from what it looks like.
     """
     _final_report([{"val_geodesic_deg": v} for v in curve])
     assert expected in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("tilt,twist,expected", [
+    (2.0, 88.0, "axis IS being recovered"),
+    (85.0, 60.0, "not being recovered either"),
+])
+def test_the_axis_only_verdict_reads_tilt_and_twist(tilt, twist, expected, capsys):
+    """
+    ~90 deg geodesic has two quite different causes and the number alone cannot
+    tell them apart: the axis learned but not the rotation about it, or nothing
+    learned at all. The verdict must consult the tilt/twist split rather than
+    assert the first, which is what it used to do -- and it used to call it a
+    structural floor, which is false: a fragment's fracture boundary is unique
+    even when the whole object is a surface of revolution.
+    """
+    _final_report([{"val_geodesic_deg": 91.0},
+                   {"val_geodesic_deg": 89.5, "val_tilt_deg": tilt,
+                    "val_twist_deg": twist}])
+    output = capsys.readouterr().out
+    assert expected in output
+    assert "structural result" not in output
 
 
 # --------------------------------------------------------------------------

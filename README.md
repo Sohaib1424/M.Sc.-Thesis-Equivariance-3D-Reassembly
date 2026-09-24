@@ -127,7 +127,7 @@ tests still pass and the network tests skip.
 git clone <this-repo> && cd <this-repo>
 python -m venv .venv && source .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest                                        # 311 passed
+python -m pytest                                        # 396 passed
 ```
 
 Installing is optional — `pytest.ini` sets `pythonpath = src .` and each script
@@ -257,6 +257,8 @@ src/reassembly/
 │   └── shell.py                   ray-cast visibility (unused; kept for figures)
 ├── data/
 │   ├── paths.py                   scene discovery, subsets, official splits
+│   ├── catalog.py             ★   one shape is one shape; split modes; balancing
+│   ├── sampling.py                weighted + distributed + reproducible sampler
 │   ├── scene.py                   SceneReader — caches the intact mesh across modes
 │   ├── transforms.py              SE(3) perturbation, centring, normalisation
 │   └── features.py                meshes → tensors, and the batch collate
@@ -268,6 +270,7 @@ src/reassembly/
 │   ├── cross.py               ★   cross-fragment attention — read its docstring
 │   ├── losses.py                  the composite objective, verified chance values
 │   └── model.py                   the backbone and the rotation convention
+├── evaluation/metrics.py          reported-only: tilt/twist, head|cos|, Chamfer, PA
 └── viz/scene.py                   scene assembly for rendering
 
 scripts/
@@ -277,7 +280,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             311 tests, no skips
+tests/                             396 tests, no skips
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -309,8 +312,8 @@ python -m scripts.train --root /path/to/breaking_bad --evaluate
 
 On Kaggle's two T4s, `devices=2` spawns one process per GPU — from a *file*,
 not a notebook cell (`scripts/train.py` explains why). It refuses to print a
-verdict a run did not earn: a result at chance, one parked at the 89.9°
-axis-only floor, and one still descending at its cutoff are each flagged for
+verdict a run did not earn: a result at chance, one parked at the ~90°
+axis-only landmark, and one still descending at its cutoff are each flagged for
 what they are.
 
 ### Before you spend a session: preflight
@@ -400,19 +403,25 @@ project how many more sessions are left:
 
 An earlier VN-GAT implementation fit small subsets (43° train error against a
 126.5° chance baseline) but did not generalise — validation stayed near 94–102°
-at every dataset size, which is close to the ~89.9° floor expected if a model
+at every dataset size, which is close to the ~90° level expected if a model
 recovers a fragment's axis but not its azimuth. That result is what motivated
 the current redesign, in which cross-fragment attention runs over
 fracture-surface vertices rather than virtual nodes.
+
+That ~90° level is a **landmark, not a floor**, and the earlier design's own
+later measurements refute reading it as one: a fragment of a symmetric object
+is not itself symmetric, because its fracture boundary is jagged and unique,
+and a scaling run on eight Everyday objects reached 30.9°. The tilt/twist split
+in `reassembly.evaluation.metrics` distinguishes the two readings directly.
 
 Reference values used throughout, worth checking any number against:
 
 | quantity | value |
 |---|---|
 | chance geodesic error (uniform residual) | 126.48° = π/2 + 2/π |
-| chance Euler RMSE, **random** prediction | 86.29° |
-| chance Euler RMSE, **identity** prediction | 83.14° |
-| "axis correct, azimuth random" geodesic | 89.9° |
+| chance Euler RMSE, **random** prediction | 83.25° |
+| chance Euler RMSE, **identity** prediction | 83.18° |
+| "axis correct, azimuth random" geodesic | 90.0° |
 | untrained `L_normal`, `L_face` | 1.0, 2.0 |
 | `L_position` on the unit sphere | 4/3 |
 
@@ -421,11 +430,17 @@ All measured by Monte Carlo in `tests/test_losses.py`.
 Two things worth knowing about these. Euler RMSE and geodesic error are **not**
 the same metric on the same prediction — a 30° single-axis error is 30°
 geodesic but ≈17.3° Euler RMSE, and GARF's tables use Euler RMSE, so always say
-which. And "chance" has two values: predicting the *identity* every time scores
-83.14° Euler RMSE, three degrees **better** than guessing randomly. Since
-collapsing to near-identity is the cheapest early way to reduce a rotation loss,
-a model can appear to beat chance on the headline metric while having learned
-nothing. Geodesic error is 126.5° for both, so it does not pay for the collapse.
+which. And the comparable GARF row is the **vanilla Everyday supplementary**
+table — SE(3)-Equiv 79.30°, GARF-mini 10.41° — not the 6.1° headline.
+
+`euler_rmse` measures the Euler angles of the **residual** rotation
+`predictedᵀ · target`, not the componentwise difference of two Euler triples.
+The difference is not cosmetic: Euler angles are chart coordinates, so
+subtracting two charts is not a metric on SO(3) and it manufactured a 3° gap in
+which a model collapsing to the identity scored *better than guessing* while
+having learned nothing. Measuring the residual closes that gap to 0.07°, which
+is Monte-Carlo noise — the two rows above are the same number, and that is the
+correct behaviour.
 
 ## Notes on the implementation
 
@@ -439,6 +454,14 @@ nothing. Geodesic error is 126.5° for both, so it does not pay for the collapse
   global `np.random` gives correlated streams across DataLoader workers.
 - `Scene.object_key` collapses fracture-mode variants, so `count_objects()`
   reports distinct shapes (746) rather than scene directories (1,442).
+  `data.catalog.build_catalog` applies that grouping to the dataset itself,
+  merging a shape's break patterns across variant directories. Without it a
+  shape is two objects, and one copy can land in train while the other lands in
+  val — so the object split is not an object split, and nothing raises.
+- Two ways to hold data out, `--split-by object` (the benchmark) and
+  `--split-by fracture` (unseen break patterns of known shapes). The second is
+  a diagnostic; its numbers are not comparable with published results and the
+  config prints that at startup.
 
 ## Citation
 

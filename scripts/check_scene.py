@@ -3,9 +3,9 @@
 Find where a scene goes wrong: the data, the model in fp32, the model under
 AMP, or the gradient.
 
-    python -m scripts.check_scene --root data --scene everyday_compressed/Mug/<id>/fractured_3
-    python -m scripts.check_scene --root data --scene <key> --checkpoint runs/vgat/last.pt
-    python -m scripts.check_scene --root data --scene <key> --checkpoint ... --locate
+    python -m scripts.check_scene --root_dir data --scene everyday_compressed/Mug/<id>/fractured_3
+    python -m scripts.check_scene --root_dir data --scene <key> --checkpoint runs/vgat/last.pt
+    python -m scripts.check_scene --root_dir data --scene <key> --checkpoint ... --locate
 
 ``<key>`` is the name training prints for a failed batch and lists in
 ``<out-dir>/offenders.json`` -- ``<object>/<mode>``. A path to a scene directory
@@ -230,7 +230,7 @@ def main(argv=None) -> int:
         entry = next((e for e in build_catalog(find_scenes(config.root, config.subsets)).objects
                       if any(Path(d).resolve() == directory for d, _ in e.modes)), None)
         if entry is None:
-            print(f"{key} is not a scene under --root {config.root}")
+            print(f"{key} is not a scene under --root_dir {config.root}")
             return 2
         modes = [m for d, m in entry.modes if Path(d).resolve() == directory]
         key = f"{entry.key}/{args.mode or modes[0]}"
@@ -279,7 +279,7 @@ def main(argv=None) -> int:
         print("-> a real numerical bug in full precision on this geometry: worth fixing,\n"
               "   not skipping. --locate names the module.")
     if any(s.startswith("MODEL under AMP") for s in stages):
-        print("-> fp16 overflow only: train with --no-amp (the default), or lower --lr.")
+        print("-> fp16 overflow only: train with --amp False (the default), or lower --lr.")
     if any(s.startswith("GRADIENT") for s in stages):
         print("-> the forward is fine and the backward is not: look at the named parameter's\n"
               "   module for a norm or normalisation of a vector that can be zero.")

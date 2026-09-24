@@ -8,6 +8,9 @@ closed solids, and the break creates a genuine two-dimensional surface that
 exists twice, once on each side, with coincident vertices. A fixture that does
 not reproduce that cannot test fracture extraction at all -- it will report
 zero fracture faces and look like a pass.
+
+:func:`no_gpu` is for the few tests whose meaning would otherwise depend on
+how many GPUs the machine running them has.
 """
 from __future__ import annotations
 
@@ -107,3 +110,30 @@ def open_patch(solid):
     keep = np.asarray(solid.triangles_center)[:, 2] > 0
     kept, new_faces = compact_indices(faces[keep], vertices.shape[0])
     return trimesh.Trimesh(vertices[kept], new_faces, process=False)
+
+
+# --------------------------------------------------------------------------
+# The machine
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def no_gpu(monkeypatch):
+    """
+    Hide every GPU -- from this process and from any process it spawns.
+
+    For the tests that need ``train(devices=N)`` to mean N processes. It means
+    that only on a machine without a GPU: with GPUs, ``N`` is capped at how
+    many there are, so on a one-GPU Colab machine ``devices=2`` is one process
+    on ``cuda:0``, and a test asserting two processes fails there while passing
+    on a laptop. Hidden, it is N processes over gloo on every machine.
+
+    Both layers are needed. The spawned processes are fresh interpreters and
+    see only the environment variable. This process may already have started
+    CUDA in an earlier test, after which torch no longer reads the variable,
+    so here the two calls the launcher makes are patched instead.
+    """
+    import torch
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)

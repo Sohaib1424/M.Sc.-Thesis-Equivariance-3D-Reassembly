@@ -2,8 +2,8 @@
 """
 Where the data pipeline's time goes -- measured on this machine, on the real data.
 
-    python -m scripts.benchmark_data --root /kaggle/input/breaking-bad --scenes 24
-    python -m scripts.benchmark_data --root ... --scenes 24 --throughput 30 --workers 2
+    python -m scripts.benchmark_data --root_dir /kaggle/input/breaking-bad --scenes 24
+    python -m scripts.benchmark_data --root_dir ... --scenes 24 --throughput 30 --num_workers 2
 
 Three measurements, all medians over real training scenes:
 
@@ -17,12 +17,12 @@ Three measurements, all medians over real training scenes:
    own time to finish the batch -- on a GPU, synchronised, so the number is
    what the training step actually pays. This is the measurement behind
    ``Config.perturb_on_device``; run it on the GPU the training will use.
-3. **Loader throughput** -- a real ``DataLoader`` with ``--workers`` processes,
+3. **Loader throughput** -- a real ``DataLoader`` with ``--num_workers`` processes,
    batches per second. With prefetching an epoch costs
    ``max(loading, compute)``, not the sum: loading only slows training once a
    batch takes longer to build than to train on.
 
-Every ``Config`` flag is accepted (``--tokens-per-scene``, ``--label-method``,
+Every training flag is accepted (``--tokens_per_scene``, ``--label_method``,
 ...), so the measured pipeline is the one the run will use.
 """
 from __future__ import annotations
@@ -179,7 +179,8 @@ def throughput(dataset, config, batches: int) -> None:
 
     loader = _loader(dataset, config, True, 0, 1, 0,
                      pairs_in_worker=not torch.cuda.is_available())
-    print(f"\n=== loader throughput: {config.workers} worker(s), batch {config.batch_size} ===")
+    print(f"\n=== loader throughput: {config.workers} worker(s), "
+          f"{config.batch_size} scene(s) per batch (--micro_batch_scenes) ===")
     start, count, scenes = time.perf_counter(), 0, 0
     for batch, _dropped in loader:
         count += 1

@@ -9,7 +9,7 @@ splitting an engine across files mostly buys import diagrams.
 
 or from the command line::
 
-    python -m scripts.train --root /kaggle/input/breaking-bad --epochs 40
+    python -m scripts.train --root_dir /kaggle/input/breaking-bad --epochs 40
 
 What this module refuses to do quietly
 --------------------------------------
@@ -73,13 +73,13 @@ class Config:
     root: str = "data"
     subsets: Optional[Sequence[str]] = None
     official_subset: str = "everyday"
-    mode_filter: Optional[str] = None
+    mode_filter: Optional[str] = "fractured_"
     """
-    Keep only fracture-mode directories whose name starts with this --
-    ``"fractured_"`` for the standard break patterns only, excluding the
-    ``mode_*`` variants. ``None`` keeps every mode, which is the default
-    because the variants are additional break patterns of the *same* shape and
-    discarding them throws away data for no stated reason.
+    ``--fracture_pattern``. Keep only fracture-mode directories whose name
+    starts with this: ``"fractured_"``, the default as in Thesis 1, keeps the
+    standard break patterns and excludes the ``mode_*`` variants, so results
+    stay comparable with the benchmark. ``None`` (``--fracture_pattern ""``)
+    keeps every mode.
     """
     split_by: str = "object"
     """
@@ -109,6 +109,14 @@ class Config:
     used, as the proportion of each object's modes held out.
     """
     split_seed: int = 0
+    split_source: str = "auto"
+    """
+    Where the object split comes from: ``"official"`` -- Breaking Bad's own
+    train/val lists, required for numbers comparable with published results,
+    and an error if they are missing; ``"hash"`` -- a deterministic split of
+    whatever is on disk, by ``val_frac``/``test_frac``/``split_seed``; ``"auto"``
+    -- the official lists when present, the hash otherwise (printed either way).
+    """
     balance: str = "none"
     """
     Correct the category imbalance when drawing training samples: ``"none"``,
@@ -173,20 +181,17 @@ class Config:
     head_dim: int = 8
     embedding_dim: int = 32
     negative_slope: float = 0.2
-    checkpoint_cross: bool = True
+    grad_checkpointing: bool = False
     """
-    Recompute the cross-attention pair gathers in the backward pass instead of
-    storing them. Measured as bytes per pair: 1109 -> 86, which on 2048 tokens
-    over 6 fragments (3.5M pairs) is 3.6 GB -> 0.3 GB per layer, for one extra
-    forward of a cheap indexing op. On by default because the trade is that
-    lopsided; outputs and gradients are bitwise identical either way.
-    """
-    checkpoint_intra: bool = False
-    """
-    The same for the intra-fragment layers. Off by default: here recomputation
-    re-runs the projections themselves, which is real work, so it is worth it
-    only when memory is the binding constraint. Turn it on if preflight cannot
-    fit `batch_size=1`.
+    Recompute each layer in the backward pass instead of storing its insides,
+    as in Thesis 1 (``--grad_checkpointing True``). Roughly one extra forward
+    pass of time for a large cut in memory: measured on CPU at 128 channels,
+    see ``docs/PROJECT-STATE.md`` §11. Outputs and gradients are identical.
+    Off by default; a batch that runs out of memory is retried with it on.
+
+    (The cross layers recompute their pair gathers in the backward pass
+    whatever this says -- 1109 -> 86 bytes per pair for nearly no time -- so
+    there is nothing to switch there.)
     """
     schedule: Sequence[str] = ("intra",) * 5 + ("cross",) * 3 + ("intra",)
     """
@@ -211,43 +216,39 @@ class Config:
 
     # -- optimisation -----------------------------------------------------
     epochs: int = 40
-    steps_per_epoch: int = 800
+    steps_per_epoch: int = 1600
     """
-    Batches per GPU per epoch. ``0`` means one full pass over the training
-    split, which is what an epoch used to be.
+    Forward passes (micro-batches) per GPU per epoch; ``0`` is one full pass
+    over the training split. On the command line ``--steps_per_epoch`` counts
+    *optimizer* steps, as in Thesis 1, and is multiplied by ``accumulate``
+    here: the default 1600 is the command line's 800 steps x 2 scenes.
 
     An epoch is the unit the validation curve, the checkpoints, the time
     projection and the learning-rate schedule are counted in, so it should be a
     fixed amount of training. A pass is not one: it moves with
     ``modes_per_scene``, the split, ``limit_train``, the number of GPUs and
-    balancing -- which draws with replacement, so under it "a pass" is not even
-    well defined. A fixed count keeps every one of those fixed.
-
-    800 is roughly one pass over the Everyday training split on two GPUs at
-    ``batch_size=2`` (800 x 2 x 2 = 3,200 scenes, against about 400 objects x 8
-    modes), so the two-GPU Kaggle numbers stay comparable with earlier runs. On
-    one GPU the same epoch is 1,600 scenes: half the data, the same number of
-    optimizer steps. The draws are seeded and every GPU gets exactly the same
-    number of them, which it must -- every GPU takes part in every step.
-
-    For a smoke test with ``limit_train``, set this small or to 0: 800 steps
-    over 40 scenes is forty passes. The startup banner says how many passes an
-    epoch is.
+    balancing. 800 steps x 2 scenes on each of two GPUs is 3,200 scenes, about
+    one pass over the Everyday training split. The draws are seeded and every
+    GPU gets exactly the same number of them, which it must -- every GPU takes
+    part in every step. The startup banner says how many passes an epoch is.
     """
-    batch_size: int = 2
+    batch_size: int = 1
     """
-    Scenes per step *per device*. A scene is a whole graph, so this is not
-    comparable to an image batch size.
-
-    2 rather than 4 because that is what was **measured** to fit on the target
-    card: on a 15.6 GB T4, 4 copies of the largest of twelve sampled Breaking
-    Bad scenes ran out of memory and 2 peaked at 11.96 GB (76%). With
-    `accumulate=2` the effective batch is unchanged, so this costs a little
-    speed and nothing else.
+    Scenes per forward pass per GPU -- ``--micro_batch_scenes`` on the command
+    line, 1 by default as in Thesis 1. Peak memory grows with this and with
+    nothing else in the batch settings. A scene is a whole graph, not an image.
     """
     lr: float = 1e-3
     min_lr_fraction: float = 0.02
+    """``--lr_min`` on the command line, as an absolute rate."""
     warmup_fraction: float = 0.03
+    """``--lr_warmup_epochs`` on the command line, in epochs."""
+    lr_schedule: str = "cosine"
+    """
+    ``"cosine"``: after the warmup, decay once to the floor and stay there.
+    ``"constant"``: stay at ``lr`` after the warmup. (Thesis 1's ``"plateau"``
+    is not implemented here.)
+    """
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     max_vertices_per_batch: int = 0
@@ -267,23 +268,13 @@ class Config:
     actually fit, with a margin. Batches skipped this way are counted and named
     exactly like an out-of-memory skip, because they are the same event.
     """
-    accumulate: int = 1
+    accumulate: int = 2
     """
-    Optimizer steps every `accumulate` batches.
-
-    This was briefly 2, to "keep the effective batch the same as the old
-    `batch_size=4` default". That reasoning was wrong twice over. Accumulation
-    exists to *recover* an effective batch when memory forces `batch_size` down
-    from a justified value -- and 4 was never justified, it was a guess, so
-    there was nothing to recover. It also halves the number of optimizer steps
-    for identical wall-clock, which for a 635k-parameter model on a fixed
-    session budget is a real cost: 40 epochs is ~65k steps at 1 and ~32k at 2.
-
-    At 1 an optimizer step still sees `batch_size * devices` = 4 scenes, and the
-    losses average over *fragments*, so that is around 24 fragments per step,
-    not 4 samples. Raise this if the loss curve turns out to be gradient-noise
-    limited -- which is something to measure, not assume. The LR schedule is
-    expressed in forward passes, so changing it does not shift warmup.
+    Forward passes per optimizer step. The command line does not ask for it:
+    it is ``--batch_size`` (scenes per step per GPU, as in Thesis 1) divided by
+    ``--micro_batch_scenes``. The gradients of the passes in a step are summed
+    and divided by their fragment count, so a step over 8 passes of 1 scene is
+    the same step as one pass over all 8 -- only the peak memory differs.
     """
     amp: bool = False
     perturb_on_device: bool = True
@@ -329,6 +320,11 @@ class Config:
     ``/kaggle/working``, and the next session mounts that output read-only under
     ``/kaggle/input/<name>``. Point ``resume_from`` at the input copy and
     ``out_dir`` at working, and the chain continues across sessions.
+    """
+    save_every: int = 1
+    """
+    Write ``last.pt`` every this many epochs, and always on the last one and on
+    a stop. ``best.pt`` is written whenever validation improves, regardless.
     """
     checkpoint_every_minutes: float = 30.0
     """
@@ -378,6 +374,15 @@ class Config:
             raise ValueError("max_objects must be >= 1, or None for every object")
         if self.accumulate < 1:
             raise ValueError("accumulate must be >= 1")
+        if self.split_source not in ("auto", "official", "hash"):
+            raise ValueError(f"split_source must be 'auto', 'official' or 'hash', "
+                             f"got {self.split_source!r}")
+        if self.lr_schedule not in ("cosine", "constant"):
+            raise ValueError(f"lr_schedule must be 'cosine' or 'constant', got "
+                             f"{self.lr_schedule!r}" + (" -- Thesis 1's 'plateau' is not "
+                             "implemented here" if self.lr_schedule == "plateau" else ""))
+        if self.save_every < 1:
+            raise ValueError("save_every must be >= 1")
         from .data.catalog import BALANCE_SCHEMES, SPLIT_MODES
 
         if self.split_by not in SPLIT_MODES:
@@ -416,6 +421,34 @@ class Config:
             print("[config] supervise_embedding=False: the embedding head will "
                   "receive no gradient at all, and stage two's correspondence "
                   "search depends on it. Set w_embedding=0 to acknowledge this.")
+
+
+# The command-line name of each Config field that Thesis 1 also has, under
+# Thesis 1's name, so the two projects are driven by the same flags. Every
+# other field's flag is its own name. `scripts/config_flags.py` builds the
+# parser from this; the messages here use it to name the flag the user types.
+# (`--batch_size`, `--steps_per_epoch`, `--lr_min`, `--lr_warmup_epochs`,
+# `--val_steps` and `--resume` carry Thesis 1's *meaning* too and are converted
+# there.)
+THESIS1_NAMES = {
+    "root": "root_dir",
+    "out_dir": "checkpoint_dir",
+    "subsets": "data_subsets",
+    "mode_filter": "fracture_pattern",
+    "channels": "hidden_channels",
+    "embedding_dim": "embed_dim",
+    "w_rotation": "w_rot",
+    "w_position": "w_pos",
+    "workers": "num_workers",
+    "devices": "num_gpus",
+    "max_hours": "time_budget_hours",
+    "batch_size": "micro_batch_scenes",
+}
+
+
+def flag(field: str) -> str:
+    """The command-line flag that sets a Config field."""
+    return "--" + THESIS1_NAMES.get(field, field)
 
 
 # Reference values every metric is read against. Measured by Monte Carlo in
@@ -491,11 +524,16 @@ class BreakingBadScenes:
         # `volume_constrained-everyday_compressed`, so an object split is not
         # one. Grouping keeps every break pattern and counts every shape once.
         full = build_catalog(scenes, mode_filter=config.mode_filter)
-        official = {
+        official = {} if config.split_source == "hash" else {
             name: load_official_split(config.root, name, config.official_subset)
             for name in ("train", "val", "test")
         }
         official = {k: v for k, v in official.items() if v}
+        if config.split_source == "official" and not official:
+            raise FileNotFoundError(
+                f"--split_source official, but no official split lists for "
+                f"{config.official_subset!r} were found under {config.root!r}. "
+                f"Use --split_source hash (or auto) to split what is on disk.")
         self.official = bool(official)
 
         self.catalog: Catalog = split_catalog(
@@ -521,7 +559,7 @@ class BreakingBadScenes:
                    "official test split -- use split_by='fracture' or the hash "
                    "fallback if you need a third partition."
                    if split == "test" and official else
-                   "Check --root and --official-subset.")
+                   "Check --root_dir and --official_subset.")
             )
 
         # (object index, mode name) pairs, deterministic in order. A mode's
@@ -784,7 +822,8 @@ def _collate_samples(samples, pairs: bool = False):
 
 def learning_rate(step: int, total: int, config: Config) -> float:
     """
-    Linear warmup then cosine decay -- a pure function of the step.
+    Linear warmup, then cosine decay to the floor (``lr_schedule="cosine"``) or
+    a constant rate (``"constant"``) -- a pure function of the step.
 
     Deliberately not ``CosineAnnealingLR``. That object is *periodic*: past
     ``T_max`` the rate climbs back toward its base, which turns a mis-set epoch
@@ -798,6 +837,8 @@ def learning_rate(step: int, total: int, config: Config) -> float:
     floor = config.lr * config.min_lr_fraction
     if step < warmup:
         return config.lr * (step + 1) / warmup
+    if config.lr_schedule == "constant":
+        return config.lr
     progress = min((step - warmup) / max(total - warmup, 1), 1.0)
     return floor + 0.5 * (config.lr - floor) * (1.0 + math.cos(math.pi * progress))
 
@@ -1197,33 +1238,26 @@ def _release_cache(device) -> None:
 
 class _checkpointing:
     """
-    Force gradient checkpointing on every attention layer, for one retry.
+    Switch whole-layer gradient checkpointing on, for one retry.
 
-    Intra layers keep their projections, cross layers their pair gathers, in
-    the forward pass by default; with this on, both are recomputed in the
-    backward instead. Outputs and gradients are identical -- only the peak
-    memory and the time change -- so a scene that fits this way contributes
-    exactly what it would have if it had fitted the first time.
+    Outputs and gradients are identical -- only the peak memory and the time
+    change -- so a scene that fits this way contributes exactly what it would
+    have if it had fitted the first time.
     """
 
     def __init__(self, model, forced: bool):
-        self.model, self.forced, self.saved = model, forced, []
+        self.model, self.forced, self.saved = model, forced, None
 
     def __enter__(self):
         if self.forced:
-            from .nn.cross import VNCrossFragmentAttention
-            from .nn.gat import VNGraphAttention
-
-            for module in self.model.modules():
-                if isinstance(module, (VNGraphAttention, VNCrossFragmentAttention)):
-                    self.saved.append((module, module.checkpoint))
-                    module.checkpoint = True
+            self.saved = self.model.grad_checkpointing
+            self.model.grad_checkpointing = True
         return self
 
     def __exit__(self, *exc):
-        for module, flag in self.saved:
-            module.checkpoint = flag
-        self.saved = []
+        if self.saved is not None:
+            self.model.grad_checkpointing = self.saved
+        self.saved = None
         return False
 
 
@@ -1281,8 +1315,8 @@ def _attempt(model, batch, criterion, config, scaler, weight, forced):
         # `accumulate`. Every loss term is a *mean over fragments*, so
         # multiplying by the count turns it back into a sum; the step divides
         # the sum by the fragments that actually contributed, on every GPU.
-        # That makes `--batch-size 1 --accumulate 2` the same gradient as
-        # `--batch-size 2`, which `loss / accumulate` is not -- it weights each
+        # That makes 2 passes of 1 scene the same gradient as one pass of
+        # 2 scenes, which `loss / accumulate` is not -- it weights each
         # *scene* equally, and a scene holds 2 to 35 fragments. Measured on a
         # 2- and an 8-fragment scene, the two had cosine similarity 0.80.
         scaled = loss * weight
@@ -1549,7 +1583,7 @@ def _count_outcome(tally, outcome, batch, names, vertices, detail, prefix,
         _note_batch_failure(tally, batch, "out of memory")
         print(f"\n  {prefix}[oom] {label} batch {index} ({vertices:,} vertices) did "
               f"not fit even with gradient checkpointing; skipped. "
-              f"--max-vertices-per-batch {int(vertices * 0.9)} skips these up front.")
+              f"--max_vertices_per_batch {int(vertices * 0.9)} skips these up front.")
     elif outcome in ("nonfinite-loss", "nonfinite-grad"):
         what = "loss" if outcome == "nonfinite-loss" else "gradient"
         tally["nonfinite"] += 1
@@ -1780,7 +1814,7 @@ def _check_resume_compatible(config: Config, saved: Dict, announce: bool) -> Non
             raise ValueError(
                 f"cannot resume: the checkpoint was trained with a different "
                 f"architecture ({detail}). Either match the config, point "
-                f"--out-dir somewhere fresh, or pass --no-strict-resume to "
+                f"--checkpoint_dir somewhere fresh, or pass --strict_resume False to "
                 f"attempt it anyway."
             )
         if announce:
@@ -1893,11 +1927,11 @@ def _time_report(history: List[dict], config: Config, elapsed: float,
     """
     # Seconds *per step*, not per epoch. An epoch's duration is only comparable
     # to another epoch of the same size, and they are not always the same size:
-    # a `--limit-train` calibration run resumed at the full dataset leaves three
+    # a `--limit_train` calibration run resumed at the full dataset leaves three
     # 236-second epochs sitting in the history in front of three 3,555-second
     # ones. Averaging those gave "~22:09/epoch" for an epoch that took 59
     # minutes -- a 2.7x under-estimate, in the one number the session plan is
-    # built on. Per-step is invariant to that, and to `--limit-train` changing
+    # built on. Per-step is invariant to that, and to `--limit_train` changing
     # again on the next resume.
     rates = [h["seconds"] / h["steps"] for h in history
              if h.get("seconds") and h.get("steps")]
@@ -1932,8 +1966,7 @@ def build_model(config: Config):
         channels=config.channels, heads=config.heads, head_dim=config.head_dim,
         embedding_dim=config.embedding_dim, schedule=tuple(config.schedule),
         negative_slope=config.negative_slope,
-        checkpoint_intra=config.checkpoint_intra,
-        checkpoint_cross=config.checkpoint_cross,
+        grad_checkpointing=config.grad_checkpointing,
     )
 
 
@@ -2041,6 +2074,11 @@ def train(config: Config) -> List[dict]:
     ran, since only rank 0 records it.
     """
     requested = _launch_size(config)
+    if 0 < requested < config.devices:
+        # Said out loud: a run told to use two GPUs that quietly used one would
+        # read as a two-GPU result.
+        print(f"[setup] --num_gpus {config.devices} requested but only {requested} "
+              f"GPU(s) visible -- using {requested}.")
     if requested > 1:
         import __main__
         import torch.multiprocessing as mp
@@ -2299,7 +2337,7 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
                "partial": int(stopped),
                "lr": learning_rate(step, total_steps, config),
                # Recorded so the time projection can work in seconds *per step*
-               # and stay right when --limit-train changes between sessions.
+               # and stay right when --limit_train changes between sessions.
                "steps": max(step - epoch_step, 1),
                "gpus": max(world, 1),
                "seconds": round(time.time() - began, 1)}
@@ -2321,7 +2359,9 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
         improved = score < best
         if improved:
             best = score
-        checkpoint(step, epoch, completed=not stopped)
+        if (stopped or (epoch + 1) % config.save_every == 0
+                or epoch + 1 == config.epochs):
+            checkpoint(step, epoch, completed=not stopped)
         if improved:
             save_checkpoint(best_path, model, optimizer, config, epoch, step,
                             history, best, scaler, completed=not stopped,
@@ -2337,7 +2377,7 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
     if main:
         if signal_watch.triggered:
             print(f"\n[signal] stopped on {signal_watch.name}. Progress is in "
-                  f"{last_path} -- rerun with the same --out-dir to continue.")
+                  f"{last_path} -- rerun with the same --checkpoint_dir to continue.")
         elif stopped:
             print(f"\n[time] session budget reached. Progress is in {last_path}.")
             print(_resume_recipe(config, out_dir))
@@ -2462,18 +2502,21 @@ def _balance_banner(config, train_set) -> List[str]:
 
 
 def _epoch_lines(config, items: int, world: int, per_epoch: int) -> List[str]:
-    """What one epoch is, in scenes and in passes over the training split."""
+    """What one epoch is: optimizer steps, scenes, and passes over the split."""
     gpus = max(world, 1)
     scenes = per_epoch * config.batch_size * gpus
     passes = scenes / max(items, 1)
+    steps = math.ceil(per_epoch / max(config.accumulate, 1))
     kind = "fixed length" if config.steps_per_epoch > 0 else "one full pass"
-    lines = [f"  epoch         {per_epoch} steps/GPU x {gpus} GPU(s) x batch "
-             f"{config.batch_size} = {scenes:,} scenes = {passes:.2f} passes ({kind})"]
-    if config.accumulate > 1:
-        lines.append(f"                optimizer step every {config.accumulate} batches")
+    lines = [f"  epoch         {steps} steps/GPU x batch "
+             f"{config.batch_size * config.accumulate} x {gpus} GPU(s) = {scenes:,} "
+             f"scenes = {passes:.2f} passes ({kind})",
+             f"                {config.batch_size} scene(s) per forward pass "
+             f"(--micro_batch_scenes), gradient checkpointing "
+             f"{'on' if config.grad_checkpointing else 'off'}"]
     if config.steps_per_epoch > 0 and passes > 4:
         lines.append(f"                every scene is drawn ~{passes:.0f}x per epoch -- "
-                     f"for a smoke test use --steps-per-epoch 0 (one pass)")
+                     f"for a smoke test use --steps_per_epoch 0 (one pass)")
     return lines
 
 
@@ -2497,8 +2540,10 @@ def _banner(config, train_set, val_set, parameters, device, world, per_epoch) ->
         f"  tokens        {config.tokens_per_scene}/scene, {config.token_mode}"
         f" by {config.token_metric} distance",
         f"  precision     {'AMP' if config.amp else 'fp32'}",
-        f"  lr            {config.lr:.2e} -> {config.lr * config.min_lr_fraction:.2e}"
-        f"  (warmup {config.warmup_fraction:.0%}, cosine)",
+        (f"  lr            {config.lr:.2e} -> {config.lr * config.min_lr_fraction:.2e}"
+         if config.lr_schedule == "cosine" else f"  lr            {config.lr:.2e}")
+        + f"  ({config.lr_schedule}, warmup {config.warmup_fraction * config.epochs:g}"
+          f" epoch(s))",
         "-" * 74,
         "  read every number against chance, not against zero:",
         f"    geodesic      {CHANCE['geodesic_deg']:.2f} deg   <- a model here has learned nothing",
@@ -2641,7 +2686,7 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
         summary["assembly_scenes"] = [dict(scene) for scene in scenes]
         _print_assembly(assembly, by_category, len(scenes))
     else:
-        print("  (rotation only: --no-assemble skipped the translation solver, so "
+        print("  (rotation only: --no_assemble skipped the translation solver, so "
               "there is no RMSE(T), Chamfer or part accuracy)")
 
     summary.pop("failures", None)
@@ -2720,8 +2765,8 @@ def _adopt_checkpoint_settings(config: Config, stored: Dict, data: bool) -> Conf
     changes = {key: stored[key] for key in keys
                if key in stored and key in names and _differs(stored[key], getattr(config, key))}
     for key, value in changes.items():
-        print(f"[checkpoint] using the checkpoint's {key}={value!r} "
-              f"(the config said {getattr(config, key)!r})")
+        print(f"[checkpoint] using the checkpoint's {flag(key)} {value!r} "
+              f"(the flags said {getattr(config, key)!r})")
     if "schedule" in changes:
         changes["schedule"] = tuple(changes["schedule"])
     return dataclasses.replace(config, **changes) if changes else config
@@ -2806,8 +2851,9 @@ def _report_dropped(train_summary: Dict, val_summary: Dict,
         if summary.get("oom"):
             print(f"  {label}: {summary['oom']} batch(es) did not fit even with "
                   f"gradient checkpointing and were skipped. A handful is "
-                  f"survivable; more than that means --batch-size is too high and "
-                  f"the largest objects are being dropped from training.")
+                  f"survivable; more than that means the largest objects are being "
+                  f"dropped from training: lower --micro_batch_scenes (1 is the "
+                  f"floor), or --hidden_channels.")
         if summary.get("nonfinite"):
             print(f"  {label}: {summary['nonfinite']} batch(es) produced a "
                   f"non-finite loss or gradient and were dropped from the step. "
@@ -2935,7 +2981,7 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             f"{total_workers} dataloader workers plus {world} training "
             f"process(es) on {cpus} cpus is oversubscribed. Scene building is "
             f"CPU-bound here, so this comes straight off epoch time; try "
-            f"--workers {max((cpus - world) // world, 1)}."
+            f"--num_workers {max((cpus - world) // world, 1)}."
         )
 
     # -- 2. output location ------------------------------------------------
@@ -2961,11 +3007,11 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
         # split came out empty, --root is right and the split is the problem --
         # telling someone to fix a correct path sends them the wrong way.
         if "no scenes left in split" in str(error):
-            print("\n  The dataset was found, so --root is right. Either the")
+            print("\n  The dataset was found, so --root_dir is right. Either the")
             print("  official split lists no object present here, or there are")
             print("  too few objects for the hashed fallback to fill every split.")
         else:
-            print("\n  --root must point at the directory *containing* the subset")
+            print("\n  --root_dir must point at the directory *containing* the subset")
             print("  folders, e.g. /kaggle/input/breaking-bad, not at one object.")
         return False
     print(f"  objects: {len(train_set.scenes)} train / {len(val_set.scenes)} val")
@@ -3080,7 +3126,7 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     if tokens.max() == 0:
         problems.append("every scene produced ZERO cross-fragment tokens -- the "
                         "fracture mask is empty, so the cross layers do nothing. "
-                        "Check --label-method and --sharp-threshold.")
+                        "Check --label_method and --sharp_threshold.")
     elif np.median(tokens) < 16:
         warnings.append(f"median {int(np.median(tokens))} tokens/scene is very "
                         f"low; the cross-fragment layers have little to attend over")
@@ -3118,47 +3164,44 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             model.zero_grad(set_to_none=True)
             batch = loss = report = None
             torch.cuda.empty_cache()
-            print(f"  batch_size={candidate}: out of memory")
+            print(f"  micro_batch_scenes={candidate}: out of memory")
             continue
         peak = (torch.cuda.max_memory_allocated() / 1e9
                 if device.startswith("cuda") else 0.0)
         fitted = candidate
-        print(f"  batch_size={candidate}: fits"
+        print(f"  micro_batch_scenes={candidate}: fits"
               + (f", peak {peak:.2f} GB of {total_memory:.1f} GB "
                  f"({100 * peak / total_memory:.0f}%)" if peak else ""))
         break
 
     if fitted == 0:
         problems.append(
-            f"out of memory even at batch_size=1 on a {total_memory:.0f} GB card. "
-            f"Try, in this order: --checkpoint-intra (recomputes the "
-            f"intra-fragment projections in the backward pass, the largest "
-            f"remaining saving), then --channels 32 (roughly halves every edge "
-            f"activation), then --tokens-per-scene 1024 (the cross-attention "
-            f"cost is quadratic in this)."
+            f"out of memory even at micro_batch_scenes=1 on a "
+            f"{total_memory:.0f} GB card. Try, in this order: "
+            + ("" if config.grad_checkpointing else
+               "--grad_checkpointing True (recomputes every layer in the backward "
+               "pass, the largest saving), then ")
+            + f"a smaller --hidden_channels (every edge activation scales with "
+            f"it), then --tokens_per_scene 1024 (the cross-attention cost is "
+            f"quadratic in this)."
         )
         _summarise(problems, warnings)
         return False
     if fitted < config.batch_size:
-        effective = max(config.batch_size // fitted, 1)
         problems.append(
-            f"batch_size={config.batch_size} does not fit; {fitted} does. Use "
-            f"--batch-size {fitted} --accumulate {effective}. The gradient is "
-            f"identical to a real batch of {fitted * effective} on all four "
-            f"geometric terms -- micro-batches are weighted by fragment count, "
-            f"not by 1/accumulate -- and costs a little speed. The contrastive "
-            f"term differs by construction: its negatives come from the batch, "
-            f"so accumulation gives it within-scene negatives only, which is "
-            f"the confusion set matching actually faces."
+            f"micro_batch_scenes={config.batch_size} does not fit; {fitted} does. "
+            f"Use --micro_batch_scenes {fitted}: --batch_size stays the scenes per "
+            f"optimizer step, and the step is identical on all four geometric "
+            f"terms -- passes are weighted by fragment count -- at a little "
+            f"speed. The contrastive term differs by construction: its negatives "
+            f"come from the pass, so smaller passes give it within-scene "
+            f"negatives only, which is the confusion set matching actually faces."
         )
     if peak and peak > 0.65 * total_memory:
-        # Keep the effective batch identical when suggesting a smaller one.
-        # `--accumulate 2` alongside a halved batch would quietly halve the
-        # effective batch as well, which changes the optimisation rather than
-        # just the memory -- and a suggestion that silently retunes the run is
-        # worse than no suggestion.
+        # Only the pass size is suggested: --batch_size, the scenes per
+        # optimizer step, stays, so the suggestion changes the memory and not
+        # the optimisation.
         safer = max(fitted // 2, 1)
-        keep = max(config.accumulate * max(fitted // safer, 1), 1)
         warnings.append(
             f"peak memory is {100 * peak / total_memory:.0f}% of the card on the "
             f"largest of {samples} sampled scenes -- and the dataset's largest "
@@ -3166,9 +3209,13 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             f"here. Training catches an OOM and skips the batch and reports the "
             f"count; if that count is more than a percent or so of an epoch, the "
             f"largest objects are being dropped from training, which biases the "
-            f"result. Then use --batch-size {safer} --accumulate {keep}, which "
-            f"holds the effective batch at "
-            f"{safer * keep * max(requested, 1)}."
+            f"result. Then use "
+            + (f"--micro_batch_scenes {safer}" if safer < fitted else "")
+            + (" or " if safer < fitted and not config.grad_checkpointing else "")
+            + ("--grad_checkpointing True" if not config.grad_checkpointing else "")
+            + (f"; the optimizer step keeps its "
+               f"{config.batch_size * config.accumulate} scenes per GPU."
+               if safer < fitted else ".")
         )
 
     parameters = sum(p.numel() for p in model.parameters())
@@ -3181,7 +3228,7 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     fitted_vertices = int(vertices.max()) * fitted
     suggested = int(fitted_vertices * 0.95)
     print(f"  largest batch proved to fit: {fitted_vertices:,} vertices"
-          + (f"   -- pass --max-vertices-per-batch {suggested}"
+          + (f"   -- pass --max_vertices_per_batch {suggested}"
              if not config.max_vertices_per_batch else ""))
     if not config.max_vertices_per_batch:
         # A note, no longer a warning. A batch that does not fit is retried
@@ -3189,7 +3236,7 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
         # one GPU or several -- the run survives it either way. The limit just
         # saves the two doomed attempts.
         print(f"  (a larger batch that runs out of memory is retried with "
-              f"gradient checkpointing, then skipped; --max-vertices-per-batch "
+              f"gradient checkpointing, then skipped; --max_vertices_per_batch "
               f"{suggested} skips such batches before attempting them)")
     dead = [n for n, p in model.named_parameters()
             if p.grad is None or p.grad.abs().sum() == 0]
@@ -3285,7 +3332,7 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     # step 6 had, in a second place.
     timing_batch = max(min(config.batch_size, fitted), 1)
     print(f"\n[7/7] timing {timed_batches} training steps at "
-          f"batch_size={timing_batch}"
+          f"micro_batch_scenes={timing_batch}"
           + (f" (not {config.batch_size} -- that did not fit)"
              if timing_batch != config.batch_size else ""))
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
@@ -3325,9 +3372,10 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     if done == 0:
         problems.append(
             f"every one of the first {skipped} batches ran out of memory at "
-            f"batch_size={timing_batch}, even though a batch of {fitted} copies "
-            f"of the largest sampled scene fits. Real scenes are bigger than the "
-            f"sample; lower --batch-size or --tokens-per-scene."
+            f"micro_batch_scenes={timing_batch}, even though {fitted} copies of "
+            f"the largest sampled scene fit. Real scenes are bigger than the "
+            f"sample; lower --micro_batch_scenes or --tokens_per_scene, or turn "
+            f"on --grad_checkpointing True."
         )
         _summarise(problems, warnings)
         return False
@@ -3336,7 +3384,8 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             f"{skipped} of the first {done + skipped} batches ran out of memory "
             f"and were skipped. Training survives this by design, but that rate "
             f"means the largest objects are being dropped from training -- lower "
-            f"--batch-size and raise --accumulate to keep the effective batch."
+            f"--micro_batch_scenes (the step keeps its --batch_size scenes) or "
+            f"turn on --grad_checkpointing True."
         )
     per_step = (time.time() - began) / max(done, 1)
 
@@ -3371,11 +3420,11 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     sessions = math.ceil(total_seconds / (config.max_hours * 3600))
     print(f"  {per_step:.2f} s/step train, {val_per_step:.2f} s/step val")
     print(f"  {steps} train + {val_steps} val steps/epoch per GPU at "
-          f"batch_size={timing_batch} on {world} device(s) "
+          f"micro_batch_scenes={timing_batch} on {world} device(s) "
           f"-> ~{_hms(epoch_seconds)}/epoch"
-          + ("  (--steps-per-epoch)" if config.steps_per_epoch > 0 else "  (one pass)"))
+          + ("  (--steps_per_epoch)" if config.steps_per_epoch > 0 else "  (one pass)"))
     if timing_batch != config.batch_size:
-        print(f"  (--accumulate does not change this: it changes how often the "
+        print(f"  (--batch_size does not change this: it sets how often the "
               f"optimizer steps, not how many forward/backward passes run)")
     print(f"  {config.epochs} epochs -> ~{_hms(total_seconds)} "
           f"= {sessions} session(s) at {config.max_hours:g}h")
@@ -3393,7 +3442,7 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             f"works -- mid-epoch checkpoints every "
             f"{config.checkpoint_every_minutes:g} min cover it -- but no epoch "
             f"will ever complete, so val metrics never update. Consider fewer "
-            f"--modes-per-scene."
+            f"--modes_per_scene."
         )
 
     return _summarise(problems, warnings)

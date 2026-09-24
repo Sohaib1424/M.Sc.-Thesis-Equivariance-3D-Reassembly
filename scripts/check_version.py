@@ -68,7 +68,7 @@ MARKERS = [
     ("non-finite coordinates skipped by name", "src/reassembly/training.py",
      '"non-finite vertex coordinates"'),
     # -- epochs and the data path -------------------------------------------
-    ("fixed-length epochs", "src/reassembly/training.py", "steps_per_epoch: int = 800"),
+    ("fixed-length epochs", "src/reassembly/training.py", "steps_per_epoch: int = 1600"),
     ("fixed-length sampler", "src/reassembly/data/sampling.py", "class EpochSampler"),
     ("restarted epoch rewinds its step", "src/reassembly/training.py",
      'state.get("epoch_step", state["step"])'),
@@ -93,7 +93,7 @@ MARKERS = [
     ("prediction dump with placement", "scripts/dump_prediction.py", "placement="),
     ("reassembly viewer", "scripts/visualize_reassembly.py", "build_trimesh_scene"),
     ("GIF renderer", "scripts/render_gif.py", "def render_matplotlib"),
-    ("object-count sweep", "scripts/scaling_sweep.py", "--max-objects"),
+    ("object-count sweep", "scripts/scaling_sweep.py", "--max_objects"),
     # -- earlier fixes that must not regress --------------------------------
     ("non-finite loss caught before backward", "src/reassembly/training.py",
      'return "nonfinite-loss", report, value'),
@@ -103,6 +103,21 @@ MARKERS = [
      "def build_catalog"),
     ("multi-process tests", "tests/test_distributed.py",
      "def test_the_step_is_the_global_mean_and_the_replicas_stay_identical"),
+    ("tests independent of the machine's GPU count", "tests/conftest.py",
+     "def no_gpu(monkeypatch)"),
+    ("OOM-group test exact, on one thread", "tests/test_training_recovery.py",
+     "def _identical(a, b)"),
+    # -- Thesis 1's flags, one checkpointing switch ----------------------------
+    ("whole-layer gradient checkpointing", "src/reassembly/nn/model.py",
+     "torch.utils.checkpoint.checkpoint(layer, *inputs,"),
+    ("Thesis 1's flag names and meanings", "scripts/config_flags.py",
+     "THESIS1_ONLY = {"),
+    ("--lr_schedule constant", "src/reassembly/training.py",
+     'if config.lr_schedule == "constant":'),
+    ("--split_source official is enforced", "src/reassembly/training.py",
+     'if config.split_source == "official" and not official:'),
+    ("fewer GPUs than --num_gpus is announced", "src/reassembly/training.py",
+     "GPU(s) visible -- using {requested}."),
 ]
 
 

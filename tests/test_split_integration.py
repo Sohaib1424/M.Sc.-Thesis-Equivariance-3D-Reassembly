@@ -80,7 +80,7 @@ def _config(root, **kwargs):
     defaults = dict(
         root=str(root), out_dir=str(Path(root).parent / "out"),
         channels=16, heads=4, head_dim=4, embedding_dim=8, workers=0,
-        tokens_per_scene=32, batch_size=2, epochs=1, modes_per_scene=None,
+        tokens_per_scene=32, batch_size=2, accumulate=1, epochs=1, modes_per_scene=None,
         schedule=("intra", "cross"), check_init=False, steps_per_epoch=0,
     )
     defaults.update(kwargs)

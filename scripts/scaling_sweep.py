@@ -2,27 +2,27 @@
 """
 How does training error move with the number of distinct OBJECTS?
 
-    python -m scripts.scaling_sweep --root data --counts 2 8 32 --seeds 0 1 2 \\
-        --steps-per-object 400 --out-dir runs/scaling
+    python -m scripts.scaling_sweep --root_dir data --counts 2 8 32 --seeds 0 1 2 \\
+        --steps_per_object 400 --checkpoint_dir runs/scaling
 
 Each (count, seed) is a separate ``python -m scripts.train`` run on the first
-``count`` training objects (``--max-objects``, spread across the catalogue),
-and the sweep reads their histories. Any other ``Config`` flag
-(``--devices``, ``--batch-size``, ``--channels`` ...) is passed through to every
-run.
+``count`` training objects (``--max_objects``, spread across the catalogue),
+and the sweep reads their histories. Any other training flag
+(``--num_gpus``, ``--batch_size``, ``--hidden_channels`` ...) is passed through
+to every run. Steps are optimizer steps, as in ``--steps_per_epoch``.
 
 The two confounds this exists to avoid
 --------------------------------------
 1. **Equal total budget.** Giving every run the same number of steps gives each
    object 1/N of them, so error rises with N by arithmetic alone.
-   ``--steps-per-object`` is held fixed instead and total steps grow with N --
+   ``--steps_per_object`` is held fixed instead and total steps grow with N --
    expensive at large N, which is the honest price of the question.
 2. **A wall-clock cap.** A cap silently truncates exactly the large-N runs and
-   reintroduces (1). None is set unless you pass ``--max-hours``, and a run
+   reintroduces (1). None is set unless you pass ``--time_budget_hours``, and a run
    that fell short of its budget is marked TRUNCATED and excluded from the
    verdict rather than reported as comparable.
 
-The learning rate is constant by default (``--lr-schedule constant``): a decaying
+The learning rate is constant by default (``--lr_schedule constant``): a decaying
 schedule reaches its floor at different points in runs of different lengths.
 
 Reading the result
@@ -39,7 +39,8 @@ oscillate, so the last epoch is a poor estimate of what a run reached.
   orientation once the object is unknown.
 
 This reads TRAINING error on purpose: the question is capacity, not
-generalisation. Validation is kept to ``--limit-val`` scenes to stay cheap.
+generalisation. Validation is kept to ``--val_steps`` x ``--batch_size`` scenes
+(8 by default) to stay cheap.
 """
 from __future__ import annotations
 
@@ -56,9 +57,12 @@ sys.path.insert(0, str(ROOT))
 from scripts.config_flags import (add_config_arguments, config_flags,  # noqa: E402
                                   config_from_args)
 
-# Set by the sweep itself, per run; never passed through from the command line.
+# Set by the sweep itself, per run; never passed through from the command line:
+# the flags, and the Config fields they set.
+_OWNED_FLAGS = {"max_objects", "steps_per_epoch", "epochs", "seed", "out_dir", "resume",
+                "lr_warmup_epochs", "val_steps", "max_hours"}
 _OWNED = {"max_objects", "steps_per_epoch", "epochs", "seed", "out_dir", "resume",
-          "resume_from", "min_lr_fraction", "warmup_fraction", "limit_val", "max_hours"}
+          "resume_from", "warmup_fraction", "limit_val", "max_hours"}
 
 
 def _slope(values) -> float:
@@ -75,16 +79,17 @@ def run_one(count: int, seed: int, args, passthrough) -> dict:
     out_dir = Path(args.out_dir) / f"objects{count:04d}_seed{seed}"
     total = args.steps_per_object * count
     epochs = max(4, min(args.max_epochs, -(-total // args.steps_per_epoch)))
+    warmup = (args.lr_warmup_epochs if args.lr_warmup_epochs is not None
+              else 0.03 * epochs)
     command = [
         sys.executable, "-m", "scripts.train", *passthrough,
-        "--max-objects", str(count), "--steps-per-epoch", str(args.steps_per_epoch),
-        "--epochs", str(epochs), "--seed", str(seed), "--out-dir", str(out_dir),
-        "--no-resume", "--limit-val", str(args.limit_val),
-        "--warmup-fraction", str(args.warmup_fraction),
-        "--min-lr-fraction", "1.0" if args.lr_schedule == "constant" else "0.02",
+        "--max_objects", str(count), "--steps_per_epoch", str(args.steps_per_epoch),
+        "--epochs", str(epochs), "--seed", str(seed), "--checkpoint_dir", str(out_dir),
+        "--resume", "none", "--val_steps", str(args.val_steps),
+        "--lr_warmup_epochs", repr(warmup),
     ]
     if args.max_hours:
-        command += ["--max-hours", str(args.max_hours)]
+        command += ["--time_budget_hours", str(args.max_hours)]
     print(f"\n{'=' * 72}\n  {count} objects | seed {seed} | {epochs} epochs x "
           f"{args.steps_per_epoch} steps ({epochs * args.steps_per_epoch / count:.0f} "
           f"per object)\n{'=' * 72}", flush=True)
@@ -98,7 +103,9 @@ def run_one(count: int, seed: int, args, passthrough) -> dict:
              if row.get("train_rotation_degrees") is not None]
     if not curve:
         return {"objects": count, "seed": seed, "error": "no rotation error recorded"}
-    steps = sum(row.get("steps", 0) for row in history if not row.get("partial"))
+    # Optimizer steps, the unit of --steps_per_object ("steps" counts passes).
+    steps = sum(row.get("train_steps", row.get("steps", 0)) for row in history
+                if not row.get("partial"))
     achieved = steps / count
     tail = curve[-max(1, len(curve) // 10):]
     return {
@@ -130,7 +137,7 @@ def summarise(results, seeds) -> None:
     truncated = [r for r in results if r.get("truncated")]
     if truncated:
         print(f"\n  INVALID: {len(truncated)} run(s) stopped short of the per-object budget "
-              f"and are left out below -- rerun them without --max-hours.")
+              f"and are left out below -- rerun them without --time_budget_hours.")
     by_count = {}
     for r in good:
         by_count.setdefault(r["objects"], []).append(r["best_train_deg"])
@@ -149,7 +156,7 @@ def summarise(results, seeds) -> None:
     falling = [r for r in good if r["tail_slope_deg_per_epoch"] < -0.3]
     if falling:
         print(f"\n  CAUTION: {len(falling)} run(s) were still descending at the end -- lower "
-              f"bounds on progress, not ceilings. Raise --steps-per-object.")
+              f"bounds on progress, not ceilings. Raise --steps_per_object.")
 
 
 def main(argv=None) -> int:
@@ -157,20 +164,21 @@ def main(argv=None) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--counts", type=int, nargs="+", default=[2, 8, 32])
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
-    parser.add_argument("--steps-per-object", type=int, default=400)
-    parser.add_argument("--max-epochs", type=int, default=400)
-    parser.add_argument("--lr-schedule", choices=["constant", "cosine"], default="constant")
-    parser.add_argument("--sweep-summary", default="",
-                        help="where to write the JSON summary (default: <out-dir>/summary.json)")
+    parser.add_argument("--steps_per_object", type=int, default=400)
+    parser.add_argument("--max_epochs", type=int, default=400)
+    parser.add_argument("--sweep_summary", default="",
+                        help="where to write the JSON summary (default: "
+                             "<checkpoint_dir>/summary.json)")
     add_config_arguments(parser)
     args = parser.parse_args(argv)
-    # The sweep's own defaults for the fields it owns.
+    # The sweep's own defaults for what it owns. A decaying rate reaches its
+    # floor at different points in runs of different lengths, so constant.
     args.steps_per_epoch = args.steps_per_epoch or 20
     args.out_dir = args.out_dir or "runs/scaling"
-    args.limit_val = args.limit_val or 8
-    args.warmup_fraction = args.warmup_fraction if args.warmup_fraction is not None else 0.03
+    args.val_steps = args.val_steps if args.val_steps is not None else 4
+    args.lr_schedule = args.lr_schedule or "constant"
     config = config_from_args(argparse.Namespace(
-        **{k: v for k, v in vars(args).items() if k not in _OWNED}))
+        **{k: v for k, v in vars(args).items() if k not in _OWNED_FLAGS}))
     passthrough = config_flags(config, fields={f for f in vars(config)} - _OWNED)
 
     results = [run_one(count, seed, args, passthrough)

@@ -539,33 +539,47 @@ def test_the_relative_position_rotates_with_the_fragment():
 
 def test_checkpointing_does_not_change_the_model():
     """
-    The layer-level tests pin the equivalence; this pins the *wiring*. The two
-    flags travel Config -> build_model -> ReassemblyNet -> each layer, and a
-    flag that silently failed to arrive would be invisible except as a run that
-    OOMs where a previous one did not.
+    ``grad_checkpointing`` recomputes every layer in the backward pass. That
+    must change the memory and nothing else: bitwise on the prediction and on
+    every gradient, over a real collated scene rather than random tensors, so
+    the token/pair indices are the ones the dataset produces. One thread, so
+    "bitwise" is not at the mercy of how a busy CPU schedules its sums.
 
-    Bitwise on both the prediction and every gradient, over a real collated
-    scene rather than random tensors, so the token/pair indices are the ones
-    the dataset actually produces.
+    It also pins that the recomputation happens -- a flag accepted and then
+    ignored would pass the equality trivially.
     """
-    batch = collate([_sample(0), _sample(1)], dtype=DTYPE)
-    outputs, grads = [], []
-    for flags in ({"checkpoint_cross": False, "checkpoint_intra": False},
-                  {"checkpoint_cross": True, "checkpoint_intra": True}):
-        net = _net(**flags)
-        # The flag has to reach the layers, not just the constructor: a kwarg
-        # accepted and dropped would make every assertion below pass trivially.
-        for module in net.modules():
-            if hasattr(module, "checkpoint"):
-                assert module.checkpoint is flags["checkpoint_cross"]
-        prediction = _forward(net, batch)
-        (prediction.frame.square().sum()
-         + prediction.vertex_embedding.square().sum()).backward()
-        outputs.append((prediction.rotation.detach(), prediction.frame.detach(),
-                        prediction.vertex_embedding.detach()))
-        grads.append({n: None if p.grad is None else p.grad.clone()
-                      for n, p in net.named_parameters()})
+    import unittest.mock as mock
 
+    import torch.utils.checkpoint as checkpoint
+
+    batch = collate([_sample(0), _sample(1)], dtype=DTYPE)
+    outputs, grads, calls = [], [], []
+    real = checkpoint.checkpoint
+
+    def counted(function, *args, **kwargs):
+        calls[-1] += 1
+        return real(function, *args, **kwargs)
+
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        for on in (False, True):
+            net = _net(grad_checkpointing=on)
+            assert net.grad_checkpointing is on
+            calls.append(0)
+            with mock.patch.object(checkpoint, "checkpoint", counted):
+                prediction = _forward(net, batch)
+            (prediction.frame.square().sum()
+             + prediction.vertex_embedding.square().sum()).backward()
+            outputs.append((prediction.rotation.detach(), prediction.frame.detach(),
+                            prediction.vertex_embedding.detach()))
+            grads.append({n: None if p.grad is None else p.grad.clone()
+                          for n, p in net.named_parameters()})
+    finally:
+        torch.set_num_threads(threads)
+
+    layers = len(net.schedule)
+    assert calls[1] - calls[0] == layers, "every layer must be checkpointed when on"
     for a, b in zip(*outputs):
         assert torch.equal(a, b), "checkpointing moved the prediction"
     for name, expected in grads[0].items():

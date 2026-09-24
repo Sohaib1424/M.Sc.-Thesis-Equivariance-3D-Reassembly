@@ -56,6 +56,7 @@ from __future__ import annotations
 from typing import List, NamedTuple, Optional, Sequence
 
 import torch
+import torch.utils.checkpoint
 from torch import Tensor, nn
 
 from .cross import VNCrossFragmentAttention
@@ -109,8 +110,7 @@ class ReassemblyNet(nn.Module):
         embedding_dim: int = 32,
         schedule: Sequence[str] = DEFAULT_SCHEDULE,
         negative_slope: float = 0.2,
-        checkpoint_intra: bool = False,
-        checkpoint_cross: bool = True,
+        grad_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         self.channels = channels
@@ -126,14 +126,26 @@ class ReassemblyNet(nn.Module):
 
         self.intra = nn.ModuleList(
             VNGraphAttentionBlock(channels, edge_channels, heads, head_dim,
-                                  negative_slope, checkpoint_intra)
+                                  negative_slope)
             for kind in self.schedule if kind == "intra"
         )
+        # The cross layers always recompute their pair gathers in the backward
+        # pass (1109 -> 86 bytes per pair, bitwise-identical results, nearly
+        # free): not a setting, because there is no reason to turn it off.
         self.cross = nn.ModuleList(
-            VNCrossFragmentAttention(channels, heads=heads, head_dim=2 * head_dim,
-                                     checkpoint=checkpoint_cross)
+            VNCrossFragmentAttention(channels, heads=heads, head_dim=2 * head_dim)
             for kind in self.schedule if kind == "cross"
         )
+        self.grad_checkpointing = bool(grad_checkpointing)
+        """
+        Recompute every layer in the backward pass instead of storing its
+        insides, as Thesis 1's ``--grad_checkpointing`` does. Each layer then
+        keeps only its input, ``(N, C, 3)``; without it an intra layer keeps
+        several edge-sized ``(E, C, 3)`` tensors, and a mesh has about six
+        directed edges per vertex. Outputs and gradients are identical either
+        way; the price is roughly one extra forward pass. Read at call time, so
+        the out-of-memory retry can switch it on for one batch.
+        """
 
         # Pool to a fragment, then two equivariant 3-vectors -> a rotation.
         self.pool_proj = VNLinear(channels, channels)
@@ -184,11 +196,19 @@ class ReassemblyNet(nn.Module):
         if log_scale is not None:
             x = self.scale_gate(x, log_scale[vertex_fragment])
 
+        checkpointed = self.grad_checkpointing and torch.is_grad_enabled()
+
+        def run(layer, *inputs):
+            if checkpointed:
+                return torch.utils.checkpoint.checkpoint(layer, *inputs,
+                                                         use_reentrant=False)
+            return layer(*inputs)
+
         intra = iter(self.intra)
         cross = iter(self.cross)
         for kind in self.schedule:
             if kind == "intra":
-                x = next(intra)(x, edge_index, edge_attr)
+                x = run(next(intra), x, edge_index, edge_attr)
             else:
                 layer = next(cross)
                 if token_index is None or token_index.numel() == 0:
@@ -196,7 +216,7 @@ class ReassemblyNet(nn.Module):
                     # rather than an error: a single-fragment mode has no
                     # cross-fragment structure to attend over.
                     continue
-                tokens = layer(x[token_index], token_query, token_key)
+                tokens = run(layer, x[token_index], token_query, token_key)
                 # Residual write-back, so vertices that are not tokens keep
                 # their features and token vertices keep theirs too.
                 x = x.index_add(0, token_index, tokens - x[token_index])

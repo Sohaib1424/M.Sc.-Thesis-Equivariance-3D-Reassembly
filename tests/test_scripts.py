@@ -28,10 +28,10 @@ def trained(tmp_path_factory):
 
 
 def _flags(root, config):
-    return ["--root", str(root), "--channels", str(config.channels), "--heads",
-            str(config.heads), "--head-dim", str(config.head_dim), "--embedding-dim",
-            str(config.embedding_dim), "--tokens-per-scene", str(config.tokens_per_scene),
-            "--workers", "0", "--val-frac", str(config.val_frac), "--test-frac", "0.0"]
+    return ["--root_dir", str(root), "--hidden_channels", str(config.channels), "--heads",
+            str(config.heads), "--head_dim", str(config.head_dim), "--embed_dim",
+            str(config.embedding_dim), "--tokens_per_scene", str(config.tokens_per_scene),
+            "--num_workers", "0", "--val_frac", str(config.val_frac), "--test_frac", "0.0"]
 
 
 def _val_key(root, config):
@@ -143,7 +143,8 @@ def test_benchmark_data_runs_every_measurement(trained, capsys):
 
     root, config, _ = trained
     assert main(_flags(root, config) + ["--scenes", "4", "--throughput", "2",
-                                        "--batch-size", "2", "--device", "cpu"]) == 0
+                                        "--batch_size", "2", "--micro_batch_scenes", "2",
+                                        "--device", "cpu"]) == 0
     out = capsys.readouterr().out
     for heading in ("per stage", "where the batch is finished", "loader throughput"):
         assert heading in out

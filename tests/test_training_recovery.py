@@ -51,7 +51,7 @@ def _config(root, **kwargs):
     defaults = dict(
         root=str(root), out_dir=str(Path(root).parent / "out"),
         channels=16, heads=4, head_dim=4, embedding_dim=8, workers=0,
-        tokens_per_scene=32, batch_size=1, epochs=1, modes_per_scene=None,
+        tokens_per_scene=32, batch_size=1, accumulate=1, epochs=1, modes_per_scene=None,
         schedule=("intra",), check_init=False, val_frac=0.34, test_frac=0.0,
         steps_per_epoch=0,
     )
@@ -194,11 +194,19 @@ def _gradients_at_every_step(config, items, oom=(), unusable=()):
     return captured, summary
 
 
-def _same(a, b):
+def _identical(a, b):
     """
-    Equal up to CPU scheduling. With several threads the reductions run in a
-    nondeterministic order and two identical runs differ by ~1e-6 relative;
-    a wrong normalisation is off by tens of percent.
+    The same gradients bit for bit, with ``None`` in the same places.
+
+    Exact, which the one thread in the test below makes possible. With two,
+    on a busy machine the CPU sums round differently from run to run, and
+    AdamW then enlarges the difference: it divides each gradient by its own
+    size, so rounding in a nearly-zero one (this model has a parameter whose
+    whole gradient is ~3e-7) becomes a difference in the step itself. Measured
+    under load: the second step's gradients differed by up to 2.5e-4 of their
+    norm in 5 runs of 8 on two threads, and were bitwise equal in 8 of 8 on
+    one. No tolerance separates that from a real difference, and the old one
+    (1e-5 of each tensor's own norm) failed on it intermittently.
     """
     compared = 0
     for x, y in zip(a, b):
@@ -206,7 +214,7 @@ def _same(a, b):
             assert x is y
             continue
         compared += 1
-        assert float((x - y).norm()) <= 1e-5 * float(y.norm()) + 1e-8
+        assert torch.equal(x, y)
     assert compared > 0, "no gradients were compared"
 
 
@@ -231,15 +239,21 @@ def test_an_oom_mid_group_is_exactly_a_batch_that_never_existed(root):
     simply unusable -- and group A must equal a run over batch 0 alone.
     """
     config = _config(root, accumulate=2)
-    after_oom, summary = _gradients_at_every_step(config, [0, 1, 2, 3], oom=[1])
-    never_there, _ = _gradients_at_every_step(config, [0, 1, 2, 3], unusable=[1])
-    alone, _ = _gradients_at_every_step(config, [0])
+    # One thread, so the comparison can be exact (see `_identical`).
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        after_oom, summary = _gradients_at_every_step(config, [0, 1, 2, 3], oom=[1])
+        never_there, _ = _gradients_at_every_step(config, [0, 1, 2, 3], unusable=[1])
+        alone, _ = _gradients_at_every_step(config, [0])
+    finally:
+        torch.set_num_threads(threads)
 
     assert summary["oom"] == 1 and summary["oom_recovered"] == 0
     assert len(after_oom) == len(never_there) == 2, "one step per group"
     for a, b in zip(after_oom, never_there):
-        _same(a, b)
-    _same(after_oom[0], alone[0])
+        _identical(a, b)
+    _identical(after_oom[0], alone[0])
 
 
 def test_the_oom_is_counted_and_named_by_scene(root):
@@ -357,7 +371,7 @@ def test_evaluate_assembles_the_prediction_and_scores_it(root, capsys):
     other = dataclasses.replace(config, tokens_per_scene=8)
     training.evaluate(other, checkpoint="last.pt", split="val", assemble=False)
     out = capsys.readouterr().out
-    assert "using the checkpoint's tokens_per_scene=32" in out
+    assert "using the checkpoint's --tokens_per_scene 32" in out
     assert "rotation only" in out
     training.evaluate(other, checkpoint="last.pt", split="val", assemble=False,
                       data_from_checkpoint=False)

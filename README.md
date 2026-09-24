@@ -322,9 +322,32 @@ loss term separately each epoch alongside the total, with chance in the banner
 so a number can be read against something:
 
 ```bash
-python -m scripts.train --root /path/to/breaking_bad --epochs 40
-python -m scripts.train --root /path/to/breaking_bad --evaluate
+python -m scripts.train --root_dir /path/to/breaking_bad --epochs 40
+python -m scripts.train --root_dir /path/to/breaking_bad --evaluate
 ```
+
+**The flags are Thesis 1's** wherever the two projects share a setting, with
+Thesis 1's meaning, so one set of habits drives both:
+
+| flag | meaning |
+|---|---|
+| `--root_dir`, `--checkpoint_dir` | the dataset; where `last.pt` / `best.pt` go |
+| `--resume auto\|none\|PATH` | continue from `--checkpoint_dir` (default); start fresh; or load from elsewhere |
+| `--num_gpus` | `-1` every visible GPU (default), `N` the first N, `0` the CPU |
+| `--data_subsets`, `--fracture_pattern`, `--split_source` | which subsets; which break patterns (`fractured_`, the default); `official`, `hash` or `auto` |
+| `--batch_size` | scenes per optimizer step per GPU |
+| `--micro_batch_scenes` | scenes per forward pass (default 1) — the only batch setting peak memory depends on |
+| `--steps_per_epoch`, `--val_steps` | optimizer steps per epoch; `val_steps x batch_size` validation scenes (default: all) |
+| `--lr`, `--lr_min`, `--lr_schedule`, `--lr_warmup_epochs` | the rate, its floor, `cosine` or `constant`, the warmup in epochs |
+| `--hidden_channels`, `--heads`, `--embed_dim` | the width, attention heads, embedding size |
+| `--grad_checkpointing True` | recompute every layer in the backward pass (below) |
+| `--num_workers`, `--save_every`, `--time_budget_hours` | loader processes per GPU; `last.pt` every N epochs; stop cleanly after this long |
+
+Settings only this project has keep their own names in the same style
+(`--tokens_per_scene`, `--modes_per_scene`, `--max_objects`, `--schedule`, ...);
+`python -m scripts.train --help` lists them. Booleans take a value as in Thesis 1
+(`--amp False`). A Thesis 1 flag with no counterpart here (`--num_vn_slots`,
+`--num_layers`, `--max_scenes`, `--config`, ...) stops with what to use instead.
 
 It refuses to print a verdict a run did not earn: a result at chance, one
 parked at the ~90° axis-only landmark, and one still descending at its cutoff
@@ -332,8 +355,9 @@ are each flagged for what they are.
 
 ### One GPU, two, or more
 
-`--devices` picks them: `-1` (the default) every visible GPU, `1` one, `N` the
-first N, `0` the CPU. More than one runs one process per GPU — from a *file*,
+`--num_gpus` picks them: `-1` (the default) every visible GPU, `1` one, `N` the
+first N, `0` the CPU; asking for more than are visible uses what is there, and
+says so. More than one runs one process per GPU — from a *file*,
 not a notebook cell (`scripts/train.py` explains why) — and each draws its own
 share of every epoch.
 
@@ -362,14 +386,14 @@ disjoint, unpadded shards, so each scene is scored once.
 
 ### An epoch is a fixed amount of training
 
-`--steps-per-epoch 800` (the default) makes an epoch 800 batches per GPU,
-whatever the split size, `--modes-per-scene`, balancing or GPU count. On two
-T4s at `--batch-size 2` that is 3,200 scenes — about one pass over the Everyday
-training split, so earlier numbers stay comparable; on one GPU it is 1,600
-scenes and the same number of optimizer steps. `--steps-per-epoch 0` goes back
-to one full pass. The banner prints what an epoch is in scenes and passes. For a
-smoke test with `--limit-train`, use `--steps-per-epoch 0` or a small number —
-800 steps over 40 scenes is forty passes.
+`--steps_per_epoch 800` (the default) makes an epoch 800 optimizer steps per
+GPU, whatever the split size, `--modes_per_scene`, balancing or GPU count. At
+the default `--batch_size 2` on two T4s that is 3,200 scenes — about one pass
+over the Everyday training split; on one GPU it is 1,600 scenes and the same
+number of optimizer steps. `--steps_per_epoch 0` goes back to one full pass. The
+banner prints what an epoch is in steps, scenes and passes. For a smoke test
+with `--limit_train`, use `--steps_per_epoch 0` or a small number — 800 steps
+over 40 scenes is forty passes.
 
 ### What happens to a batch that fails
 
@@ -378,7 +402,7 @@ smoke test with `--limit-train`, use `--steps-per-epoch 0` or a small number —
 | out of memory | retried once with gradient checkpointing forced on every layer (same gradient, less memory, more time); skipped only if that fails too |
 | non-finite loss | dropped before the backward |
 | finite loss, non-finite gradient | dropped (fp32; under AMP the GradScaler does this job) |
-| more than `--max-vertices-per-batch` | skipped before it is attempted (optional) |
+| more than `--max_vertices_per_batch` | skipped before it is attempted (optional) |
 
 Each is counted, and named by the scenes in it. A tally of failed scenes
 survives across epochs and sessions (in the checkpoint and `offenders.json`);
@@ -391,7 +415,7 @@ non-finite coordinates is skipped by name.
 ### Before you spend a session: preflight
 
 ```bash
-python -m scripts.train --root /kaggle/input/breaking-bad --preflight
+python -m scripts.train --root_dir /kaggle/input/breaking-bad --preflight
 ```
 
 Runs in a few minutes, trains nothing, and exits non-zero if it is not safe to
@@ -411,31 +435,45 @@ from there. Preflight checks the things that are:
 | Loss at initialisation vs chance | A term far from its reference is measuring something other than its name |
 | Measured seconds/step | Projects epoch time, total time, **and how many sessions it will take** |
 
-The defaults — `batch_size=2`, `accumulate=1`, `checkpoint_cross=True` — are the
-ones **measured** to fit a 15.6 GB T4: 11.96 GB (76%) on the largest of twelve
-sampled Breaking Bad scenes. Watch the out-of-memory counts in the first
-epoch; the dataset's largest single fragment is four times anything preflight
-samples, so some scenes will not fit. Training retries those with gradient
-checkpointing and reports how many were rescued and how many were still
-skipped, and more than a percent or two skipped means `--batch-size 1
---accumulate 4` — dropping the largest objects is a bias in the result, not a
-performance detail.
+**Memory.** Of the batch settings, only `--micro_batch_scenes` (default 1)
+changes the peak: `--batch_size` is how many scenes go into an optimizer step,
+and they go through the GPU `--micro_batch_scenes` at a time with their
+gradients summed — the same step, bit for bit, as one big pass. Watch the
+out-of-memory counts in the first epoch. A batch that runs out of memory is
+retried with gradient checkpointing and skipped only if that fails too, and the
+epoch summary says how many were rescued and how many skipped; more than a
+percent or two skipped is a bias in the result (the largest objects are the
+ones dropped), not a performance detail.
 
-If preflight reports that even `batch_size=1` will not fit, turn the knobs in
-this order — the first two do not change what the model can represent, the third
-does:
+**`--grad_checkpointing True`** recomputes every layer in the backward pass, as
+in Thesis 1, so each layer keeps only its `(N, C, 3)` input instead of its
+edge-sized insides — a mesh has about six directed edges per vertex. Measured on
+CPU at `--hidden_channels 128`, one forward and backward, four fragments,
+2,048 tokens:
+
+| vertices | per-layer switches of the old version, both on | `--grad_checkpointing True` |
+|---|---|---|
+| 2,568 | 0.87 GB held after the forward, 1.06 GB peak | 0.22 GB held, 0.55 GB peak |
+| 10,248 | 3.3 GB held; the backward exceeded the 6.5 GB free and was killed | 0.43 GB held, 3.7 GB peak |
+| 40,968 | — | 1.0 GB held, 4.1 GB peak |
+
+About 20 KB per vertex is held instead of about 250 KB. Most of the ~3 GB peak is
+the cross-attention's pair tensors, rebuilt for one layer at a time in the
+backward pass; it depends on the tokens (`--tokens_per_scene`) and not on the
+vertices. The price is time — about one extra forward pass (+19% on the one size
+measured both ways here; Thesis 1 measured ~35%). The cross layers recompute
+their pair gathers whatever the setting (1109 bytes per pair stored against 86
+recomputed, bitwise identical), so there is nothing to switch there.
+
+If preflight reports that even `--micro_batch_scenes 1` will not fit, turn the
+knobs in this order — the first two do not change what the model can represent,
+the third does:
 
 ```bash
---checkpoint-intra          # recompute the intra-layer projections too
---channels 32               # half the width
---tokens-per-scene 1024     # fewer cross-fragment tokens; changes the model
+--grad_checkpointing True   # recompute every layer in the backward pass
+--hidden_channels 32        # a narrower model
+--tokens_per_scene 1024     # fewer cross-fragment tokens; changes the model
 ```
-
-Cross-attention checkpointing is already on by default (`--no-checkpoint-cross`
-turns it off). It is what makes 2048 tokens fit at all: the pair gathers cost
-1109 bytes per pair when stored against 86 when recomputed, which at a
-3.5-million-pair scene is 3.6 GB against 0.3 GB *per cross layer*. Outputs and
-gradients are bitwise identical either way.
 
 ### Training across Kaggle's 12-hour cap
 
@@ -480,14 +518,14 @@ network's invariant embedding, weights each match by how opposed its normals
 are, and solves the translations by weighted least squares with a Huber
 reweighting. Scores are Breaking Bad's — RMSE(T), Chamfer distance, part
 accuracy (per-fragment Chamfer below 0.01) — in world units, per scene then
-over scenes, with a per-category table. `--no-assemble` reports rotation only,
+over scenes, with a per-category table. `--no_assemble` reports rotation only,
 and says so. The model and, by default, the data definition come from the
 checkpoint itself, with every setting that differs from the flags printed
-(`--data-from-flags` keeps the flags' data settings).
+(`--data_from_flags` keeps the flags' data settings).
 
 ```bash
-python -m scripts.train --root /path/to/breaking_bad --evaluate --checkpoint best.pt
-python -m scripts.dump_prediction --root ... --checkpoint best.pt --scene <object>/<mode> --out pred.npz
+python -m scripts.train --root_dir /path/to/breaking_bad --evaluate --checkpoint best.pt
+python -m scripts.dump_prediction --root_dir ... --checkpoint best.pt --scene <object>/<mode> --out pred.npz
 python -m scripts.visualize_reassembly --dump pred.npz --mode compare
 python -m scripts.render_gif --dump pred.npz --out reassembly.gif
 ```
@@ -563,8 +601,8 @@ correct behaviour.
   merging a shape's break patterns across variant directories. Without it a
   shape is two objects, and one copy can land in train while the other lands in
   val — so the object split is not an object split, and nothing raises.
-- Two ways to hold data out, `--split-by object` (the benchmark) and
-  `--split-by fracture` (unseen break patterns of known shapes). The second is
+- Two ways to hold data out, `--split_by object` (the benchmark) and
+  `--split_by fracture` (unseen break patterns of known shapes). The second is
   a diagnostic; its numbers are not comparable with published results and the
   config prints that at startup.
 

@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 445 tests, clean under `-W error` |
+| Pipeline | **built** — 448 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -611,7 +611,9 @@ all contributing; one GPU with an unusable scene; one out of memory on every
 attempt; one skipping *every* batch — plus a stop on one GPU stopping all at the
 same step, and `train()` end to end with a resume. Every run has a timeout, so a
 hang fails instead of stalling. Moving the rescale back to its old place fails
-the test (checked).
+the test (checked). These tests hide the machine's GPUs (`no_gpu`, in
+`tests/conftest.py`). Where there are GPUs, `train(devices=N)` caps N at how many
+there are, so on a one-GPU Colab machine they used to run one process and fail.
 
 ### The six additions
 
@@ -655,7 +657,10 @@ the test (checked).
    every layer — identical gradient (bitwise, on one thread; tested), less
    memory, more time — and skipped only if that fails too. Each micro-batch's
    gradient is computed with the running total set aside, so a failure part-way
-   through a backward discards that micro-batch alone.
+   through a backward discards that micro-batch alone. That is bitwise too, on
+   one thread (tested). Its first test allowed a tolerance on two threads instead,
+   and failed now and then on a busy CPU: the sums round differently from run to
+   run, and AdamW enlarges the difference by the second step.
 4. **Repairs counted, failures named, repeat offenders tracked.** Zero-area
    faces and zero-length vertex normals are counted per scene (repaired to zero,
    never NaN — which is why they must be counted); non-finite coordinates skip
@@ -664,8 +669,8 @@ the test (checked).
    accumulates while its partners change — in a tally kept in the checkpoint
    and `offenders.json`. A scene failing in more than one epoch is printed as a
    repeat offender with the command that diagnoses it.
-5. **Fixed-length epochs**, `steps_per_epoch = 800` batches per GPU by default
-   (`0` = one full pass). A restarted partial epoch now rewinds its step count to
+5. **Fixed-length epochs**, 800 optimizer steps per GPU by default
+   (`--steps_per_epoch`; `0` = one full pass). A restarted partial epoch now rewinds its step count to
    where the epoch began, so an interrupted run's learning-rate schedule matches
    an uninterrupted one.
 6. **Tools**: `benchmark_data`, `check_scene` (with `--locate`, and a gradient
@@ -673,6 +678,37 @@ the test (checked).
    `render_gif`, `scaling_sweep` (with `--max-objects`, a new Config field),
    `check_version` (every file compiles, every fix present, no shadowed tests).
    All take the training `Config` flags (`scripts/config_flags.py`).
+
+### Thesis 1's flags, and one checkpointing switch
+
+The command line now uses Thesis 1's flag names, with Thesis 1's meaning where
+the two differed: `--batch_size` is scenes per optimizer step per GPU, processed
+`--micro_batch_scenes` (default 1) at a time; `--steps_per_epoch` counts
+optimizer steps; `--lr_min` is absolute; `--lr_warmup_epochs`, `--val_steps`,
+`--resume auto|none|PATH`, `--save_every`, `--split_source`, `--lr_schedule
+cosine|constant` as there. `scripts/config_flags.py` holds the conversions; the
+Config fields keep their names. Thesis 1 flags with no counterpart here stop with
+what to use instead. `--fracture_pattern` now defaults to `fractured_`, as in
+Thesis 1.
+
+The two per-layer switches (`checkpoint_intra`, `checkpoint_cross`) are replaced
+by one, `--grad_checkpointing`, which recomputes **whole layers** as Thesis 1
+does. The old intra switch recomputed only the attention scores, and each intra
+layer still kept several edge-sized `(E, C, 3)` tensors — which is why a large
+scene failed "even with gradient checkpointing" here and not in Thesis 1.
+Measured on CPU at 128 channels, one forward and backward, four fragments,
+2,048 tokens:
+
+| vertices | old switches, both on | `--grad_checkpointing True` |
+|---|---|---|
+| 2,568 | 0.87 GB held, 1.06 GB peak | 0.22 GB held, 0.55 GB peak |
+| 10,248 | 3.3 GB held, backward killed above 6.5 GB | 0.43 GB held, 3.7 GB peak |
+| 40,968 | — | 1.0 GB held, 4.1 GB peak |
+
+~20 KB held per vertex instead of ~250 KB. The ~3 GB peak is mostly the cross
+layers' pair tensors, rebuilt one layer at a time; it scales with the tokens, not
+the vertices. Outputs and gradients are bitwise identical with it on (tested, one
+thread); the pair-gather recompute in the cross layers stays on always.
 
 ### Still outstanding
 

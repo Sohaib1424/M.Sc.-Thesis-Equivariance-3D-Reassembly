@@ -364,7 +364,7 @@ def _train_config(root: Path, out: Path, **overrides):
 
     base = dict(root=str(root), out_dir=str(out), channels=8, heads=2, head_dim=2,
                 embedding_dim=4, workers=0, tokens_per_scene=16, batch_size=1,
-                epochs=2, modes_per_scene=None, schedule=("intra", "cross"),
+                epochs=2, modes_per_scene=None, schedule=("intra", "cross"), accumulate=1,
                 check_init=False, val_frac=0.34, test_frac=0.0,
                 steps_per_epoch=3, checkpoint_every_minutes=0.0)
     base.update(overrides)
@@ -373,12 +373,16 @@ def _train_config(root: Path, out: Path, **overrides):
 
 @pytest.mark.slow
 @pytest.mark.parametrize("world", [2, 3])
-def test_train_runs_end_to_end_on_several_processes(tmp_path, world, monkeypatch):
+def test_train_runs_end_to_end_on_several_processes(tmp_path, world, monkeypatch,
+                                                    no_gpu):
     """
     The whole launcher -- spawn, broadcast, fixed-length epochs, the per-step
     reductions, sharded validation gathered to one summary, rank-0-only
     checkpoints -- on ``world`` CPU processes. Then a resume, which must pick
     up at the next epoch with the step count it left at.
+
+    ``no_gpu``: on a GPU machine ``devices=world`` is capped at the GPU count,
+    and this would be one process on ``cuda:0`` asserting it was ``world``.
     """
     from reassembly.training import train
 

@@ -11,6 +11,7 @@ still pass and this one would not.
 """
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import math
@@ -105,7 +106,7 @@ def test_the_model_can_actually_learn():
     everywhere else.
     """
     torch.manual_seed(0)
-    config = Config(channels=64, heads=4, lr=3e-3, batch_size=2, workers=0)
+    config = Config(accumulate=1, channels=64, heads=4, lr=3e-3, batch_size=2, workers=0)
     loader = torch.utils.data.DataLoader(
         _Fixed(6), batch_size=2, shuffle=True, collate_fn=_collate_samples
     )
@@ -434,17 +435,70 @@ def test_config_rejects_settings_that_would_fail_later():
 
 
 def test_cli_flags_round_trip_into_the_config():
+    """Thesis 1's flag names, into this project's Config fields."""
     from scripts.train import build_parser, config_from_args
 
     args = build_parser().parse_args(
-        ["--root", "/data", "--epochs", "7", "--channels", "128", "--heads", "8",
-         "--no-amp", "--schedule", "intra", "cross", "--lr", "5e-4"]
+        ["--root_dir", "/data", "--epochs", "7", "--hidden_channels", "128",
+         "--heads", "8", "--amp", "False", "--schedule", "intra", "cross",
+         "--lr", "5e-4", "--num_gpus", "1", "--checkpoint_dir", "/out",
+         "--data_subsets", "everyday_compressed", "--fracture_pattern", "fractured_",
+         "--grad_checkpointing", "True", "--lr_schedule", "constant",
+         "--time_budget_hours", "5", "--num_workers", "3"]
     )
     config = config_from_args(args)
-    assert config.root == "/data" and config.epochs == 7
-    assert config.channels == 128 and config.heads == 8
+    assert config.root == "/data" and config.epochs == 7 and config.out_dir == "/out"
+    assert config.channels == 128 and config.heads == 8 and config.devices == 1
     assert config.amp is False and config.lr == pytest.approx(5e-4)
     assert tuple(config.schedule) == ("intra", "cross")
+    assert list(config.subsets) == ["everyday_compressed"]
+    assert config.mode_filter == "fractured_" and config.grad_checkpointing is True
+    assert config.lr_schedule == "constant" and config.max_hours == 5.0
+    assert config.workers == 3
+
+
+def test_cli_flags_carry_thesis_1s_meaning():
+    """
+    ``--batch_size`` is scenes per optimizer step, processed
+    ``--micro_batch_scenes`` at a time; ``--steps_per_epoch`` counts optimizer
+    steps; ``--lr_min`` is absolute; ``--lr_warmup_epochs`` is in epochs;
+    ``--val_steps`` x ``--batch_size`` is the validation size; ``--resume``
+    takes auto, none or a path -- all as in Thesis 1.
+    """
+    from scripts.train import build_parser, config_from_args
+
+    def parse(*flags):
+        return config_from_args(build_parser().parse_args(["--root_dir", "/d", *flags]))
+
+    config = parse("--batch_size", "16", "--steps_per_epoch", "30", "--epochs", "150",
+                   "--lr", "6e-4", "--lr_min", "6e-5", "--lr_warmup_epochs", "3",
+                   "--val_steps", "8", "--resume", "none")
+    assert config.batch_size == 1 and config.accumulate == 16
+    assert config.steps_per_epoch == 30 * 16, "micro-batches per epoch"
+    assert config.min_lr_fraction == pytest.approx(0.1)
+    assert config.warmup_fraction == pytest.approx(3 / 150)
+    assert config.limit_val == 8 * 16 and config.resume is False
+
+    config = parse("--batch_size", "8", "--micro_batch_scenes", "2", "--resume",
+                   "/kaggle/input/previous")
+    assert config.batch_size == 2 and config.accumulate == 4
+    assert config.resume is True and config.resume_from == "/kaggle/input/previous"
+    assert parse("--grad_checkpointing").grad_checkpointing is True, "bare = True"
+    assert parse("--fracture_pattern", "").mode_filter is None, "'' = every pattern"
+    assert parse("--modes_per_scene", "0").modes_per_scene is None, "0 = every pattern"
+    with pytest.raises(SystemExit):
+        parse("--batch_size", "3", "--micro_batch_scenes", "2")
+
+
+def test_a_thesis_1_flag_with_no_counterpart_says_what_to_use(capsys):
+    from scripts.train import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--num_vn_slots", "16"])
+    assert "no virtual nodes here" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--max_scenes", "16"])
+    assert "--max_objects" in capsys.readouterr().err
 
 
 def test_cli_leaves_unspecified_fields_at_their_defaults():
@@ -454,19 +508,44 @@ def test_cli_leaves_unspecified_fields_at_their_defaults():
     """
     from scripts.train import build_parser, config_from_args
 
-    config = config_from_args(build_parser().parse_args(["--root", "/data"]))
+    config = config_from_args(build_parser().parse_args(["--root_dir", "/data"]))
     default = Config()
-    assert config.epochs == default.epochs
-    assert config.channels == default.channels
-    assert config.tokens_per_scene == default.tokens_per_scene
+    for name in ("epochs", "channels", "tokens_per_scene", "batch_size", "accumulate",
+                 "steps_per_epoch", "min_lr_fraction", "warmup_fraction", "limit_val",
+                 "resume", "mode_filter", "grad_checkpointing", "lr_schedule"):
+        assert getattr(config, name) == getattr(default, name), name
 
 
-def test_multi_gpu_from_a_notebook_raises_something_actionable(monkeypatch):
+def test_the_flags_reproduce_a_config():
+    """`config_flags` is the inverse of the parser -- the sweep relies on it."""
+    from scripts.config_flags import config_flags
+    from scripts.train import build_parser, config_from_args
+
+    config = Config(root="/d", batch_size=2, accumulate=4, steps_per_epoch=40,
+                    channels=128, min_lr_fraction=0.1, lr=6e-4, warmup_fraction=0.02,
+                    epochs=150, limit_val=64, resume=False, grad_checkpointing=True,
+                    mode_filter=None, subsets=["a", "b"], lr_schedule="constant")
+    again = config_from_args(build_parser().parse_args(config_flags(config)))
+    for field in dataclasses.fields(Config):
+        mine, theirs = getattr(config, field.name), getattr(again, field.name)
+        if isinstance(mine, float):
+            assert theirs == pytest.approx(mine), field.name
+        else:
+            assert (list(mine) if isinstance(mine, (list, tuple)) else mine) == \
+                (list(theirs) if isinstance(theirs, (list, tuple)) else theirs), field.name
+
+
+def test_multi_gpu_from_a_notebook_raises_something_actionable(monkeypatch, no_gpu):
     """
     `mp.spawn` re-imports `__main__` in each child, which does not exist in a
     notebook cell -- the children die with a FileNotFoundError on `<stdin>`
     that says nothing about the cause. Under pytest `__main__` *does* have a
     file, so the notebook condition is simulated by removing it.
+
+    `no_gpu`, so that `devices=2` asks for two processes on every machine. On a
+    one-GPU machine it is capped to one, which spawns nothing -- correctly, so
+    there is no notebook problem to report and the test would see the next
+    error instead, the missing dataset.
     """
     import __main__
 
@@ -777,36 +856,24 @@ def test_the_embedding_head_has_no_unlearnable_bias():
     assert model.embedding[-1].bias is None
 
 
-def test_the_checkpointing_flags_reach_the_layers():
+def test_the_checkpointing_flag_reaches_the_model():
     """
-    ``checkpoint_cross`` defaults on because it is what makes a 2048-token
-    scene fit on a T4 -- measured 1109 B/pair down to 86 B/pair, 3.6 GB down to
-    0.3 GB for one cross layer at 3.5 million pairs. ``checkpoint_intra``
-    defaults off because there recomputation re-runs the projections
-    themselves rather than an indexing op.
+    One switch, ``grad_checkpointing``, off by default as in Thesis 1. It is
+    only worth anything if it arrives, and the symptom of a flag that does not
+    is an OOM eleven hours into a session.
 
-    Both are only worth anything if they arrive, and the symptom of a flag that
-    does not is an OOM eleven hours into a session.
+    The cross layers recompute their pair gathers whatever it says -- measured
+    1109 B/pair down to 86 B/pair, 3.6 GB down to 0.3 GB for one cross layer at
+    3.5 million pairs -- so that is pinned too.
     """
     from reassembly.nn.cross import VNCrossFragmentAttention
-    from reassembly.nn.gat import VNGraphAttention
 
-    def flags(model):
-        return {
-            "cross": [m.checkpoint for m in model.modules()
-                      if isinstance(m, VNCrossFragmentAttention)],
-            "intra": [m.checkpoint for m in model.modules()
-                      if isinstance(m, VNGraphAttention)],
-        }
-
-    default = flags(build_model(Config(channels=32, heads=4)))
-    assert default["cross"] and all(default["cross"]), "cross is on by default"
-    assert default["intra"] and not any(default["intra"]), "intra is off by default"
-
-    swapped = flags(build_model(Config(channels=32, heads=4,
-                                       checkpoint_cross=False,
-                                       checkpoint_intra=True)))
-    assert not any(swapped["cross"]) and all(swapped["intra"])
+    default = build_model(Config(channels=32, heads=4))
+    assert default.grad_checkpointing is False
+    assert all(m.checkpoint for m in default.modules()
+               if isinstance(m, VNCrossFragmentAttention))
+    assert build_model(Config(channels=32, heads=4,
+                              grad_checkpointing=True)).grad_checkpointing is True
 
 
 def test_preflight_reports_a_missing_dataset_rather_than_crashing(capsys):
@@ -818,7 +885,7 @@ def test_preflight_reports_a_missing_dataset_rather_than_crashing(capsys):
 
     assert preflight(Config(root="/nonexistent-dataset-path")) is False
     out = capsys.readouterr().out
-    assert "--root must point at the directory" in out
+    assert "--root_dir must point at the directory" in out
 
 
 def test_limit_spans_the_split_instead_of_taking_a_prefix():
@@ -966,7 +1033,7 @@ def _fake_dataset(root: Path, objects: int = 24, modes: int = 2) -> Path:
                  identity(len(vertices), format="csr"))
         for mode in range(modes):
             pieces = 2 + mode
-            mode_dir = directory / f"mode_{mode}"
+            mode_dir = directory / f"fractured_{mode}"
             mode_dir.mkdir()
             labels = np.floor((theta + np.pi) / (2 * np.pi) * pieces)
             np.save(mode_dir / "compressed_fracture.npy",
@@ -1006,10 +1073,10 @@ def test_preflight_times_at_a_batch_size_that_fits(tmp_path, monkeypatch, capsys
     training.preflight(config)
     text = capsys.readouterr().out
 
-    assert "batch_size=4: out of memory" in text
-    assert "batch_size=2: fits" in text
+    assert "micro_batch_scenes=4: out of memory" in text
+    assert "micro_batch_scenes=2: fits" in text
     # The point of the test: step 7 ran, and ran at 2.
-    assert "timing" in text and "batch_size=2" in text
+    assert "timing" in text and "micro_batch_scenes=2" in text
     assert "s/step" in text, "step 7 never produced a timing"
     assert max(seen) == 4, "step 5 should have tried the configured size once"
     assert seen.count(4) == 1, "nothing after step 5 may retry a size that failed"
@@ -1064,7 +1131,7 @@ def test_an_out_of_memory_in_the_backward_is_caught():
     ending the run at 3% of the final epoch, after two hours.
     """
     torch.manual_seed(0)
-    config = Config(channels=16, heads=4, workers=0, batch_size=1)
+    config = Config(accumulate=1, channels=16, heads=4, workers=0, batch_size=1)
     model = build_model(config)
     # Make every backward fail, the way an oversized scene would.
     head = model.embedding
@@ -1087,9 +1154,7 @@ class _Lambda(torch.nn.Module):
 
 
 def _checkpointing_on(model) -> bool:
-    from reassembly.nn.gat import VNGraphAttention
-
-    return all(m.checkpoint for m in model.modules() if isinstance(m, VNGraphAttention))
+    return bool(model.grad_checkpointing)
 
 
 def _step_gradients(model, loader, config, forward=None):
@@ -1120,8 +1185,7 @@ def test_an_out_of_memory_is_retried_with_checkpointing_before_it_is_skipped():
     """
     import reassembly.training as training
 
-    config = Config(channels=16, heads=4, workers=0, batch_size=1,
-                    checkpoint_cross=False, checkpoint_intra=False)
+    config = Config(accumulate=1, channels=16, heads=4, workers=0, batch_size=1)
     real = training._forward
 
     def tight(model_, batch, criterion, config_):
@@ -1194,7 +1258,7 @@ def test_the_gpus_meet_once_per_step_whatever_each_one_skipped(monkeypatch):
 def test_a_step_with_nothing_in_it_does_not_move_the_weights():
     """AdamW moves weights on momentum and decay alone; an empty step must not call it."""
     torch.manual_seed(0)
-    config = Config(channels=16, heads=4, workers=0, batch_size=1,
+    config = Config(accumulate=1, channels=16, heads=4, workers=0, batch_size=1,
                     max_vertices_per_batch=1)
     model = build_model(config)
     before = [p.detach().clone() for p in model.parameters()]
@@ -1214,7 +1278,7 @@ def test_an_oversized_batch_is_skipped_before_it_is_attempted():
     """
     torch.manual_seed(0)
     model = build_model(Config(channels=16, heads=4))
-    tiny = Config(channels=16, heads=4, workers=0, batch_size=1,
+    tiny = Config(accumulate=1, channels=16, heads=4, workers=0, batch_size=1,
                   max_vertices_per_batch=1)
     summary, _, _ = run_epoch(model, _loader(), build_criterion(tiny), tiny,
                               optimizer=torch.optim.AdamW(model.parameters()),
@@ -1222,7 +1286,7 @@ def test_an_oversized_batch_is_skipped_before_it_is_attempted():
                               show_progress=False)
     assert summary["oom"] == 4
 
-    generous = Config(channels=16, heads=4, workers=0, batch_size=1,
+    generous = Config(accumulate=1, channels=16, heads=4, workers=0, batch_size=1,
                       max_vertices_per_batch=10_000_000)
     summary, _, _ = run_epoch(model, _loader(), build_criterion(generous), generous,
                               optimizer=torch.optim.AdamW(model.parameters()),

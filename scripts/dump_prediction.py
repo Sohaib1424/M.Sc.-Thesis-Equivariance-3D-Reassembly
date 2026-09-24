@@ -4,10 +4,10 @@ Dump one predicted reassembly -- rotations AND the solver's placement -- to a
 small ``.npz`` that can be copied off Kaggle and animated anywhere.
 
     # which scenes are there?
-    python -m scripts.dump_prediction --root data --list --split val
+    python -m scripts.dump_prediction --root_dir data --list --split val
 
     # dump one
-    python -m scripts.dump_prediction --root data --checkpoint runs/vgat/best.pt \\
+    python -m scripts.dump_prediction --root_dir data --checkpoint runs/vgat/best.pt \\
         --scene everyday_compressed/Mug/<id>/fractured_3 --scatter-seed 0 --out pred.npz
 
     # then, on any machine with a clone:

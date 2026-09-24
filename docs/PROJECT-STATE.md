@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 448 tests, clean under `-W error` |
+| Pipeline | **built** — 449 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -709,6 +709,13 @@ Measured on CPU at 128 channels, one forward and backward, four fragments,
 layers' pair tensors, rebuilt one layer at a time; it scales with the tokens, not
 the vertices. Outputs and gradients are bitwise identical with it on (tested, one
 thread); the pair-gather recompute in the cross layers stays on always.
+
+The time budget (`--time_budget_hours`) is now read between epochs, as in
+Thesis 1: the epoch it runs out in is finished, validated in full and saved as
+complete, and the next session starts at the next epoch. Before, it stopped at
+the next optimizer step and the half-done epoch was run again; and validation
+had its own cap, 5% of the budget, which could cut it short without saying so.
+A kill signal still stops at once, with a checkpoint.
 
 ### Still outstanding
 

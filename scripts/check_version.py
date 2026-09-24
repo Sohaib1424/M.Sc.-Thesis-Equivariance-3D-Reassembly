@@ -118,6 +118,8 @@ MARKERS = [
      'if config.split_source == "official" and not official:'),
     ("fewer GPUs than --num_gpus is announced", "src/reassembly/training.py",
      "GPU(s) visible -- using {requested}."),
+    ("time budget read between epochs", "src/reassembly/training.py",
+     "votes = dist.sum_scalars([float(val_stopped), float(time.time() >= deadline)],"),
 ]
 
 

@@ -378,6 +378,30 @@ def test_evaluate_assembles_the_prediction_and_scores_it(root, capsys):
     assert "tokens_per_scene" not in capsys.readouterr().out
 
 
+def test_the_time_budget_finishes_the_epoch_it_runs_out_in(root, capsys):
+    """
+    The budget is read between epochs, as in Thesis 1: the epoch it runs out in
+    is trained to its last step, validated in full and saved as complete, and
+    the next session starts at the next epoch. It used to stop at the next
+    optimizer step, leaving half an epoch to be run again.
+    """
+    import dataclasses
+
+    config = _config(root, epochs=3, steps_per_epoch=3, max_hours=1e-9)
+    history = training.train(config)
+    assert [row["epoch"] for row in history] == [0], "stops after the first epoch"
+    assert history[0]["partial"] == 0 and history[0]["steps"] == 3
+    val = BreakingBadScenes(config, "val")
+    assert history[0]["val_batches"] + history[0]["val_skipped"] == len(val)
+    state = torch.load(Path(config.out_dir) / "last.pt", map_location="cpu",
+                       weights_only=False)
+    assert state["completed"] and state["epoch"] == 0
+    assert "which was finished, validated and saved" in capsys.readouterr().out
+
+    resumed = training.train(dataclasses.replace(config, max_hours=1.0))
+    assert [row["epoch"] for row in resumed] == [0, 1, 2]
+
+
 def test_last_pt_carries_the_best_so_far(root):
     """
     last.pt used to be written before `best` was updated, so it carried the

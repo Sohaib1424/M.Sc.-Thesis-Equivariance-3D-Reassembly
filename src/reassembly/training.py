@@ -310,8 +310,14 @@ class Config:
     gloo -- slow, and meant for testing the multi-process path.
     """
     max_hours: float = 11.0
-    """Kaggle cuts a session at 12 hours. Stop cleanly before that with a
-    checkpoint written, rather than losing the epoch in progress."""
+    """
+    ``--time_budget_hours``. Read between epochs, as in Thesis 1: once it has
+    run out, the epoch in progress is finished, validated and saved, and the
+    run stops. So leave one epoch's time below any hard session limit
+    (Kaggle's is 12 h; the log prints the time per epoch). A kill signal still
+    stops at once, with a checkpoint, and the 30-minute mid-epoch checkpoints
+    cover a session that is cut off without one.
+    """
     resume: bool = True
     resume_from: Optional[str] = None
     """
@@ -1197,7 +1203,9 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
                 # stop early on its own; the results are gathered afterwards.
                 stopped = True
                 if show_progress:
-                    print(f"\n  [time] budget reached during {label}; stopping cleanly")
+                    reason = ("signal" if stop_signal is not None and
+                              stop_signal.triggered else "time budget")
+                    print(f"\n  [stop] {reason} during {label}; stopping cleanly")
                 bar.update(1)
                 break
             bar.update(1, f"loss {report['total']:.4f}" if report else "")
@@ -2259,7 +2267,7 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
                       per_epoch))
 
     deadline = time.time() + config.max_hours * 3600
-    stopped = False
+    stopped = val_stopped = out_of_time = False
     # On EVERY rank. A signal that reaches one GPU process and not another
     # used to kill the one without a handler, leaving its peer blocked in the
     # next all-reduce; now each rank only sets a flag and they vote.
@@ -2292,23 +2300,29 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
                   f"   lr {learning_rate(step, total_steps, config):.2e}")
 
         began = time.time()
+        # No deadline inside an epoch: the time budget is read between epochs
+        # (below), so an epoch that has started is trained to its last step and
+        # validated in full. Only a signal -- the session being killed -- stops
+        # one part-way, and then with a checkpoint.
         train_summary, step, stopped = run_epoch(
             model, train_loader, criterion, config, optimizer=optimizer,
             scaler=scaler, device=device, step=step, total_steps=total_steps,
-            label="train", show_progress=main, deadline=deadline,
-            stop_signal=signal_watch,
+            label="train", show_progress=main, stop_signal=signal_watch,
             on_checkpoint=lambda s_, completed: checkpoint(s_, epoch, completed),
             distributed=distributed,
         )
-        # Validation gets its own margin rather than `None`. A stop that fires
-        # at the end of training must not then spend an unbounded amount of the
-        # remaining time validating and get killed before it can checkpoint.
-        val_summary, _, _ = run_epoch(
+        val_summary, _, val_stopped = run_epoch(
             model, val_loader, criterion, config, device=device,
             label="val", show_progress=main,
-            deadline=time.time() + max(config.max_hours * 3600 * 0.05, 300),
+            stop_signal=signal_watch,
             distributed=distributed,
         )
+        # The budget, as Thesis 1 reads it: once it has run out, the epoch just
+        # finished is the last of this session. Voted with any signal that cut
+        # validation short, so every GPU leaves the loop at the same epoch.
+        votes = dist.sum_scalars([float(val_stopped), float(time.time() >= deadline)],
+                                 device)
+        val_stopped, out_of_time = votes[0] > 0, votes[1] > 0
         new_failures = _record_offenders(offenders, epoch, train_summary, val_summary)
         repaired = {"train": train_summary.pop("most_repaired", []),
                     "val": val_summary.pop("most_repaired", [])}
@@ -2318,6 +2332,8 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
                 print(f"  [check] {complaint}")
 
         if not main:
+            if stopped or val_stopped or out_of_time:
+                break
             continue
 
         print(f"  train  {format_losses(train_summary)}")
@@ -2330,11 +2346,12 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
         train_summary.pop("dropped_names", None)
         val_summary.pop("dropped_names", None)
         row = {"epoch": epoch, "step": step,
-               # An epoch cut short by the time budget is recorded, because its
-               # metrics are real measurements -- but flagged, because the next
-               # session re-runs that epoch and the same number then appears
-               # twice. Plot `partial == 0` for a clean curve.
-               "partial": int(stopped),
+               # An epoch cut short by a signal is recorded, because its
+               # metrics are real measurements -- but flagged: in training the
+               # next session re-runs that epoch and the same number appears
+               # twice, in validation the numbers cover part of the split.
+               # Plot `partial == 0` for a clean curve.
+               "partial": int(stopped or val_stopped),
                "lr": learning_rate(step, total_steps, config),
                # Recorded so the time projection can work in seconds *per step*
                # and stay right when --limit_train changes between sessions.
@@ -2356,10 +2373,11 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
         # then took the next epoch as a "new best" even when it was worse, and
         # overwrote best.pt with it.
         score = val_summary.get("geodesic_deg", val_summary["total"])
-        improved = score < best
+        # A validation cut short scored part of the split: not a best.
+        improved = score < best and not val_stopped
         if improved:
             best = score
-        if (stopped or (epoch + 1) % config.save_every == 0
+        if (stopped or val_stopped or out_of_time or (epoch + 1) % config.save_every == 0
                 or epoch + 1 == config.epochs):
             checkpoint(step, epoch, completed=not stopped)
         if improved:
@@ -2372,14 +2390,20 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
                               start_epoch, steps_per_epoch=per_epoch)
         if report:
             print(report)
+        if stopped or val_stopped or out_of_time:
+            break
 
     signal_watch.restore()
     if main:
+        finished = bool(history) and history[-1]["epoch"] + 1 >= config.epochs
         if signal_watch.triggered:
             print(f"\n[signal] stopped on {signal_watch.name}. Progress is in "
-                  f"{last_path} -- rerun with the same --checkpoint_dir to continue.")
-        elif stopped:
-            print(f"\n[time] session budget reached. Progress is in {last_path}.")
+                  f"{last_path}.")
+            print(_resume_recipe(config, out_dir))
+        elif out_of_time and not finished:
+            print(f"\n[time] the {config.max_hours:g} h budget ran out during epoch "
+                  f"{history[-1]['epoch'] + 1}, which was finished, validated and "
+                  f"saved. Progress is in {last_path}.")
             print(_resume_recipe(config, out_dir))
     if main and history:
         _final_report(history)
@@ -2882,17 +2906,19 @@ def _resume_recipe(config: Config, out_dir: Path) -> str:
     """
     kaggle = str(out_dir).startswith("/kaggle")
     if not kaggle:
-        return (f"  To continue: rerun the same command. It will load "
-                f"{out_dir / 'last.pt'} and pick up where it stopped.")
+        return (f"  To continue: rerun the same command with --resume auto (the "
+                f"default) -- not --resume none, which starts over. It loads "
+                f"{out_dir / 'last.pt'} and picks up where it stopped.")
     return (
         "  To continue in the next Kaggle session:\n"
         "    1. Save this notebook's version so /kaggle/working becomes an output.\n"
         "    2. In the new session, add that output as an input dataset.\n"
-        "    3. Point the run at it:\n"
-        "         Config(..., resume_from='/kaggle/input/<the-output-name>',\n"
-        "                     out_dir='/kaggle/working/vgat')\n"
-        "  out_dir must stay under /kaggle/working -- /kaggle/input is read-only,\n"
-        "  and a run that cannot write its checkpoint discovers that 11 hours in."
+        "    3. Rerun the same command, pointed at it:\n"
+        "         --resume /kaggle/input/<the-output-name> "
+        "--checkpoint_dir /kaggle/working/vgat\n"
+        "  --checkpoint_dir must stay under /kaggle/working -- /kaggle/input is\n"
+        "  read-only, and a run that cannot write its checkpoint discovers that\n"
+        "  hours in."
     )
 
 

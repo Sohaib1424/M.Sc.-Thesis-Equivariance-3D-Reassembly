@@ -499,8 +499,10 @@ train(Config(root="/kaggle/input/breaking-bad",
 `out_dir` must stay under `/kaggle/working`; `/kaggle/input` is read-only, and
 the run checks that before training rather than at the first checkpoint.
 
-It stops at `max_hours=11` with a checkpoint written, checkpoints every 30
-minutes in case one epoch outlasts a session, catches the SIGTERM Kaggle sends,
+Once `--time_budget_hours` (11 by default) has run out it finishes the epoch in
+progress, validates and saves it, and stops — as Thesis 1 does, so leave one
+epoch's time below the session limit. It checkpoints every 30 minutes in case
+one epoch outlasts a session, catches the SIGTERM Kaggle sends,
 restores optimiser moments and RNG state, refuses to resume onto a different
 architecture, warns loudly if the *data* settings changed (that one raises
 nothing on its own), and tracks cumulative training time so the banner can

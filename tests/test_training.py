@@ -781,9 +781,10 @@ def test_kaggle_gets_the_right_resume_recipe():
     from reassembly.training import _resume_recipe
 
     kaggle = _resume_recipe(Config(), Path("/kaggle/working/vgat"))
-    assert "resume_from" in kaggle and "input" in kaggle and "read-only" in kaggle
+    assert "--resume /kaggle/input/" in kaggle and "read-only" in kaggle
     local = _resume_recipe(Config(), Path("runs/vgat"))
-    assert "rerun the same command" in local
+    assert "rerun the same command with --resume auto" in local
+    assert "not --resume none" in local, "the one flag that would start over"
 
 
 def test_a_resumed_run_carries_its_checkpoint_into_the_new_out_dir(tmp_path):

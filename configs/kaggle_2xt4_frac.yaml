@@ -1,0 +1,91 @@
+# Kaggle 2x T4, fracture-surface input (scored on the full mesh), official Everyday split.
+# Every field maps 1:1 to vngat/config.py (see the docstrings there) and can be
+# overridden on the command line, e.g.
+#   python -m scripts.train --config configs/kaggle_2xt4_frac.yaml --num_layers 6
+# Generated from the Config dataclass, so no field can go missing.
+
+
+# ---- data ----
+root_dir: data
+data_subsets: everyday_compressed
+input_source: frac                # 'full' or 'frac' (fracture surfaces only; scored on the full mesh)
+fracture_pattern: fractured_
+split_source: official            # 'official' (benchmark lists) or 'hash'
+split_by: object                  # 'object' (held-out shapes) or 'fracture' (held-out break patterns)
+fracture_pool: train              # split_by=fracture only: 'train' keeps held-out shapes clean
+val_frac: 0.1
+test_frac: 0.1
+split_seed: 0
+max_scenes: 0                     # 0 = whole split; >0 = deterministic subset of objects
+balance: 'none'                   # 'none' (every object equally) or 'category'
+balance_temperature: 1.0          # 0 natural .. 1 every category equal
+normalize_mode: scene             # 'scene' | 'fragment' | 'none'
+correspondence: true
+correspondence_tol: 1.0e-05
+min_fragments: 2
+
+# ---- model ----
+hidden_channels: 64
+num_layers: 4
+num_vn_slots: 8
+heads: 4
+head_dim: 8                       # score directions per head in the mesh-edge layer
+embed_dim: 32
+gram_bottleneck: 16
+norm: layer
+grad_checkpointing: false
+
+# ---- loss weights (all untuned at 1.0) ----
+w_rot: 1.0
+w_pos: 1.0
+w_node: 1.0
+w_face: 1.0
+w_emb_v: 1.0
+w_emb_e: 1.0
+symmetry_axis: z
+emb_pull_margin: 0.1
+emb_push_margin: 0.5
+
+# ---- optimisation ----
+epochs: 400
+batch_size: 2
+micro_batch_scenes: 1
+steps_per_epoch: 80
+val_steps: 10                     # used only when val_fixed is false
+val_fixed: true                   # same validation scenes + rotations every epoch
+val_scenes: 0                     # 0 = one break pattern per validation object
+lr: 0.0003
+weight_decay: 1.0e-05
+grad_clip: 1.0
+amp: false
+lr_schedule: plateau
+lr_monitor: rot
+lr_patience: 20
+lr_factor: 0.5
+lr_min: 1.0e-05
+restart_schedule: false
+lr_warmup_epochs: 5
+seed: 0
+
+# ---- dataloading ----
+num_workers: 2
+prefetch_factor: 4
+pin_memory: true
+persistent_workers: true
+
+# ---- runtime ----
+num_gpus: 2
+device: cuda
+master_port: 12355
+time_budget_hours: 11.0
+
+# ---- checkpointing ----
+checkpoint_dir: /kaggle/working/checkpoints
+save_every: 10
+checkpoint_monitor: rot           # val term that decides best.pt
+resume: auto
+drive_folder_id: ''
+drive_credentials: ''
+
+# ---- misc ----
+tag: vngat_frac

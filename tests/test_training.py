@@ -1,0 +1,1429 @@
+"""
+The training engine: schedule, checkpoints, reporting, and can it learn.
+
+The last one is the point of the file. Everything else here guards a failure
+mode that produces finite numbers and a descending curve --
+`test_the_model_can_actually_learn` is the check that the architecture and all
+of its conventions are *consistent enough to fit anything at all*. If the
+rotation label were transposed, or the head's frame pointed the wrong way, or
+the loss compared misaligned rows, every other test in this repository would
+still pass and this one would not.
+"""
+from __future__ import annotations
+
+import dataclasses
+import io
+import json
+import math
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import trimesh
+
+torch = pytest.importorskip("torch")
+
+from reassembly.data.features import build_scene
+from reassembly.data.transforms import random_rotations
+from reassembly.training import (
+    CHANCE,
+    Config,
+    Progress,
+    Skipped,
+    _collate_samples,
+    _final_report,
+    _forward,
+    _metrics,
+    build_criterion,
+    build_model,
+    check_initial_losses,
+    format_losses,
+    learning_rate,
+    run_epoch,
+    save_checkpoint,
+    write_history,
+)
+
+
+def _scene(seed: int, fragments: int = 3, dent: bool = True, clusters: bool = True):
+    """A scene of distinguishable shards under a known perturbation."""
+    rng = np.random.default_rng(seed)
+    vertices, faces, masks = [], [], []
+    for i in range(fragments):
+        mesh = trimesh.creation.icosphere(subdivisions=2, radius=1.0 - 0.15 * i)
+        mesh.apply_translation([2.5 * i, 0.0, 0.0])
+        v, f = np.asarray(mesh.vertices).copy(), np.asarray(mesh.faces)
+        if dent:
+            # Otherwise every fragment is the same sphere and its rotation is
+            # genuinely unrecoverable -- the test would be measuring a symmetry,
+            # not the model.
+            v[rng.choice(len(v), 25, replace=False)] *= 1.25
+        mask = np.zeros(len(v), bool)
+        mask[rng.choice(len(v), 40, replace=False)] = True
+        vertices.append(v)
+        faces.append(f)
+        masks.append(mask)
+    spin = random_rotations(fragments, np.random.default_rng(1000 + seed))
+    cluster = None
+    if clusters:
+        # Stand-in coincidence labels. Without them `num_clusters` is zero, the
+        # embedding term is absent, and the whole embedding head goes untrained
+        # -- see `test_without_coincidence_labels_the_embedding_head_is_untrained`.
+        total = sum(len(v) for v in vertices)
+        cluster = np.full(total, -1, np.int64)
+        cluster[:30] = np.arange(30) // 3
+    return build_scene(vertices, faces, masks, rotations=spin,
+                       tokens_per_scene=48, cluster=cluster)
+
+
+class _Fixed(torch.utils.data.Dataset):
+    def __init__(self, n: int = 6):
+        self.items = [_scene(s) for s in range(n)]
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        return self.items[i]
+
+
+# --------------------------------------------------------------------------
+# Can it learn
+# --------------------------------------------------------------------------
+
+# (target, epochs, schedule length in steps). The anchor target is slower to
+# fit, and that is a measurement, not a guess: on these six scenes, four seeds
+# on one thread, the absolute target ends 45 epochs at 23-36 deg while the
+# anchor target is at 37-76 deg after 45 epochs and 19-30 deg after 80. Its
+# targets move with the anchor's own prediction while both are being learned.
+_LEARNING_RUNS = [("absolute", 45, 200), ("anchor", 80, 240)]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("target,epochs,total_steps", _LEARNING_RUNS)
+def test_the_model_can_actually_learn(target, epochs, total_steps):
+    """
+    Memorise six scenes and drive the rotation error far below chance.
+
+    This is a *training*-error check and proves nothing about generalisation --
+    that is exactly what makes it useful. It isolates "are the conventions
+    self-consistent and is the architecture capable of fitting" from "does it
+    generalise", and only the first question can be answered without the real
+    dataset. A transposed label or a misaligned loss row fails here and passes
+    everywhere else. Run under both rotation targets: under the anchor target
+    the error is each fragment's relative to its scene's largest.
+    """
+    torch.manual_seed(0)
+    config = Config(accumulate=1, channels=64, heads=4, lr=3e-3, batch_size=2, workers=0,
+                    rotation_target=target)
+    loader = torch.utils.data.DataLoader(
+        _Fixed(6), batch_size=2, shuffle=True, collate_fn=_collate_samples
+    )
+    model = build_model(config)
+    criterion = build_criterion(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+
+    first, step, _ = run_epoch(model, loader, criterion, config,
+                               optimizer=optimizer, step=0, total_steps=total_steps,
+                               label="train", show_progress=False)
+    assert 90.0 < first["rotation_degrees"] < 165.0, (
+        f"an untrained model should start near chance "
+        f"({CHANCE['geodesic_deg']:.0f} deg), got {first['rotation_degrees']:.1f}"
+    )
+
+    for _ in range(epochs - 1):
+        summary, step, _ = run_epoch(model, loader, criterion, config,
+                                     optimizer=optimizer, step=step,
+                                     total_steps=total_steps, label="train",
+                                     show_progress=False)
+
+    assert summary["rotation_degrees"] < 70.0, (
+        f"after {epochs} epochs on six memorisable scenes the rotation error is "
+        f"{summary['rotation_degrees']:.1f} deg, against a chance level of "
+        f"{CHANCE['geodesic_deg']:.0f}. The model cannot fit its own training "
+        f"set, which means a convention is wrong -- not that it needs more data."
+    )
+    assert summary["total"] < first["total"]
+
+
+def test_losses_start_at_their_reference_values():
+    """
+    An untrained forward pass, read against what each term must be at chance.
+    A term far from its reference is measuring something other than its name.
+    """
+    torch.manual_seed(0)
+    config = Config(channels=32, heads=4)
+    # Eight scenes, not four. The rotation angle of a random rotation has a
+    # standard deviation of 37 deg, so twelve fragments carry a standard error
+    # of 10.7 deg -- enough for a single seed to land outside any honest band by
+    # luck alone, which is exactly what it did. Twenty-four fragments halve it.
+    batch, _ = _collate_samples([_scene(s) for s in range(1, 9)])
+    model = build_model(config)
+    loss, report, R = _forward(model, batch, build_criterion(config), config)
+
+    assert torch.isfinite(loss)
+    assert 80.0 < report["rotation_degrees"] < 175.0
+    assert 0.6 < report["normal"] < 1.5              # chance 1.0
+    assert 1.2 < report["face"] < 2.9                # chance 2.0
+    assert check_initial_losses(report) == []
+
+
+def test_every_parameter_trains():
+    """A layer with no gradient is a layer that is not in the model."""
+    torch.manual_seed(0)
+    config = Config(channels=32, heads=4)
+    batch, _ = _collate_samples([_scene(1), _scene(2)])
+    model = build_model(config)
+    loss, _, _ = _forward(model, batch, build_criterion(config), config)
+    loss.backward()
+    dead = [n for n, p in model.named_parameters()
+            if p.grad is None or p.grad.abs().sum() == 0]
+    assert not dead, f"no gradient reaches: {dead}"
+
+
+def test_without_coincidence_labels_the_embedding_head_is_untrained():
+    """
+    A consequence worth stating rather than discovering later.
+
+    The embedding-consistency loss is the *only* thing that supervises the
+    per-vertex embedding. With `supervise_embedding=False`, or on a scene whose
+    fragments share no vertices, that term is absent and the readout and its MLP
+    receive no gradient at all -- silently, since the rotation loss keeps
+    descending exactly as before.
+
+    It matters because stage two matches interface points by mutual nearest
+    neighbours *in embedding space*. An untrained embedding head means the
+    rotation model still works and the translation solver has nothing to use.
+    `Config` warns about this at startup.
+    """
+    torch.manual_seed(0)
+    config = Config(channels=32, heads=4)
+    batch, _ = _collate_samples([_scene(1, clusters=False),
+                                 _scene(2, clusters=False)])
+    assert batch.num_clusters == 0
+    model = build_model(config)
+    loss, report, _ = _forward(model, batch, build_criterion(config), config)
+    loss.backward()
+
+    assert "embedding" not in report, "the term should be absent, not zero"
+    dead = {n for n, p in model.named_parameters()
+            if p.grad is None or p.grad.abs().sum() == 0}
+    assert any(n.startswith("embedding.") for n in dead)
+    assert "readout.directions.weight" in dead
+    # Everything else still trains -- which is exactly why this is easy to miss.
+    assert not any(n.startswith(("intra.", "cross.", "head.")) for n in dead)
+
+
+def test_metrics_agree_with_a_perfect_prediction():
+    R = torch.as_tensor(random_rotations(20, np.random.default_rng(0)))
+    out = _metrics(R, R)
+    assert out["geodesic_deg"] < 1e-4
+    assert out["acc@5deg"] == 1.0
+
+
+# --------------------------------------------------------------------------
+# Schedule
+# --------------------------------------------------------------------------
+
+def test_schedule_warms_up_then_decays():
+    config = Config(lr=1e-3, warmup_fraction=0.1, min_lr_fraction=0.02)
+    rates = [learning_rate(s, 1000, config) for s in range(1000)]
+    assert rates[0] < rates[50] <= config.lr
+    assert rates[99] == pytest.approx(config.lr, rel=1e-9)
+    assert all(rates[i] >= rates[i + 1] - 1e-12 for i in range(100, 999))
+    # The floor is reached at step == total; step 999 is one short of it.
+    assert learning_rate(1000, 1000, config) == pytest.approx(
+        config.lr * config.min_lr_fraction, rel=1e-9)
+    assert rates[-1] == pytest.approx(config.lr * config.min_lr_fraction, rel=1e-3)
+
+
+def test_schedule_does_not_climb_back_after_the_end():
+    """
+    The reason this is a function and not `CosineAnnealingLR`. That scheduler is
+    periodic: past `T_max` the rate rises back toward its base, so a mis-set
+    epoch count silently becomes a late-training rate increase. Its `T_max` also
+    lives in its own state dict, so changing `--epochs` on resume may not change
+    the schedule at all.
+    """
+    config = Config(lr=1e-3)
+    floor = config.lr * config.min_lr_fraction
+    for step in (1000, 1500, 5000, 100_000):
+        assert learning_rate(step, 1000, config) == pytest.approx(floor, rel=1e-9)
+
+
+def test_schedule_is_exactly_reproducible_on_resume():
+    """A pure function of the step, so resuming cannot drift the schedule."""
+    config = Config(lr=1e-3)
+    straight = [learning_rate(s, 500, config) for s in range(500)]
+    resumed = [learning_rate(s, 500, config) for s in range(200)] + \
+              [learning_rate(s, 500, config) for s in range(200, 500)]
+    assert straight == resumed
+
+
+@pytest.mark.parametrize("total", [1, 2, 7])
+def test_schedule_survives_a_tiny_run(total):
+    config = Config(lr=1e-3)
+    for step in range(total + 5):
+        rate = learning_rate(step, total, config)
+        assert 0.0 < rate <= config.lr + 1e-12
+
+
+# --------------------------------------------------------------------------
+# Dropped samples
+# --------------------------------------------------------------------------
+
+def test_a_dropped_sample_is_named_not_just_counted():
+    """
+    Dropping a bad sample is not neutral: an item that fails every epoch has
+    been removed from the dataset. A per-*batch* counter cannot see it at all --
+    a batch of four with one unusable item still collates and reports nothing.
+    """
+    batch, dropped = _collate_samples(
+        [_scene(1), Skipped("mug/mode_03", "1 fragment(s)"), _scene(2)]
+    )
+    assert batch is not None and batch.num_scenes == 2
+    assert [d.key for d in dropped] == ["mug/mode_03"]
+    assert dropped[0].reason == "1 fragment(s)"
+
+
+def test_a_batch_of_only_unusable_samples_collates_to_none():
+    batch, dropped = _collate_samples([Skipped("a", "x"), Skipped("b", "y")])
+    assert batch is None and len(dropped) == 2
+
+
+def test_run_epoch_tallies_dropped_names():
+    config = Config(channels=16, heads=4, workers=0)
+
+    class Mixed(torch.utils.data.Dataset):
+        def __len__(self):
+            return 4
+
+        def __getitem__(self, i):
+            return Skipped(f"obj{i}", "1 fragment(s)") if i == 0 else _scene(i)
+
+    loader = torch.utils.data.DataLoader(Mixed(), batch_size=2,
+                                         collate_fn=_collate_samples)
+    summary, _, _ = run_epoch(build_model(config), loader, build_criterion(config),
+                              config, label="val", show_progress=False)
+    assert summary["dropped"] == 1
+    assert summary["dropped_names"] == ["obj0"]
+
+
+# --------------------------------------------------------------------------
+# Checkpoints and history
+# --------------------------------------------------------------------------
+
+def test_checkpoint_carries_everything_needed_to_continue(tmp_path):
+    """Weights alone restarts the schedule and throws away the optimiser."""
+    config = Config(channels=16, heads=4, out_dir=str(tmp_path))
+    model = build_model(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    sum(p.sum() for p in model.parameters()).backward()
+    optimizer.step()
+
+    path = tmp_path / "last.pt"
+    save_checkpoint(path, model, optimizer, config, epoch=3, step=120,
+                    history=[{"epoch": 0}], best=1.5)
+    assert not (tmp_path / "last.pt.tmp").exists(), "no partial file left behind"
+
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    for key in ("model", "optimizer", "config", "epoch", "step", "history",
+                "best", "torch_rng", "numpy_rng", "python_rng"):
+        assert key in state, f"checkpoint is missing {key}"
+    assert Config(**state["config"]).channels == 16
+    assert len(state["optimizer"]["state"]) > 0, "optimiser moments must survive"
+
+    restored = build_model(config)
+    restored.load_state_dict(state["model"])
+    for a, b in zip(model.state_dict().values(), restored.state_dict().values()):
+        assert torch.equal(a, b)
+
+
+def test_history_csv_unions_columns_across_epochs(tmp_path):
+    """
+    A term that only appears in later epochs must not shift every other
+    column, and a missing value must be blank rather than a wrong number.
+    """
+    write_history(tmp_path, [{"epoch": 0, "a": 1.0}, {"epoch": 1, "a": 2.0, "b": 3.0}])
+    rows = (tmp_path / "history.csv").read_text().strip().split("\n")
+    assert rows[0] == "epoch,a,b"
+    assert rows[1] == "0,1.0,"
+    assert rows[2] == "1,2.0,3.0"
+    assert len(json.loads((tmp_path / "history.json").read_text())) == 2
+
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+
+def test_every_loss_term_is_printed_alongside_the_total():
+    summary = {"rotation": 1.0, "position": 2.0, "normal": 3.0, "face": 4.0,
+               "embedding": 5.0, "total": 15.0}
+    line = format_losses(summary)
+    for name in ("rotation", "position", "normal", "face", "embedding", "TOTAL"):
+        assert name in line
+
+
+def test_progress_bar_works_without_a_terminal(capsys):
+    """
+    A captured notebook cell is not a tty, and carriage returns there produce
+    one unreadable line. It must fall back to periodic newlines.
+    """
+    bar = Progress(10, prefix="test")
+    bar.tty = False
+    for _ in range(10):
+        bar.update(1)
+    bar.close()
+    out = capsys.readouterr().out
+    assert "test [" in out and "10/10" in out and "100.0%" in out
+    assert "\r" not in out
+
+
+def test_initial_loss_check_catches_a_term_that_is_off():
+    assert check_initial_losses({"rotation_degrees": 126.0, "normal": 1.0,
+                                 "face": 2.0}) == []
+    complaints = check_initial_losses({"rotation_degrees": 12.0, "normal": 0.02,
+                                       "face": 0.1})
+    assert len(complaints) == 3
+
+
+@pytest.mark.parametrize("curve,expected", [
+    ([126.4, 126.3], "at chance"),
+    ([91.0, 89.5], "axis-only landmark"),
+    ([60.0, 50.0, 40.0, 20.0], "still descending"),
+])
+def test_the_final_verdict_refuses_to_flatter_a_run(curve, expected, capsys):
+    """
+    Interpretation rules written before the results, and enforced. A run at
+    chance, one parked at the axis-only landmark, and one truncated mid-descent
+    all produce a perfectly reportable number that means something quite
+    different from what it looks like.
+    """
+    _final_report([{"val_geodesic_deg": v} for v in curve])
+    assert expected in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("tilt,twist,expected", [
+    (2.0, 88.0, "axis IS being recovered"),
+    (85.0, 60.0, "not being recovered either"),
+])
+def test_the_axis_only_verdict_reads_tilt_and_twist(tilt, twist, expected, capsys):
+    """
+    ~90 deg geodesic has two quite different causes and the number alone cannot
+    tell them apart: the axis learned but not the rotation about it, or nothing
+    learned at all. The verdict must consult the tilt/twist split rather than
+    assert the first, which is what it used to do -- and it used to call it a
+    structural floor, which is false: a fragment's fracture boundary is unique
+    even when the whole object is a surface of revolution.
+    """
+    _final_report([{"val_geodesic_deg": 91.0},
+                   {"val_geodesic_deg": 89.5, "val_tilt_deg": tilt,
+                    "val_twist_deg": twist}])
+    output = capsys.readouterr().out
+    assert expected in output
+    assert "structural result" not in output
+
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+def test_config_rejects_settings_that_would_fail_later():
+    with pytest.raises(ValueError):
+        Config(channels=30, heads=4)
+    with pytest.raises(ValueError):
+        Config(label_method="guess")
+    with pytest.raises(ValueError):
+        Config(epochs=0)
+    with pytest.raises(ValueError):
+        Config(steps_per_epoch=-1)
+    with pytest.raises(ValueError):
+        Config(max_objects=0)
+    with pytest.raises(ValueError):
+        Config(accumulate=0)
+
+
+def test_cli_flags_round_trip_into_the_config():
+    """Thesis 1's flag names, into this project's Config fields."""
+    from scripts.train import build_parser, config_from_args
+
+    args = build_parser().parse_args(
+        ["--root_dir", "/data", "--epochs", "7", "--hidden_channels", "128",
+         "--heads", "8", "--amp", "False", "--schedule", "intra", "cross",
+         "--lr", "5e-4", "--num_gpus", "1", "--checkpoint_dir", "/out",
+         "--data_subsets", "everyday_compressed", "--fracture_pattern", "fractured_",
+         "--grad_checkpointing", "True", "--lr_schedule", "constant",
+         "--time_budget_hours", "5", "--num_workers", "3"]
+    )
+    config = config_from_args(args)
+    assert config.root == "/data" and config.epochs == 7 and config.out_dir == "/out"
+    assert config.channels == 128 and config.heads == 8 and config.devices == 1
+    assert config.amp is False and config.lr == pytest.approx(5e-4)
+    assert tuple(config.schedule) == ("intra", "cross")
+    assert list(config.subsets) == ["everyday_compressed"]
+    assert config.mode_filter == "fractured_" and config.grad_checkpointing is True
+    assert config.lr_schedule == "constant" and config.max_hours == 5.0
+    assert config.workers == 3
+
+
+def test_cli_flags_carry_thesis_1s_meaning():
+    """
+    ``--batch_size`` is scenes per optimizer step, processed
+    ``--micro_batch_scenes`` at a time; ``--steps_per_epoch`` counts optimizer
+    steps; ``--lr_min`` is absolute; ``--lr_warmup_epochs`` is in epochs;
+    ``--val_steps`` x ``--batch_size`` is the validation size; ``--resume``
+    takes auto, none or a path -- all as in Thesis 1.
+    """
+    from scripts.train import build_parser, config_from_args
+
+    def parse(*flags):
+        return config_from_args(build_parser().parse_args(["--root_dir", "/d", *flags]))
+
+    config = parse("--batch_size", "16", "--steps_per_epoch", "30", "--epochs", "150",
+                   "--lr", "6e-4", "--lr_min", "6e-5", "--lr_warmup_epochs", "3",
+                   "--val_steps", "8", "--resume", "none")
+    assert config.batch_size == 1 and config.accumulate == 16
+    assert config.steps_per_epoch == 30 * 16, "micro-batches per epoch"
+    assert config.min_lr_fraction == pytest.approx(0.1)
+    assert config.warmup_fraction == pytest.approx(3 / 150)
+    assert config.limit_val == 8 * 16 and config.resume is False
+
+    config = parse("--batch_size", "8", "--micro_batch_scenes", "2", "--resume",
+                   "/kaggle/input/previous")
+    assert config.batch_size == 2 and config.accumulate == 4
+    assert config.resume is True and config.resume_from == "/kaggle/input/previous"
+    assert parse("--grad_checkpointing").grad_checkpointing is True, "bare = True"
+    assert parse("--fracture_pattern", "").mode_filter is None, "'' = every pattern"
+    assert parse("--modes_per_scene", "0").modes_per_scene is None, "0 = every pattern"
+    with pytest.raises(SystemExit):
+        parse("--batch_size", "3", "--micro_batch_scenes", "2")
+
+
+def test_a_thesis_1_flag_with_no_counterpart_says_what_to_use(capsys):
+    from scripts.train import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--num_vn_slots", "16"])
+    assert "no virtual nodes here" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--max_scenes", "16"])
+    assert "--max_objects" in capsys.readouterr().err
+
+
+def test_cli_leaves_unspecified_fields_at_their_defaults():
+    """
+    The parser's defaults are `None`, not copies of the dataclass values, so
+    there is only one place a default lives and it cannot drift.
+    """
+    from scripts.train import build_parser, config_from_args
+
+    config = config_from_args(build_parser().parse_args(["--root_dir", "/data"]))
+    default = Config()
+    for name in ("epochs", "channels", "tokens_per_scene", "batch_size", "accumulate",
+                 "steps_per_epoch", "min_lr_fraction", "warmup_fraction", "limit_val",
+                 "resume", "mode_filter", "grad_checkpointing", "lr_schedule"):
+        assert getattr(config, name) == getattr(default, name), name
+
+
+def test_the_flags_reproduce_a_config():
+    """`config_flags` is the inverse of the parser -- the sweep relies on it."""
+    from scripts.config_flags import config_flags
+    from scripts.train import build_parser, config_from_args
+
+    config = Config(root="/d", batch_size=2, accumulate=4, steps_per_epoch=40,
+                    channels=128, min_lr_fraction=0.1, lr=6e-4, warmup_fraction=0.02,
+                    epochs=150, limit_val=64, resume=False, grad_checkpointing=True,
+                    mode_filter=None, subsets=["a", "b"], lr_schedule="constant")
+    again = config_from_args(build_parser().parse_args(config_flags(config)))
+    for field in dataclasses.fields(Config):
+        mine, theirs = getattr(config, field.name), getattr(again, field.name)
+        if isinstance(mine, float):
+            assert theirs == pytest.approx(mine), field.name
+        else:
+            assert (list(mine) if isinstance(mine, (list, tuple)) else mine) == \
+                (list(theirs) if isinstance(theirs, (list, tuple)) else theirs), field.name
+
+
+def test_multi_gpu_from_a_notebook_raises_something_actionable(monkeypatch, no_gpu):
+    """
+    `mp.spawn` re-imports `__main__` in each child, which does not exist in a
+    notebook cell -- the children die with a FileNotFoundError on `<stdin>`
+    that says nothing about the cause. Under pytest `__main__` *does* have a
+    file, so the notebook condition is simulated by removing it.
+
+    `no_gpu`, so that `devices=2` asks for two processes on every machine. On a
+    one-GPU machine it is capped to one, which spawns nothing -- correctly, so
+    there is no notebook problem to report and the test would see the next
+    error instead, the missing dataset.
+    """
+    import __main__
+
+    from reassembly.training import train
+
+    monkeypatch.delattr(__main__, "__file__", raising=False)
+    with pytest.raises(RuntimeError, match="notebook"):
+        train(Config(root="/nonexistent", devices=2))
+
+
+# --------------------------------------------------------------------------
+# Resuming across sessions
+# --------------------------------------------------------------------------
+
+def _tiny_checkpoint(path, config, *, epoch, step, completed, history=None,
+                     elapsed=0.0, best=9.9):
+    model = build_model(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    sum(p.sum() for p in model.parameters()).backward()
+    optimizer.step()
+    save_checkpoint(path, model, optimizer, config, epoch, step,
+                    history or [], best, completed=completed, elapsed=elapsed)
+
+
+def test_a_partial_epoch_is_restarted_not_skipped(tmp_path):
+    """
+    A mid-epoch checkpoint records the epoch as incomplete, so resume runs it
+    again. Treating it as finished would silently drop the part that never ran,
+    and nothing downstream could tell.
+    """
+    from reassembly.training import _resume_path
+
+    config = Config(channels=16, heads=4, out_dir=str(tmp_path))
+    _tiny_checkpoint(tmp_path / "last.pt", config, epoch=2, step=40, completed=False)
+    state = torch.load(tmp_path / "last.pt", map_location="cpu", weights_only=False)
+    assert state["completed"] is False
+    assert state["epoch"] + (1 if state["completed"] else 0) == 2
+
+    _tiny_checkpoint(tmp_path / "done.pt", config, epoch=2, step=40, completed=True)
+    finished = torch.load(tmp_path / "done.pt", map_location="cpu", weights_only=False)
+    assert finished["epoch"] + (1 if finished["completed"] else 0) == 3
+
+
+def test_resume_from_reads_a_different_directory(tmp_path):
+    """
+    The Kaggle case: a session writes to /kaggle/working, and the next session
+    mounts that output read-only under /kaggle/input. Load and save paths differ.
+    """
+    from reassembly.training import _resume_path
+
+    source, destination = tmp_path / "session1", tmp_path / "session2"
+    source.mkdir()
+    config = Config(channels=16, heads=4, out_dir=str(destination))
+    _tiny_checkpoint(source / "last.pt", config, epoch=1, step=10, completed=True)
+
+    found = _resume_path(Config(channels=16, heads=4, out_dir=str(destination),
+                                resume_from=str(source)),
+                         destination / "last.pt")
+    assert found == source / "last.pt", "a directory should resolve to its last.pt"
+
+    direct = _resume_path(Config(channels=16, heads=4,
+                                 resume_from=str(source / "last.pt")),
+                          destination / "last.pt")
+    assert direct == source / "last.pt", "an explicit file should be used as given"
+
+    missing = _resume_path(Config(channels=16, heads=4,
+                                  resume_from=str(tmp_path / "nothing")),
+                           destination / "last.pt")
+    assert missing is None
+
+
+def test_resume_refuses_a_different_architecture():
+    """
+    Otherwise `load_state_dict` raises a shape error naming a tensor, which
+    takes a while to trace back to the flag that caused it.
+    """
+    from reassembly.training import _check_resume_compatible
+
+    saved = {"channels": 64, "heads": 4, "head_dim": 8, "embedding_dim": 32,
+             "schedule": ["intra", "cross"]}
+    _check_resume_compatible(Config(channels=64, heads=4,
+                                    schedule=("intra", "cross")), saved, False)
+    with pytest.raises(ValueError, match="different"):
+        _check_resume_compatible(Config(channels=128, heads=4,
+                                        schedule=("intra", "cross")), saved, False)
+
+
+def test_resume_warns_when_the_data_settings_changed(capsys):
+    """
+    An architecture change raises. A *data* change raises nothing -- training
+    continues on a different problem than the weights were trained for, and the
+    loss curve just has a step in it that reads as noise.
+    """
+    from reassembly.training import _check_resume_compatible
+
+    saved = {"channels": 64, "heads": 4, "label_method": "dihedral",
+             "tokens_per_scene": 2048, "epochs": 40}
+    _check_resume_compatible(Config(channels=64, heads=4,
+                                    label_method="coincidence",
+                                    tokens_per_scene=512, epochs=80), saved, True)
+    out = capsys.readouterr().out
+    assert "DATA settings changed" in out
+    assert "label_method" in out and "tokens_per_scene" in out
+    assert "epochs changed" in out, "a changed epoch count rescales the schedule"
+
+
+def test_rng_state_is_restored_not_merely_saved(capsys):
+    """
+    Saved-but-never-restored is the same as not saved: a resumed run draws a
+    different perturbation stream from an uninterrupted one, so the two diverge
+    and neither is reproducible. This was a real bug.
+    """
+    from reassembly.training import _restore_rng
+
+    torch.manual_seed(1234)
+    marker = torch.get_rng_state().clone()
+    state = {"torch_rng": marker.clone(), "numpy_rng": np.random.get_state(),
+             "python_rng": random.getstate()}
+
+    torch.manual_seed(9999)
+    assert not torch.equal(torch.get_rng_state(), marker)
+    _restore_rng(state, rank=0)
+    assert torch.equal(torch.get_rng_state(), marker)
+
+
+def test_a_broken_rng_state_warns_instead_of_crashing(capsys):
+    """A checkpoint from another torch build can carry a state this one rejects.
+    Not fatal -- but not silent either, since the stream then differs."""
+    from reassembly.training import _restore_rng
+
+    _restore_rng({"torch_rng": "not a tensor"}, rank=0)
+    assert "could not restore RNG" in capsys.readouterr().out
+
+
+def test_checkpoint_records_cumulative_training_time(tmp_path):
+    """A run spanning four sessions still knows how long it has trained."""
+    config = Config(channels=16, heads=4, out_dir=str(tmp_path))
+    _tiny_checkpoint(tmp_path / "last.pt", config, epoch=3, step=90,
+                     completed=True, elapsed=37_000.0)
+    state = torch.load(tmp_path / "last.pt", map_location="cpu", weights_only=False)
+    assert state["elapsed"] == pytest.approx(37_000.0)
+    assert state["format"] == 2
+
+
+def test_an_unwritable_out_dir_fails_before_training_not_after(tmp_path):
+    """
+    Pointing `out_dir` at a read-only location otherwise surfaces at the first
+    checkpoint -- eleven hours in, with nothing saved.
+    """
+    from reassembly.training import _check_writable
+
+    blocker = tmp_path / "afile"
+    blocker.write_text("x")
+    with pytest.raises(RuntimeError, match="cannot write checkpoints"):
+        _check_writable(blocker / "sub")
+    _check_writable(tmp_path / "fine")           # and a good path is silent
+
+
+def test_the_time_report_projects_remaining_sessions():
+    """The number that decides whether a plan is workable."""
+    from reassembly.training import _time_report
+
+    history = [{"epoch": i, "seconds": 3600.0, "steps": 1000} for i in range(3)]
+    line = _time_report(history, Config(epochs=13, max_hours=11.0), 10_800.0, 0,
+                        steps_per_epoch=1000)
+    assert "1:00:00/epoch" in line
+    assert "10 epoch(s) left" in line
+    assert "1 more session(s)" in line
+
+
+def test_the_time_report_survives_the_epoch_size_changing():
+    """
+    The projection is what a session plan is built on, and it was wrong by 2.7x
+    on the first long run.
+
+    A `--limit-train 400` calibration leaves three 236-second epochs in the
+    history. Resuming on the full dataset makes each epoch 3,555 seconds, and
+    averaging the last three across that boundary reported "~22:09/epoch" for
+    an epoch that took 59 minutes. Averaging *per step* is invariant to the
+    dataset size changing, which it does on exactly the resume where the
+    estimate matters most.
+    """
+    from reassembly.training import _time_report
+
+    history = ([{"epoch": i, "seconds": 236.0, "steps": 100} for i in range(3)]
+               + [{"epoch": 3, "seconds": 3555.0, "steps": 1618}])
+    line = _time_report(history, Config(epochs=6, max_hours=11.0), 4341.0, 3,
+                        steps_per_epoch=1618)
+    # 236/100 = 2.36 and 3555/1618 = 2.20 s/step, so blending them projects
+    # ~62 min against an actual 59 -- 5% out, where averaging the durations
+    # was 170% out.
+    token = line.split("~")[1].split("/epoch")[0]
+    hours, minutes, seconds = (int(p) for p in token.split(":"))
+    projected = hours * 3600 + minutes * 60 + seconds
+    assert abs(projected - 3555) < 0.10 * 3555, (
+        f"projected {projected}s for an epoch that takes 3555s: {line}"
+    )
+
+
+def test_the_time_report_falls_back_for_a_checkpoint_without_step_counts():
+    """A checkpoint written before `steps` was recorded must still project."""
+    from reassembly.training import _time_report
+
+    history = [{"epoch": i, "seconds": 100.0 * (i + 1)} for i in range(3)]
+    line = _time_report(history, Config(epochs=5, max_hours=11.0), 600.0, 0,
+                        steps_per_epoch=50)
+    # The most recent epoch alone, not an average over three different sizes.
+    assert "5:00/epoch" in line, line
+
+
+def test_the_stop_signal_only_sets_a_flag(capsys):
+    """
+    Saving from inside a signal handler risks a half-written file, and under
+    DDP it would desync the ranks. The handler flags; the loop acts.
+    """
+    import signal
+
+    from reassembly.training import StopSignal
+
+    watch = StopSignal()
+    assert not watch.triggered
+    watch._handle(signal.SIGTERM, None)
+    assert watch.triggered and watch.name == "SIGTERM"
+    assert "SIGTERM" in capsys.readouterr().out
+
+
+def test_kaggle_gets_the_right_resume_recipe():
+    """
+    "Just rerun it" is wrong advice on Kaggle -- /kaggle/working becomes a
+    dataset mounted elsewhere next session -- and getting it wrong costs a
+    session to find out.
+    """
+    from reassembly.training import _resume_recipe
+
+    kaggle = _resume_recipe(Config(), Path("/kaggle/working/vgat"))
+    assert "--resume /kaggle/input/" in kaggle and "read-only" in kaggle
+    local = _resume_recipe(Config(), Path("runs/vgat"))
+    assert "rerun the same command with --resume auto" in local
+    assert "not --resume none" in local, "the one flag that would start over"
+
+
+def test_a_resumed_run_carries_its_checkpoint_into_the_new_out_dir(tmp_path):
+    """
+    Two failures would otherwise break a Kaggle chain, both silently.
+
+    A session killed during its first epoch leaves its `out_dir` empty, and a
+    session that finds nothing left to do writes nothing at all. Either way the
+    *next* session resumes from an empty directory, starts from scratch, and
+    discards every hour spent so far -- announcing only "starting from scratch",
+    one line into a long log.
+    """
+    source, destination = tmp_path / "s1", tmp_path / "s2"
+    source.mkdir()
+    config = Config(channels=16, heads=4, out_dir=str(destination))
+    _tiny_checkpoint(source / "last.pt", config, epoch=2, step=40,
+                     completed=True, history=[{"epoch": 0}], elapsed=5000.0)
+
+    # The behaviour under test is in `_worker`, so assert the property that
+    # makes it work: the resume point is readable and carries its own history.
+    state = torch.load(source / "last.pt", map_location="cpu", weights_only=False)
+    assert state["elapsed"] == 5000.0 and state["history"] == [{"epoch": 0}]
+    save_checkpoint(destination / "last.pt", build_model(config), None, config,
+                    state["epoch"], state["step"], state["history"],
+                    state["best"], completed=True, elapsed=state["elapsed"])
+    carried = torch.load(destination / "last.pt", map_location="cpu",
+                         weights_only=False)
+    assert carried["epoch"] == 2 and carried["elapsed"] == 5000.0
+    assert carried["history"] == [{"epoch": 0}]
+
+
+def test_a_partial_epoch_is_flagged_in_the_history():
+    """
+    An epoch cut short is recorded -- its metrics are real -- but the next
+    session re-runs it, so the same epoch number appears twice. Without a flag
+    the curve is ambiguous exactly where the interruption was.
+    """
+    history = [{"epoch": 5, "partial": 1, "val_geodesic_deg": 40.0},
+               {"epoch": 5, "partial": 0, "val_geodesic_deg": 38.0},
+               {"epoch": 6, "partial": 0, "val_geodesic_deg": 37.0}]
+    clean = [h for h in history if not h["partial"]]
+    assert [h["epoch"] for h in clean] == [5, 6]
+
+
+def test_the_embedding_head_has_no_unlearnable_bias():
+    """
+    The final embedding layer carries no bias, and that is provable rather than
+    stylistic. The embedding is supervised only by the centroid-variance loss,
+    and adding a constant to every embedding shifts them all equally -- the
+    scatter about each cluster centroid does not move. It is unidentifiable for
+    stage two too, since a global shift leaves every pairwise distance
+    untouched. A parameter that cannot be learned would otherwise show up
+    forever as a dead gradient in every check.
+    """
+    from reassembly.nn.losses import embedding_consistency_loss
+
+    z = torch.randn(12, 8, dtype=torch.float64)
+    cluster = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3])
+    plain = embedding_consistency_loss(z, cluster, 4)
+    shifted = embedding_consistency_loss(z + 7.5, cluster, 4)
+    # Exact in exact arithmetic, so the tolerance is round-off, not slack.
+    assert plain.item() == pytest.approx(shifted.item(), rel=1e-12)
+
+    # The operative claim: a bias on the output receives no gradient at all.
+    bias = torch.zeros(8, dtype=torch.float64, requires_grad=True)
+    embedding_consistency_loss(z + bias, cluster, 4).backward()
+    assert bias.grad.abs().max().item() < 1e-12
+
+    model = build_model(Config(channels=32, heads=4))
+    assert model.embedding[-1].bias is None
+
+
+def test_the_checkpointing_flag_reaches_the_model():
+    """
+    One switch, ``grad_checkpointing``, off by default as in Thesis 1. It is
+    only worth anything if it arrives, and the symptom of a flag that does not
+    is an OOM eleven hours into a session.
+
+    The cross layers recompute their pair gathers whatever it says -- measured
+    1109 B/pair down to 86 B/pair, 3.6 GB down to 0.3 GB for one cross layer at
+    3.5 million pairs -- so that is pinned too.
+    """
+    from reassembly.nn.cross import VNCrossFragmentAttention
+
+    default = build_model(Config(channels=32, heads=4))
+    assert default.grad_checkpointing is False
+    assert all(m.checkpoint for m in default.modules()
+               if isinstance(m, VNCrossFragmentAttention))
+    assert build_model(Config(channels=32, heads=4,
+                              grad_checkpointing=True)).grad_checkpointing is True
+
+
+def test_preflight_reports_a_missing_dataset_rather_than_crashing(capsys):
+    """
+    The single most likely first failure on a new machine, and the one whose
+    default traceback says least about what to do.
+    """
+    from reassembly.training import preflight
+
+    assert preflight(Config(root="/nonexistent-dataset-path")) is False
+    out = capsys.readouterr().out
+    assert "--root_dir must point at the directory" in out
+
+
+def test_limit_spans_the_split_instead_of_taking_a_prefix():
+    """
+    `limit_train=40` used to mean "the first 40 items". Scenes are sorted by
+    path and each contributes several modes, so that was the first five objects
+    of whichever category sorts first -- a smoke test that exercises one kind of
+    geometry, and a "small subset" experiment on an unrepresentative sample with
+    nothing saying so.
+    """
+    items = [(obj, f"mode{m}") for obj in range(40) for m in range(8)]
+
+    prefix = items[:40]
+    assert len({obj for obj, _ in prefix}) == 5, "the old behaviour, for contrast"
+
+    keep = np.linspace(0, len(items) - 1, 40).astype(int)
+    strided = [items[i] for i in dict.fromkeys(keep.tolist())]
+    assert len({obj for obj, _ in strided}) == 40, "one mode from every object"
+    assert strided == sorted(strided), "and still deterministic and ordered"
+
+
+# --------------------------------------------------------------------------
+# The two problems a real preflight found
+# --------------------------------------------------------------------------
+
+def test_split_matching_keeps_the_category():
+    """
+    A real dataset put 16 objects in both train and val. The cause: split files
+    list `everyday/<category>/<object>`, and matching used the object name
+    alone. Object directory names are not unique across categories, so a name
+    present in both lists put the *same* scene in both splits -- and the
+    resulting validation score is better than the honest one, so it reads as
+    success rather than as an error.
+    """
+    from reassembly.data.paths import Scene, filter_by_split, split_key
+
+    assert split_key("everyday/BeerBottle/f1ea".split("/")) == ("BeerBottle", "f1ea")
+    assert split_key("f1ea".split("/")) == ("f1ea",)
+    assert split_key("data/everyday/Bowl/x.obj".split("/")) == ("Bowl", "x")
+
+    # Two genuinely different objects that share a directory name.
+    a = Scene(Path("/d/everyday/BeerBottle/f1ea"), "everyday", "BeerBottle", "f1ea")
+    b = Scene(Path("/d/everyday/Mug/f1ea"), "everyday", "Mug", "f1ea")
+
+    train = filter_by_split([a, b], "train", official={("BeerBottle", "f1ea")})
+    val = filter_by_split([a, b], "val", official={("Mug", "f1ea")})
+    assert [s.object_key for s in train] == ["everyday/BeerBottle/f1ea"]
+    assert [s.object_key for s in val] == ["everyday/Mug/f1ea"]
+    assert not ({s.object_key for s in train} & {s.object_key for s in val})
+
+
+def test_split_matching_still_accepts_bare_names():
+    """Some split files list objects without a category; those must still work."""
+    from reassembly.data.paths import Scene, filter_by_split
+
+    scene = Scene(Path("/d/artifact/obj1"), "artifact", "", "obj1")
+    assert filter_by_split([scene], "train", official={("obj1",)}) == [scene]
+
+
+def test_the_split_projections_are_algebraically_the_concatenation():
+    """
+    `VNGraphAttention` applies its key and value maps as a sum of separate
+    projections rather than one map over a concatenation. That is exact --
+    `VNLinear` has no bias, so `W [a;b;c] == W_a a + W_b b + W_c c` -- and it
+    avoids materialising the concatenation, which measured 2961 -> 2091 MB of
+    retained activations per layer on a 488k-edge batch.
+    """
+    from reassembly.nn.gat import VNGraphAttention
+    from reassembly.nn.vn import VNLinear
+
+    channels, edge_channels, heads, head_dim = 16, 3, 4, 8
+    layer = VNGraphAttention(channels, edge_channels, heads, head_dim).to(torch.float64)
+
+    wide = VNLinear(2 * channels + edge_channels, heads * head_dim).to(torch.float64)
+    with torch.no_grad():
+        wide.weight.copy_(torch.cat([layer.key_src.weight, layer.key_dst.weight,
+                                     layer.key_edge.weight], dim=1))
+
+    n, e = 40, 150
+    x = torch.randn(n, channels, 3, dtype=torch.float64)
+    edge_index = torch.randint(0, n, (2, e))
+    edge_attr = torch.randn(e, edge_channels, 3, dtype=torch.float64)
+    src, dst = edge_index[0], edge_index[1]
+
+    split = layer.key_src(x)[src] + layer.key_dst(x)[dst] + layer.key_edge(edge_attr)
+    concatenated = wide(torch.cat([x[src], x[dst], edge_attr], dim=-2))
+    assert torch.allclose(split, concatenated, atol=1e-12)
+
+
+def test_splitting_a_layer_preserves_its_initialisation_scale():
+    """
+    Each piece of a split layer keeps the fan-in of the whole. Without that,
+    splitting silently rescales the initialisation -- a change that looks like
+    nothing and shifts every downstream activation.
+    """
+    from reassembly.nn.vn import VNLinear
+
+    torch.manual_seed(0)
+    wide = torch.stack([VNLinear(35, 32).weight.std() for _ in range(40)]).mean()
+    piece = torch.stack([VNLinear(16, 32, fan_in=35).weight.std()
+                         for _ in range(40)]).mean()
+    assert piece.item() == pytest.approx(wide.item(), rel=0.05)
+
+    unscaled = torch.stack([VNLinear(16, 32).weight.std() for _ in range(40)]).mean()
+    assert unscaled.item() > 1.3 * wide.item(), "without fan_in it would differ"
+
+
+def test_preflight_reports_the_largest_batch_that_fits():
+    """
+    "Out of memory" leaves the useful question unanswered. The number wanted is
+    the largest batch the card takes, and it costs seconds to measure.
+    """
+    from reassembly.training import _halvings
+
+    assert _halvings(4) == [4, 2, 1]
+    assert _halvings(8) == [8, 4, 2, 1]
+    assert _halvings(1) == [1]
+
+
+def _fake_dataset(root: Path, objects: int = 24, modes: int = 2) -> Path:
+    """
+    A Breaking Bad directory tree small enough to run preflight against.
+
+    Preflight is the one function the rest of the suite cannot reach: it needs a
+    dataset on disk in the real layout, so every bug in it has so far been found
+    by a Kaggle session instead of by a test. Three have been, all of the same
+    kind -- a later step allocating as though an earlier one had not run.
+
+    Each fine vertex is its own cell, so the cell matrix is the identity and the
+    fracture file is a plain per-vertex label. Pieces are angular sectors, which
+    keeps them contiguous.
+    """
+    from scipy.sparse import identity, save_npz
+
+    mesh = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
+    vertices = np.asarray(mesh.vertices)
+    theta = np.arctan2(vertices[:, 1], vertices[:, 0])
+
+    for index in range(objects):
+        directory = (root / "everyday_compressed" / "everyday_compressed"
+                     / "Mug" / f"mug_{index}")
+        directory.mkdir(parents=True)
+        mesh.export(directory / "compressed_mesh.obj")
+        save_npz(directory / "compressed_data.npz",
+                 identity(len(vertices), format="csr"))
+        for mode in range(modes):
+            pieces = 2 + mode
+            mode_dir = directory / f"fractured_{mode}"
+            mode_dir.mkdir()
+            labels = np.floor((theta + np.pi) / (2 * np.pi) * pieces)
+            np.save(mode_dir / "compressed_fracture.npy",
+                    np.clip(labels, 0, pieces - 1).astype(np.int64))
+    return root
+
+
+def test_preflight_times_at_a_batch_size_that_fits(tmp_path, monkeypatch, capsys):
+    """
+    Step 5 halves the batch until one fits. Every step after it must then use
+    *that* size -- timing at the configured size, which step 5 just proved does
+    not fit, kills preflight for its own reasons and throws away the report.
+
+    This has now happened twice: first in step 6, then, after that fix, in step
+    7, where the traceback landed in `loss.backward()` and looked like a model
+    problem rather than a preflight one. The OOM is simulated here because CPU
+    has no such limit, but the control flow under test is the real one.
+    """
+    import reassembly.training as training
+
+    _fake_dataset(tmp_path / "data")
+    real_forward = training._forward
+    seen = []
+
+    def limited(model, batch, criterion, config):
+        """Anything above two scenes 'runs out of memory'."""
+        size = int(batch.num_scenes)
+        seen.append(size)
+        if size > 2:
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return real_forward(model, batch, criterion, config)
+
+    monkeypatch.setattr(training, "_forward", limited)
+    config = Config(root=str(tmp_path / "data"), out_dir=str(tmp_path / "out"),
+                    batch_size=4, channels=16, heads=4, workers=0,
+                    tokens_per_scene=64)
+    training.preflight(config)
+    text = capsys.readouterr().out
+
+    assert "micro_batch_scenes=4: out of memory" in text
+    assert "micro_batch_scenes=2: fits" in text
+    # The point of the test: step 7 ran, and ran at 2.
+    assert "timing" in text and "micro_batch_scenes=2" in text
+    assert "s/step" in text, "step 7 never produced a timing"
+    assert max(seen) == 4, "step 5 should have tried the configured size once"
+    assert seen.count(4) == 1, "nothing after step 5 may retry a size that failed"
+
+
+def test_preflight_says_the_batch_does_not_fit_rather_than_crashing(tmp_path,
+                                                                   monkeypatch):
+    """A batch size that does not fit is a [STOP], not a traceback."""
+    import reassembly.training as training
+
+    _fake_dataset(tmp_path / "data", objects=24)
+    real_forward = training._forward
+
+    def limited(model, batch, criterion, config):
+        if int(batch.num_scenes) > 1:
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return real_forward(model, batch, criterion, config)
+
+    monkeypatch.setattr(training, "_forward", limited)
+    config = Config(root=str(tmp_path / "data"), out_dir=str(tmp_path / "out"),
+                    batch_size=4, channels=16, heads=4, workers=0,
+                    tokens_per_scene=64)
+    assert training.preflight(config) is False
+
+
+# --------------------------------------------------------------------------
+# Running out of memory mid-epoch
+# --------------------------------------------------------------------------
+
+class _OOMOnBackward(torch.autograd.Function):
+    """Raises where a real out-of-memory raises: in the backward pass."""
+
+    @staticmethod
+    def forward(ctx, x):
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        raise torch.cuda.OutOfMemoryError("simulated")
+
+
+def _loader(n=4):
+    return torch.utils.data.DataLoader(_Fixed(n), batch_size=1,
+                                       collate_fn=_collate_samples)
+
+
+def test_an_out_of_memory_in_the_backward_is_caught():
+    """
+    The guard used to wrap only the forward, which is the *cheaper* half: peak
+    memory is in the backward, and that is exactly where a real six-epoch run
+    died -- an uncaught `torch.OutOfMemoryError` inside `scaled.backward()`
+    ending the run at 3% of the final epoch, after two hours.
+    """
+    torch.manual_seed(0)
+    config = Config(accumulate=1, channels=16, heads=4, workers=0, batch_size=1)
+    model = build_model(config)
+    # Make every backward fail, the way an oversized scene would.
+    head = model.embedding
+    model.embedding = torch.nn.Sequential(head, _Lambda(_OOMOnBackward.apply))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    summary, _, _ = run_epoch(model, _loader(), build_criterion(config), config,
+                              optimizer=optimizer, step=0, total_steps=10,
+                              label="train", show_progress=False)
+    assert summary["oom"] == 4, "every batch should have been skipped, not raised"
+
+
+class _Lambda(torch.nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x):
+        return self.fn(x)
+
+
+def _checkpointing_on(model) -> bool:
+    return bool(model.grad_checkpointing)
+
+
+def _step_gradients(model, loader, config, forward=None):
+    """Run the real loop and capture the gradient handed to each optimizer step."""
+    import unittest.mock as mock
+
+    import reassembly.training as training
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)   # lr 0: grads survive
+    captured, real = [], optimizer.step
+    optimizer.step = lambda: (captured.append(_grad_vector(model)), real())
+    patch = (mock.patch.object(training, "_forward", forward) if forward
+             else mock.patch.object(training, "_forward", training._forward))
+    with patch:
+        summary, _, _ = run_epoch(model, loader, build_criterion(config), config,
+                                  optimizer=optimizer, step=0, total_steps=10,
+                                  label="train", show_progress=False)
+    return summary, captured
+
+
+def test_an_out_of_memory_is_retried_with_checkpointing_before_it_is_skipped():
+    """
+    A batch that does not fit is retried once with gradient checkpointing on
+    every layer -- and if that fits, it contributes exactly what it would have
+    contributed the first time. It used to be dropped (one GPU) or to stop the
+    whole run (several), and the batches that run out of memory are the
+    largest scenes, so dropping them biases training toward small objects.
+    """
+    import reassembly.training as training
+
+    config = Config(accumulate=1, channels=16, heads=4, workers=0, batch_size=1)
+    real = training._forward
+
+    def tight(model_, batch, criterion, config_):
+        """Only fits with checkpointing on -- the way a borderline scene does."""
+        if not _checkpointing_on(model_):
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return real(model_, batch, criterion, config_)
+
+    # One thread, so the comparison can be exact: with several, CPU reductions
+    # are scheduled nondeterministically and two identical plain runs already
+    # differ by ~1e-6 -- which would hide a real difference of that size.
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        torch.manual_seed(0)
+        model = build_model(config)
+        summary, retried = _step_gradients(model, _loader(3), config, forward=tight)
+        torch.manual_seed(0)
+        reference_model = build_model(config)
+        _, reference = _step_gradients(reference_model, _loader(3), config)
+    finally:
+        torch.set_num_threads(threads)
+    assert summary["oom"] == 0 and summary["oom_recovered"] == 3
+    assert not _checkpointing_on(model), "the forced setting must be undone"
+    assert len(retried) == len(reference) == 3
+    for a, b in zip(retried, reference):
+        assert torch.equal(a, b), "the retry changed the gradient"
+
+
+def test_the_gpus_meet_once_per_step_whatever_each_one_skipped(monkeypatch):
+    """
+    Problem (2) of the old multi-GPU path, pinned in one process.
+
+    The GPUs have to call the same collective operations the same number of
+    times, or one of them waits forever. They used to meet inside every
+    syncing backward -- so a GPU that skipped a batch (too big, empty,
+    non-finite, out of memory) met one time fewer than its peer, and the last
+    all-reduce of the epoch hung. Now they meet only at optimizer steps, which
+    are fixed by batch *position*: here, every batch is skipped and the count
+    of meetings is exactly what it is when none is.
+    """
+    import reassembly.distributed as dist
+
+    calls = {"scalars": 0}
+    real = dist.sum_scalars
+
+    def counting(values, device="cpu"):
+        calls["scalars"] += 1
+        return real(values, device)
+
+    monkeypatch.setattr(dist, "sum_scalars", counting)
+
+    def meetings(max_vertices, batches):
+        calls["scalars"] = 0
+        torch.manual_seed(0)
+        config = Config(channels=16, heads=4, workers=0, batch_size=1,
+                        accumulate=2, max_vertices_per_batch=max_vertices)
+        model = build_model(config)
+        run_epoch(model, _loader(batches), build_criterion(config), config,
+                  optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
+                  step=0, total_steps=10, label="train", show_progress=False,
+                  distributed=True)
+        return calls["scalars"]
+
+    assert meetings(0, 4) == 2, "four batches at accumulate=2 are two steps"
+    assert meetings(1, 4) == 2, "skipping every batch must not change that"
+    assert meetings(0, 5) == 3, "a trailing partial group is stepped, not carried over"
+
+
+def test_a_step_with_nothing_in_it_does_not_move_the_weights():
+    """AdamW moves weights on momentum and decay alone; an empty step must not call it."""
+    torch.manual_seed(0)
+    config = Config(accumulate=1, channels=16, heads=4, workers=0, batch_size=1,
+                    max_vertices_per_batch=1)
+    model = build_model(config)
+    before = [p.detach().clone() for p in model.parameters()]
+    summary, _, _ = run_epoch(model, _loader(2), build_criterion(config), config,
+                              optimizer=torch.optim.AdamW(model.parameters(), lr=1e-2),
+                              step=0, total_steps=10, label="train",
+                              show_progress=False)
+    assert summary["empty_steps"] == 2 and summary["steps"] == 0
+    assert all(torch.equal(a, b) for a, b in zip(before, model.parameters()))
+
+
+def test_an_oversized_batch_is_skipped_before_it_is_attempted():
+    """
+    The decision has to be made *before* the forward, from a quantity every
+    rank computes identically. An out-of-memory error arrives on whichever rank
+    was tighter, so it can never be the basis of a collective decision.
+    """
+    torch.manual_seed(0)
+    model = build_model(Config(channels=16, heads=4))
+    tiny = Config(accumulate=1, channels=16, heads=4, workers=0, batch_size=1,
+                  max_vertices_per_batch=1)
+    summary, _, _ = run_epoch(model, _loader(), build_criterion(tiny), tiny,
+                              optimizer=torch.optim.AdamW(model.parameters()),
+                              step=0, total_steps=10, label="train",
+                              show_progress=False)
+    assert summary["oom"] == 4
+
+    generous = Config(accumulate=1, channels=16, heads=4, workers=0, batch_size=1,
+                      max_vertices_per_batch=10_000_000)
+    summary, _, _ = run_epoch(model, _loader(), build_criterion(generous), generous,
+                              optimizer=torch.optim.AdamW(model.parameters()),
+                              step=0, total_steps=10, label="train",
+                              show_progress=False)
+    assert summary["oom"] == 0
+
+
+def test_token_reach_measures_how_far_cross_information_travels():
+    """
+    The number that decides whether a schedule's trailing intra layers are
+    enough. A cross layer writes only to tokens, and the rotation head pools a
+    mean over *every* vertex — so vertices the tokens never reach dilute the
+    prediction with features that know nothing about the other fragments.
+
+    Each trailing intra layer buys exactly one hop along mesh edges, so the
+    sequence must be strictly increasing and bounded by 1, and its first entry
+    must exceed the token share (one hop reaches strictly more than the tokens
+    themselves on any mesh with edges).
+    """
+    from reassembly.training import _token_reach
+
+    samples = [_scene(s) for s in range(3)]
+    reach = _token_reach(samples, 4)
+
+    assert len(reach) == 4
+    assert all(0.0 < r <= 1.0 for r in reach)
+    assert reach == sorted(reach), f"reach must grow with hops: {reach}"
+
+    tokens = sum(len(f.token_vertices) for s in samples for f in s.fragments)
+    total = sum(len(f.vertices) for s in samples for f in s.fragments)
+    assert reach[0] > tokens / total, "one hop must reach more than the tokens"
+
+
+def test_token_reach_survives_a_scene_with_no_tokens():
+    """Coincidence labelling reports fragments with no fracture surface."""
+    from reassembly.training import _token_reach
+
+    assert _token_reach([], 3) == [0.0, 0.0, 0.0]
+
+
+def _grad_vector(model):
+    return torch.cat([p.grad.flatten() for _, p in sorted(model.named_parameters())
+                      if p.grad is not None])
+
+
+def _accumulated_gradient(scenes, **overrides):
+    """Run the real loop one scene at a time and capture the gradient it steps."""
+    torch.manual_seed(0)
+    config = Config(channels=16, heads=4, workers=0, accumulate=len(scenes),
+                    grad_clip=1e9, **overrides)
+    model = build_model(config)
+
+    class _Each(torch.utils.data.Dataset):
+        def __len__(self):
+            return len(scenes)
+
+        def __getitem__(self, i):
+            return scenes[i]
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)   # lr 0: grads survive
+    captured, real = {}, optimizer.step
+    optimizer.step = lambda: (captured.setdefault("g", _grad_vector(model)), real())
+    run_epoch(model, torch.utils.data.DataLoader(_Each(), batch_size=1,
+              collate_fn=_collate_samples), build_criterion(config), config,
+              optimizer=optimizer, step=0, total_steps=10, label="train",
+              show_progress=False)
+    return captured["g"]
+
+
+def _batched_gradient(scenes, **overrides):
+    torch.manual_seed(0)
+    config = Config(channels=16, heads=4, workers=0, accumulate=1, **overrides)
+    model = build_model(config)
+    batch, _ = _collate_samples(scenes)
+    _forward(model, batch, build_criterion(config), config)[0].backward()
+    return _grad_vector(model)
+
+
+@pytest.mark.parametrize("term", ["rotation", "position", "normal", "face"])
+def test_accumulation_matches_a_real_batch_on_the_geometric_terms(term):
+    """
+    `--batch-size 1 --accumulate 2` must give the same gradient as
+    `--batch-size 2`, because preflight recommends the first as a substitute for
+    the second whenever memory forces the batch down.
+
+    It did not. `loss / accumulate` weights each *scene* equally, while a real
+    batch weights each *fragment* equally — and a Breaking Bad scene holds
+    anywhere from 2 to 35 fragments. Measured on a 2-fragment and an 8-fragment
+    scene, the two gradients had cosine similarity **0.80** and norms 45% apart:
+    a silent re-weighting of the objective, applied by a flag chosen for memory
+    reasons. Weighting each micro-batch by its fragment count and normalising by
+    the group total makes them identical.
+    """
+    scenes = [_scene(1, fragments=2), _scene(2, fragments=8)]
+    off = {f"w_{k}": 0.0 for k in ("rotation", "position", "normal", "face", "embedding")}
+    off[f"w_{term}"] = 1.0
+
+    batched = _batched_gradient(scenes, **off)
+    accumulated = _accumulated_gradient(scenes, **off)
+    cosine = torch.nn.functional.cosine_similarity(batched, accumulated, dim=0)
+    assert cosine > 0.99999, f"{term}: accumulation diverged from a real batch, {cosine}"
+
+
+def test_the_contrastive_term_cannot_match_a_real_batch_and_that_is_correct():
+    """
+    The one term that does *not* decompose, stated so nobody tries to fix it.
+
+    InfoNCE draws its negatives from whatever is in the batch. Two scenes in one
+    batch see each other's vertices as negatives; the same two scenes forwarded
+    separately do not. No accumulation scheme can reproduce that — it is a
+    property of contrastive objectives, not a defect.
+
+    It is also the better behaviour here. Matching only ever happens *within* a
+    scene, so a scene's own fracture vertices are the real confusion set and
+    another object's are free negatives that teach nothing. Accumulation
+    tightens this term rather than weakening it.
+    """
+    scenes = [_scene(1, fragments=2), _scene(2, fragments=8)]
+    off = {f"w_{k}": 0.0 for k in ("rotation", "position", "normal", "face")}
+    off["w_embedding"] = 1.0
+
+    cosine = torch.nn.functional.cosine_similarity(
+        _batched_gradient(scenes, **off), _accumulated_gradient(scenes, **off), dim=0)
+    assert cosine < 0.99, (
+        "the contrastive term matched a real batch exactly, which would mean the "
+        "negatives are no longer drawn from the batch — check correspondence_loss"
+    )

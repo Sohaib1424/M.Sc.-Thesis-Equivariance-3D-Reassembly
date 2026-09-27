@@ -1,0 +1,242 @@
+"""
+The backbone: intra-fragment attention, cross-fragment attention, rotation head.
+
+Shape of the network
+--------------------
+Layers alternate. Intra-fragment attention moves information along real mesh
+edges; cross-fragment attention lets a fragment's interface tokens hear what
+the other fragments in its scene look like; then more intra-fragment layers
+carry that back through the mesh. The last part is easy to leave out and
+important: a cross layer only updates the *token* vertices, so without intra
+layers after it, the rest of the fragment never learns anything about its
+neighbours, and the pooled rotation prediction is dominated by vertices that
+never heard from anyone.
+
+The default schedule is ``intra x5, cross x3`` -- an encoder-then-fusion shape:
+build the per-vertex description of each fragment first, then let the fragments
+talk. It is the arrangement the thesis is testing.
+
+**It accepts the cost named above, and the cost is measurable.** With no intra
+layer after the last cross layer, only *token* vertices carry any cross-fragment
+information into the pool, and the pool is a mean over every vertex. At the
+defaults that is 2,048 tokens against a median 9,149 vertices per scene, so
+roughly **78% of the pooled rotation signal comes from vertices that never heard
+from another fragment**.
+
+That is a dilution, not a wall: the network can learn to give token vertices a
+larger magnitude and dominate the mean, since VN layers scale features freely.
+But it starts at a disadvantage the interleaved form does not have, and the
+cross layers are the whole mechanism for beating the ~90 deg axis-only
+landmark (a landmark, not a floor -- see `evaluation/metrics.swing_twist_error`).
+If the floor turns out to be where this parks, ``intra x5, cross x3, intra`` --
+one extra layer -- is the first thing to try, and
+``("intra",) * 2 + ("cross", "intra") * 3`` the second.
+
+The rotation convention, derived rather than guessed
+----------------------------------------------------
+Centred, the perturbation is ``v_pert = v_gt Q^T``. Vector features inherit
+that rotation, so the head's frame satisfies ``M_pert = Q M_gt``. The label is
+the rotation that undoes the perturbation, ``R_gt = Q^T``, so the head returns
+
+    R_pred = M^T                    (M's rows, not its columns)
+
+which makes ``R_pred = M_gt^T Q^T`` -- correct exactly when the network learns
+to map an already-assembled fragment to the identity frame, ``M_gt = I``. That
+is a fixed, learnable target, because Breaking Bad's assembled pose is a
+convention shared by every scene in the dataset.
+
+Applying it: ``v_pert @ R_pred.T`` returns the fragment to its assembled pose.
+The transpose here is the single easiest thing to get backwards, and getting it
+backwards is invisible at initialisation -- chance is chance either way -- so
+``tests/test_model.py`` asserts the round trip on a fragment whose perturbation
+is known.
+"""
+from __future__ import annotations
+
+from typing import List, NamedTuple, Optional, Sequence
+
+import torch
+import torch.utils.checkpoint
+from torch import Tensor, nn
+
+from .cross import VNCrossFragmentAttention
+from .gat import VNGraphAttentionBlock
+from .segment import segment_mean
+from .vn import VNInvariant, VNLinear, VNScaleGate, gram_schmidt
+
+DEFAULT_SCHEDULE = ("intra",) * 5 + ("cross",) * 3 + ("intra",)
+
+
+class Prediction(NamedTuple):
+    """What one forward pass produces."""
+    rotation: Tensor            # (F, 3, 3) maps perturbed -> assembled
+    frame: Tensor               # (F, 3, 3) the equivariant frame, rotation's transpose
+    vertex_embedding: Tensor    # (N, D) invariant, for correspondence and the
+    #                             embedding-consistency loss
+    vertex_features: Tensor     # (N, C, 3) equivariant, the backbone's output
+    head_axes: Optional[Tensor] = None
+    """
+    ``(F, 2, 3)`` -- the two vectors the head produces *before* Gram-Schmidt.
+
+    Exposed for one diagnostic. When the two become collinear the frame's
+    second column is decided by whatever is left of the second vector after
+    projecting out the first, which near-parallel means numerical noise: the
+    prediction degenerates to one direction plus a random roll. That state is
+    invisible in the rotation loss -- the output is still a proper rotation --
+    and it is the cheapest thing to measure that separates a bad basin from
+    slow progress. See :func:`reassembly.evaluation.metrics.head_collinearity`.
+
+    Last field and optional so that constructing a ``Prediction`` positionally,
+    as the tests do, keeps working.
+    """
+
+
+class ReassemblyNet(nn.Module):
+    """
+    SO(3)-equivariant rotation prediction for fractured fragments.
+
+    Every fragment is already a graph -- its mesh -- so nothing is constructed
+    inside one. The only built connections are between fragments, among the
+    sampled fracture-surface tokens.
+    """
+
+    def __init__(
+        self,
+        channels: int = 32,
+        node_channels: int = 2,
+        edge_channels: int = 3,
+        heads: int = 4,
+        head_dim: int = 8,
+        embedding_dim: int = 32,
+        schedule: Sequence[str] = DEFAULT_SCHEDULE,
+        negative_slope: float = 0.2,
+        grad_checkpointing: bool = False,
+    ) -> None:
+        super().__init__()
+        self.channels = channels
+        self.schedule = tuple(schedule)
+        unknown = set(self.schedule) - {"intra", "cross"}
+        if unknown:
+            raise ValueError(f"unknown layer kinds in schedule: {sorted(unknown)}")
+
+        self.embed = VNLinear(node_channels, channels)
+        # Fragment scale joins as an invariant gate, never as a third axis of a
+        # (C, 3) tensor -- scale has no direction, so there is no legal slot.
+        self.scale_gate = VNScaleGate(channels, scalar_features=1)
+
+        self.intra = nn.ModuleList(
+            VNGraphAttentionBlock(channels, edge_channels, heads, head_dim,
+                                  negative_slope)
+            for kind in self.schedule if kind == "intra"
+        )
+        # The cross layers always recompute their pair gathers in the backward
+        # pass (1109 -> 86 bytes per pair, bitwise-identical results, nearly
+        # free): not a setting, because there is no reason to turn it off.
+        self.cross = nn.ModuleList(
+            VNCrossFragmentAttention(channels, heads=heads, head_dim=2 * head_dim)
+            for kind in self.schedule if kind == "cross"
+        )
+        self.grad_checkpointing = bool(grad_checkpointing)
+        """
+        Recompute every layer in the backward pass instead of storing its
+        insides, as Thesis 1's ``--grad_checkpointing`` does. Each layer then
+        keeps only its input, ``(N, C, 3)``; without it an intra layer keeps
+        several edge-sized ``(E, C, 3)`` tensors, and a mesh has about six
+        directed edges per vertex. Outputs and gradients are identical either
+        way; the price is roughly one extra forward pass. Read at call time, so
+        the out-of-memory retry can switch it on for one batch.
+        """
+
+        # Pool to a fragment, then two equivariant 3-vectors -> a rotation.
+        self.pool_proj = VNLinear(channels, channels)
+        self.head = VNLinear(channels, 2)
+        # Invariant per-vertex embedding for matching interface points across
+        # fragments. Invariant, not equivariant: the vertices being matched sit
+        # in differently-perturbed fragments, so equivariant features would be
+        # compared across unrelated frames.
+        self.readout = VNInvariant(channels, directions=4)
+        self.embedding = nn.Sequential(
+            nn.Linear(self.readout.out_features, 2 * embedding_dim),
+            nn.LayerNorm(2 * embedding_dim),
+            nn.GELU(),
+            # No bias on the last layer, and this is provable rather than
+            # stylistic. The embedding is supervised only by the
+            # centroid-variance loss, and a constant added to every embedding
+            # shifts them all equally -- the scatter about each cluster centroid
+            # does not move. It is unidentifiable for stage two as well, since a
+            # global shift leaves every pairwise distance untouched. Keeping it
+            # would put a parameter in the model that provably cannot be
+            # learned, which then shows up forever as a "dead gradient".
+            nn.Linear(2 * embedding_dim, embedding_dim, bias=False),
+        )
+
+    def forward(
+        self,
+        node_features: Tensor,
+        edge_index: Tensor,
+        edge_attr: Tensor,
+        vertex_fragment: Tensor,
+        num_fragments: int,
+        *,
+        log_scale: Optional[Tensor] = None,
+        token_index: Optional[Tensor] = None,
+        token_query: Optional[Tensor] = None,
+        token_key: Optional[Tensor] = None,
+    ) -> Prediction:
+        """
+        ``node_features`` ``(N, node_channels, 3)`` -- centred coordinate and
+        vertex normal. ``edge_attr`` ``(E, edge_channels, 3)`` -- the two
+        canonically ordered face normals and the relative position of the
+        source vertex. ``token_index`` selects which vertices
+        take part in cross-fragment attention; ``token_query`` and ``token_key``
+        are the pair lists from :func:`~reassembly.nn.cross.cross_fragment_index`,
+        built once per batch.
+        """
+        x = self.embed(node_features)
+        if log_scale is not None:
+            x = self.scale_gate(x, log_scale[vertex_fragment])
+
+        checkpointed = self.grad_checkpointing and torch.is_grad_enabled()
+
+        def run(layer, *inputs):
+            if checkpointed:
+                return torch.utils.checkpoint.checkpoint(layer, *inputs,
+                                                         use_reentrant=False)
+            return layer(*inputs)
+
+        intra = iter(self.intra)
+        cross = iter(self.cross)
+        for kind in self.schedule:
+            if kind == "intra":
+                x = run(next(intra), x, edge_index, edge_attr)
+            else:
+                layer = next(cross)
+                if token_index is None or token_index.numel() == 0:
+                    # No tokens anywhere in the batch. The layer is a no-op
+                    # rather than an error: a single-fragment mode has no
+                    # cross-fragment structure to attend over.
+                    continue
+                tokens = run(layer, x[token_index], token_query, token_key)
+                # Residual write-back, so vertices that are not tokens keep
+                # their features and token vertices keep theirs too.
+                x = x.index_add(0, token_index, tokens - x[token_index])
+
+        pooled = segment_mean(self.pool_proj(x), vertex_fragment, num_fragments)
+        axes = self.head(pooled)                           # (F, 2, 3)
+        frame = gram_schmidt(axes)                         # (F, 3, 3), columns
+        return Prediction(
+            rotation=frame.transpose(-1, -2),
+            frame=frame,
+            vertex_embedding=self.embedding(self.readout(x)),
+            vertex_features=x,
+            head_axes=axes,
+        )
+
+
+def apply_rotation(vertices: Tensor, rotation: Tensor,
+                   vertex_fragment: Tensor) -> Tensor:
+    """
+    ``v @ R.T`` per fragment -- the operation the position and normal losses
+    compare against the ground truth.
+    """
+    return torch.einsum("nij,nj->ni", rotation[vertex_fragment], vertices)

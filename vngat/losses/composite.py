@@ -54,13 +54,16 @@ def _mean(values: torch.Tensor) -> torch.Tensor:
 
 
 def fragment_mean(values: torch.Tensor, index: Optional[torch.Tensor] = None,
-                  num_fragments: Optional[int] = None) -> torch.Tensor:
+                  num_fragments: Optional[int] = None,
+                  keep: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Mean over each fragment's entries, then mean over fragments.
 
     `index` gives each entry's fragment. Fragments with no entries (a fragment
     with no edges, for an edge term) are left out of the outer mean rather than
-    counted as zero. Without `index` this is a plain mean.
+    counted as zero, and so are fragments `keep` (an `(F,)` bool mask) leaves
+    out -- under the anchor target, each scene's anchor. Without `index` this
+    is a plain mean.
 
     Accumulates in float32 under half precision: a fragment can hold tens of
     thousands of vertices, and a float16 running sum stops absorbing O(1)
@@ -75,24 +78,31 @@ def fragment_mean(values: torch.Tensor, index: Optional[torch.Tensor] = None,
     sums = torch.zeros(n, dtype=acc, device=values.device).index_add_(0, index, values.to(acc))
     counts = torch.bincount(index, minlength=n).to(acc)
     present = counts > 0
-    return (sums[present] / counts[present]).mean()
+    if keep is not None:
+        present = present & keep.to(present.device)
+    # `_mean`, not `.mean()`: with every fragment left out (a one-fragment
+    # scene under the anchor target, or DDP's placeholder) this must be a
+    # connected zero -- a NaN here would reach every gradient of the step.
+    return _mean(sums[present] / counts[present])
 
 
 def node_position_loss(x_pred: torch.Tensor, x_gt: torch.Tensor,
                        index: Optional[torch.Tensor] = None,
-                       num_fragments: Optional[int] = None) -> torch.Tensor:
+                       num_fragments: Optional[int] = None,
+                       keep: Optional[torch.Tensor] = None) -> torch.Tensor:
     """L_pos = mean_f mean_{v in f} ||x_v - xhat_v||^2. Inputs (V, 3)."""
-    return fragment_mean(((x_pred - x_gt) ** 2).sum(dim=-1), index, num_fragments)
+    return fragment_mean(((x_pred - x_gt) ** 2).sum(dim=-1), index, num_fragments, keep)
 
 
 def node_normal_loss(n_pred: torch.Tensor, n_gt: torch.Tensor,
                      index: Optional[torch.Tensor] = None,
                      num_fragments: Optional[int] = None,
-                     eps: float = 1e-8) -> torch.Tensor:
+                     eps: float = 1e-8,
+                     keep: Optional[torch.Tensor] = None) -> torch.Tensor:
     """L_node = mean_f mean_{v in f} (1 - n_v . nhat_v). Inputs (V, 3), renormalised defensively."""
     n_pred = F.normalize(n_pred, dim=-1, eps=eps)
     n_gt = F.normalize(n_gt, dim=-1, eps=eps)
-    return fragment_mean(1 - (n_pred * n_gt).sum(dim=-1), index, num_fragments)
+    return fragment_mean(1 - (n_pred * n_gt).sum(dim=-1), index, num_fragments, keep)
 
 
 def face_normal_loss(
@@ -101,6 +111,7 @@ def face_normal_loss(
     index: Optional[torch.Tensor] = None,
     num_fragments: Optional[int] = None,
     eps: float = 1e-8,
+    keep: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """L_face = mean_f mean_{e in f} [(1 - n1.n1hat) + (1 - n2.n2hat)]. Inputs (E, 3) each."""
     n1_pred = F.normalize(n1_pred, dim=-1, eps=eps)
@@ -109,7 +120,7 @@ def face_normal_loss(
     n2_gt = F.normalize(n2_gt, dim=-1, eps=eps)
     term1 = 1 - (n1_pred * n1_gt).sum(dim=-1)
     term2 = 1 - (n2_pred * n2_gt).sum(dim=-1)
-    return fragment_mean(term1 + term2, index, num_fragments)
+    return fragment_mean(term1 + term2, index, num_fragments, keep)
 
 
 def cluster_consistency_loss(
@@ -236,6 +247,7 @@ class CompositeLoss(nn.Module):
         emb_pull_margin: float = 0.1,
         emb_push_margin: float = 0.5,
         symmetry_axis: str = "z",
+        rotation_target: str = "anchor",
     ):
         super().__init__()
         self.weights = dict(
@@ -245,21 +257,35 @@ class CompositeLoss(nn.Module):
         self.emb_pull_margin = emb_pull_margin
         self.emb_push_margin = emb_push_margin
         self.symmetry_axis = symmetry_axis
+        # Read by `vngat.training.trainer._forward_loss`, which aligns the
+        # prediction to each scene's anchor before building `x_pred` and friends
+        # (`vngat.evaluation.anchor`). The loss itself only sees the result: the
+        # rotation it is given, and `targets["fragment_keep"]`.
+        self.rotation_target = rotation_target
 
     def forward(self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        # Which fragments the four rotation-dependent terms average over: every
+        # one by default; under the anchor target, all but each scene's anchor,
+        # whose aligned prediction is exact by construction.
+        keep = targets.get("fragment_keep")
         rot_angles = geodesic_rotation_loss(outputs["R_pred"], targets["R_gt"])
+        scored_angles = rot_angles if keep is None else rot_angles[keep]
         with torch.no_grad():
             tilt, twist = swing_twist_error(
                 outputs["R_pred"], targets["R_gt"], axis=self.symmetry_axis)
-        l_rot = _mean(rot_angles)
+            if keep is not None:
+                tilt, twist = tilt[keep], twist[keep]
+        l_rot = _mean(scored_angles)
         num_fragments = targets.get("num_fragments")
         node_frag = targets.get("node_frag")
         edge_frag = targets.get("edge_frag")
-        l_pos = node_position_loss(outputs["x_pred"], targets["x_gt"], node_frag, num_fragments)
-        l_node = node_normal_loss(outputs["n_pred"], targets["n_gt"], node_frag, num_fragments)
+        l_pos = node_position_loss(outputs["x_pred"], targets["x_gt"], node_frag, num_fragments,
+                                   keep=keep)
+        l_node = node_normal_loss(outputs["n_pred"], targets["n_gt"], node_frag, num_fragments,
+                                  keep=keep)
         l_face = face_normal_loss(
             outputs["n1_pred"], targets["n1_gt"], outputs["n2_pred"], targets["n2_gt"],
-            edge_frag, num_fragments,
+            edge_frag, num_fragments, keep=keep,
         )
         margins = dict(pull_margin=self.emb_pull_margin, push_margin=self.emb_push_margin)
         l_emb_v = cluster_consistency_loss(
@@ -281,7 +307,7 @@ class CompositeLoss(nn.Module):
             # angle -- not the Euler-angle RMSE GARF reports. They are
             # different numbers and must not be compared directly; see
             # `vngat/evaluation/metrics.py`, which computes both.
-            "rot_deg": _mean(rot_angles.detach()) * (180.0 / torch.pi),
+            "rot_deg": _mean(scored_angles.detach()) * (180.0 / torch.pi),
             # Reported, never optimised. Splits the residual into TILT off the
             # object's symmetry axis and TWIST about it. On validation this is
             # the measurement that separates "has not learned the axis either"

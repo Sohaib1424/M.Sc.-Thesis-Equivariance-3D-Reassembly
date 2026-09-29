@@ -28,6 +28,14 @@ translation-dependent numbers quietly omitted.
 Averaging follows the benchmark: per scene, then over scenes. Training logs
 are fragment-weighted instead; the two differ when scenes differ in fragment
 count, and the thesis tables should use this script's numbers.
+
+THE ANCHOR. Every number is read the benchmark's way: each scene's largest
+fragment is set to its true pose -- one rotation of the whole predicted
+assembly, and translations measured from the anchor's -- and the other
+fragments are scored (`vngat.evaluation.anchor`). `absolute_geodesic_deg` is
+the model's own prediction against each object's stored frame, over every
+fragment. Both apply to any checkpoint, whatever rotation target it was
+trained on.
 """
 from __future__ import annotations
 
@@ -50,6 +58,7 @@ from torch.utils.data import DataLoader  # noqa: E402
 from vngat.assembly.translation import assemble  # noqa: E402
 from vngat.config import Config  # noqa: E402
 from vngat.data.dataset import BreakingBadDataset, collate_fn, dataset_kwargs  # noqa: E402
+from vngat.evaluation.anchor import anchor_alignment  # noqa: E402
 from vngat.evaluation.metrics import (  # noqa: E402
     AXIS_ONLY_EULER_RMSE_DEG, AXIS_ONLY_GEODESIC_DEG, CHANCE_EULER_RMSE_DEG,
     CHANCE_GEODESIC_DEG, aggregate, evaluate_scene,
@@ -90,8 +99,10 @@ def evaluate(args) -> dict:
         cfg.root_dir = args.root_dir
 
     monitor = cfg.checkpoint_monitor
+    trained_on = (state.get("config") or {}).get("rotation_target", "absolute")
     write(f"checkpoint: epoch {state.get('epoch')}"
-          + (f" | val {monitor} {state['val_loss']:.4f}" if state.get("val_loss") is not None else ""))
+          + (f" | val {monitor} {state['val_loss']:.4f}" if state.get("val_loss") is not None else "")
+          + f" | trained on the {trained_on!r} rotation target")
 
     dataset = BreakingBadDataset(
         split=args.split, fixed=True, fixed_count=args.num_scenes, **dataset_kwargs(cfg),
@@ -112,8 +123,14 @@ def evaluate(args) -> dict:
     for batch in loader:
         scene = prepare_scene(batch, device, non_blocking=False)
         outputs = model(**build_model_inputs(scene["diffused_input"]))
-        R_pred = outputs["R_pred"]
         R_gt = ground_truth_rotation(scene["rot"])
+        # The whole predicted assembly turned so this scene's largest fragment
+        # sits at its true pose; everything below is placed and scored in that
+        # frame, and the anchor itself is left out of every per-fragment mean.
+        R_own = outputs["R_pred"]
+        R_pred, keep = anchor_alignment(R_own, R_gt, scene["clean_target"])
+        R_gt = R_gt.to(R_pred.dtype)
+        anchor = int((~keep).nonzero()[0]) if bool((~keep).any()) else None
 
         target = scene["clean_target"]
         diffused = scene["diffused_target"]
@@ -143,8 +160,13 @@ def evaluate(args) -> dict:
                 radii=target.frag_log_scale.squeeze(-1).exp(),
             )
             # Ground truth translation: each fragment's centroid in the
-            # assembled object frame, gauge-fixed the same way the solver is.
+            # assembled object frame. Both measured from the anchor's, which
+            # therefore sits exactly at its true position (the benchmark's
+            # gauge); a one-fragment scene falls back to the mean.
             t_gt = target.frag_centroid - target.frag_centroid.mean(0, keepdim=True)
+            if anchor is not None:
+                t_gt = target.frag_centroid - target.frag_centroid[anchor]
+                t_pred = t_pred - t_pred[anchor]
             placed = rotated + t_pred.index_select(0, target.node_frag)
             truth = target.world_pos() + t_gt.index_select(0, target.node_frag)
             kwargs = dict(pred_points=placed, gt_points=truth, point_frag=target.node_frag,
@@ -152,7 +174,8 @@ def evaluate(args) -> dict:
             extra = {"num_matches": float(matches.src_idx.numel())}
 
         metrics = evaluate_scene(R_pred, R_gt, pa_threshold=args.pa_threshold,
-                                 symmetry_axis=args.symmetry_axis, **kwargs)
+                                 symmetry_axis=args.symmetry_axis, keep=keep,
+                                 R_absolute=R_own.to(R_pred.dtype), **kwargs)
         metrics.update(extra)
         metrics["_category"] = (batch.get("categories") or ["unknown"])[0] or "unknown"
         metrics["_scene"] = f"{batch['scene_dirs'][0]}/{(batch.get('modes') or [''])[0]}"
@@ -167,6 +190,9 @@ def evaluate(args) -> dict:
     write("\n=== results ===")
     for key in sorted(summary):
         write(f"  {key:<24} {summary[key]:.5f}")
+    write("  (every figure with each scene's largest fragment set to its true pose and the "
+          "other\n   fragments scored, except absolute_geodesic_deg: every fragment in its "
+          "object's stored frame)")
 
     write("\n=== reference levels ===")
     write(f"  chance, geodesic            {CHANCE_GEODESIC_DEG:.2f} deg")

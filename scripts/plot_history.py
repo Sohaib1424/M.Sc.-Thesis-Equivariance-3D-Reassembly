@@ -24,7 +24,9 @@ from vngat.training.history import History  # noqa: E402
 
 PANELS = [
     ("total", "Total (weighted sum)"),
-    ("rot_deg", "Rotation error (degrees)"),
+    ("anchor_deg", "Rotation, largest fragment as anchor (deg)"),
+    ("absolute_deg", "Rotation, each object's stored frame (deg)"),
+    ("rot_deg", "Rotation loss term (degrees)"),
     ("rot", "Rotation (geodesic, rad)"),
     ("pos", "Node position"),
     ("node", "Node normal"),
@@ -50,7 +52,8 @@ def main(argv=None) -> None:
     if history.num_epochs == 0:
         raise SystemExit(f"No epochs recorded in {path}")
 
-    rows, cols = 4, 4
+    cols = 4
+    rows = -(-(len(PANELS) + 1 + 4) // cols)     # the panels, the category plot, four meta
     fig, axes = plt.subplots(rows, cols, figsize=(4.2 * cols, 3.2 * rows))
     axes = axes.ravel()
 

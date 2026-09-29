@@ -57,7 +57,7 @@ def _model():
                       head_dim=4, embed_dim=4)
 
 
-def _worker(rank, world, init_file, out_dir, drop_rank):
+def _worker(rank, world, init_file, out_dir, drop_rank, target):
     from vngat.config import Config
     from vngat.losses.composite import CompositeLoss
     from vngat.training import trainer as T
@@ -67,13 +67,15 @@ def _worker(rank, world, init_file, out_dir, drop_rank):
     try:
         model = _model()
         ddp = T._wrap_ddp(model, torch.device("cpu"), rank, sync_buffers=False)
-        cfg = Config(amp=False, device="cpu", grad_clip=0.0)
+        cfg = Config(amp=False, device="cpu", grad_clip=0.0, rotation_target=target)
         scaler = T.make_scaler(torch.device("cpu"), False)
-        loss_fn = CompositeLoss()
+        loss_fn = CompositeLoss(rotation_target=target)
         optimizer = torch.optim.SGD(ddp.parameters(), lr=0.1)
 
         micros = _all_micros(world)[rank]
-        frags = [m["target"].num_fragments for m in micros]
+        # What `run_phase` weights by: the fragments each loss averages over
+        # (all but one per scene under the anchor target).
+        frags = [T.loss_fragments(m["target"], target) for m in micros]
         rank_frags = float(sum(frags))
         contributed = 0.0
         optimizer.zero_grad(set_to_none=True)
@@ -96,25 +98,27 @@ def _worker(rank, world, init_file, out_dir, drop_rank):
         dist.destroy_process_group()
 
 
-def _reference(drop_rank, world=2):
-    """d/dtheta of the fragment-weighted mean over every contributed scene."""
+def _reference(drop_rank, world=2, target="anchor"):
+    """d/dtheta of the fragment-weighted mean over every contributed scene --
+    fragments the loss scores, which under the anchor target excludes one per
+    scene."""
     from vngat.losses.composite import CompositeLoss
     from vngat.training import trainer as T
 
     model = _model()
-    loss_fn = CompositeLoss()
+    loss_fn = CompositeLoss(rotation_target=target)
     pieces = []
     for rank, micros in _all_micros(world).items():
         for i, micro in enumerate(micros):
             if rank == drop_rank and i == 0:
                 continue
             pieces.append(micro)
-    total_frags = sum(m["target"].num_fragments for m in pieces)
+    total_frags = sum(T.loss_fragments(m["target"], target) for m in pieces)
     loss = 0.0
     for micro in pieces:
         scene = T.prepare_scene(micro, torch.device("cpu"))
         out = T._forward_loss(model, loss_fn, scene, torch.device("cpu"), False)
-        loss = loss + out["total"] * (micro["target"].num_fragments / total_frags)
+        loss = loss + out["total"] * (T.loss_fragments(micro["target"], target) / total_frags)
     loss.backward()
     return [p.grad.detach().clone() for p in model.parameters()]
 
@@ -134,19 +138,29 @@ def _spawn(world, *args):
                         f"waiting on a collective its peer never entered")
 
 
+@pytest.mark.parametrize("target", ["anchor", "absolute"])
 @pytest.mark.parametrize("world,drop_rank", [(2, -1), (2, 0), (3, -1), (3, 0), (3, 2)])
-def test_ddp_step_is_the_global_fragment_mean_and_replicas_agree(tmp_path, world, drop_rank):
+def test_ddp_step_is_the_global_fragment_mean_and_replicas_agree(tmp_path, world, drop_rank,
+                                                                  target):
     if not dist.is_available():
         pytest.skip("torch.distributed unavailable")
     init_file = tmp_path / "init"
-    _spawn(world, str(init_file), str(tmp_path), drop_rank)
+    _spawn(world, str(init_file), str(tmp_path), drop_rank, target)
     ranks = [torch.load(tmp_path / f"rank{r}.pt", weights_only=False) for r in range(world)]
-    reference = _reference(drop_rank, world)
+    reference = _reference(drop_rank, world, target)
     for index, ref in enumerate(reference):
         first = ranks[0]["grads"][index]
         for other in ranks[1:]:
             assert torch.equal(first, other["grads"][index]), "ranks disagree on the reduced gradient"
-        assert torch.allclose(first, ref, rtol=1e-4, atol=1e-6)
+        # Against the reference, relative to the tensor's own scale: float32
+        # sums taken in a different order differ by ~1e-6 of it (measured: 2.8e-6
+        # on a tensor of scale 4.2 under the anchor target), which an element-wise
+        # rtol trips over on elements near zero. A wrong weighting -- per-rank
+        # means, or a rank's own count applied after the all-reduce -- is off by
+        # tens of percent.
+        scale = float(ref.abs().max())
+        assert float((first - ref).abs().max()) <= 1e-5 * scale + 1e-6, (
+            f"parameter {index}: not the global fragment-weighted mean step")
     for index in range(len(ranks[0]["params"])):
         for other in ranks[1:]:
             assert torch.equal(ranks[0]["params"][index], other["params"][index]), (

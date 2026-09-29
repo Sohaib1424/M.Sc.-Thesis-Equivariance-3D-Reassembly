@@ -211,6 +211,36 @@ included, the catalogue groups each shape's copies into ONE object with the
 union of their break patterns, so nothing is double-counted and one shape can
 never sit in two splits.
 
+## The largest fragment as the anchor
+
+`R_gt` is each fragment's rotation back into the frame its object is *stored*
+in. For a shape the model has never seen, that frame cannot be read off the
+input -- most Everyday objects are round, so the turn of the stored object
+about its axis is arbitrary -- and Thesis 1 and My Thesis Work both sat at
+chance on the official-split validation while their training error fell. The
+benchmark asks something else: GARF and PuzzleFusion++ fix each scene's largest
+fragment at its true pose and score the others relative to it. This version
+does the same (`vngat/evaluation/anchor.py`):
+
+* **Metrics, always.** Every epoch reports `anchor_deg` (each scene's
+  prediction turned so its largest fragment is exact; the other fragments'
+  error) and `absolute_deg` (every fragment in its stored frame), on one
+  `[val ]` line. Chance is 126.47 deg for both. tilt/twist and the
+  per-category table are the anchor's; `best.pt` is chosen on `anchor_deg`.
+  `scripts.evaluate` scores this way, translations measured from the anchor's.
+* **Loss, by default** (`--rotation_target anchor`): rot, pos, node and face
+  compare the anchor-aligned prediction, over every fragment but the anchors.
+  `--rotation_target absolute` is Thesis 1's target.
+* **Unchanged:** the model, the embedding terms, the data, every other flag.
+* **Resuming a checkpoint written before this** continues it on the absolute
+  target it was trained on, monitoring what it monitored; pass
+  `--rotation_target anchor` to switch it (announced, and best-so-far reset).
+
+```bash
+# score an existing checkpoint both ways, no retraining
+python -m scripts.evaluate --checkpoint checkpoints/best.pt --split val
+```
+
 ## Split modes, balancing, validation
 
 | setting | what it does |

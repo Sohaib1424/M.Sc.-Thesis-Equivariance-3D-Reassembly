@@ -36,6 +36,7 @@ norm: layer
 grad_checkpointing: false
 
 # ---- loss weights (all untuned at 1.0) ----
+rotation_target: anchor       # each fragment relative to its scene's largest (vngat/evaluation/anchor.py)
 w_rot: 1.0
 w_pos: 1.0
 w_node: 1.0
@@ -82,7 +83,7 @@ time_budget_hours: 11.0
 # ---- checkpointing ----
 checkpoint_dir: checkpoints
 save_every: 10
-checkpoint_monitor: rot           # val term that decides best.pt
+checkpoint_monitor: anchor_deg    # val term that decides best.pt
 resume: auto
 drive_folder_id: ''
 drive_credentials: ''

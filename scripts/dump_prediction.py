@@ -30,8 +30,11 @@ file loads with a plain `np.load` and no `allow_pickle`.
     centroids       (F, 3)        per-fragment centroid of the original mesh
     A               (F, 3, 3)     the scatter rotation applied to fragment f
     t               (F, 3)        the scatter translation
-    R_pred          (F, 3, 3)     what the model predicts
+    R_pred          (F, 3, 3)     what the model predicts, with the scene's
+                                  largest fragment set to its true pose
+                                  (vngat/evaluation/anchor.py)
     R_gt            (F, 3, 3)     the target, = A^T
+    anchor          ()            which fragment is the anchor (its error is 0)
     geodesic_deg    (F,)          per-fragment error
     tilt_deg        (F,)          residual off the symmetry axis
     twist_deg       (F,)          residual about it
@@ -67,6 +70,7 @@ import torch  # noqa: E402
 from scripts.evaluate import load_config, load_model  # noqa: E402
 from vngat.data.dataset import BreakingBadDataset, build_graphs, dataset_kwargs  # noqa: E402
 from vngat.data.io import list_fracture_dirs, load_scene  # noqa: E402
+from vngat.evaluation.anchor import anchor_alignment  # noqa: E402
 from vngat.evaluation.metrics import geodesic_angle, swing_twist_error  # noqa: E402
 from vngat.training.bridge import build_model_inputs, ground_truth_rotation  # noqa: E402
 
@@ -158,16 +162,27 @@ def main(argv=None) -> int:
     A_t = torch.from_numpy(A).to(device)
     with torch.no_grad():
         out = model(**build_model_inputs(graph.rotate_per_fragment(A_t)))
-    R_pred = out["R_pred"].float().cpu()
-    R_gt = ground_truth_rotation(A_t).cpu()
+    # Shown and scored the benchmark's way: the whole predicted assembly turned
+    # so the largest fragment sits at its true pose, the others relative to it.
+    R_gt_device = ground_truth_rotation(A_t)
+    R_aligned, keep = anchor_alignment(out["R_pred"].float(), R_gt_device, graph)
+    anchor = int((~keep).nonzero()[0]) if bool((~keep).any()) else -1
+    R_pred = R_aligned.cpu()
+    R_gt = R_gt_device.cpu()
+    keep = keep.cpu()
 
     geo = geodesic_angle(R_pred, R_gt).numpy()
     tilt, twist = swing_twist_error(R_pred, R_gt, axis=args.symmetry_axis)
 
     print("\nper-fragment geodesic error (deg), chance = 126.47:")
     for i, g in enumerate(geo):
-        print(f"  fragment {i:>2}: {g:8.2f}    tilt {float(tilt[i]):7.2f}  twist {float(twist[i]):7.2f}")
-    print(f"  {'mean':>11}: {geo.mean():8.2f}    tilt {float(tilt.mean()):7.2f}  twist {float(twist.mean()):7.2f}")
+        mark = "   <- anchor, set to its true pose" if i == anchor else ""
+        print(f"  fragment {i:>2}: {g:8.2f}    tilt {float(tilt[i]):7.2f}  "
+              f"twist {float(twist[i]):7.2f}{mark}")
+    if bool(keep.any()):
+        print(f"  {'mean':>11}: {geo[keep.numpy()].mean():8.2f}    tilt "
+              f"{float(tilt[keep].mean()):7.2f}  twist {float(twist[keep].mean()):7.2f}"
+              f"   (the other fragments)")
 
     verts = [np.asarray(m.vertices, np.float32) for m in meshes]
     faces = [np.asarray(m.faces, np.int32) for m in meshes]
@@ -185,6 +200,7 @@ def main(argv=None) -> int:
         A=A, t=t,
         R_pred=R_pred.numpy().astype(np.float32),
         R_gt=R_gt.numpy().astype(np.float32),
+        anchor=np.array(anchor),
         geodesic_deg=geo.astype(np.float32),
         tilt_deg=np.asarray(tilt, np.float32),
         twist_deg=np.asarray(twist, np.float32),

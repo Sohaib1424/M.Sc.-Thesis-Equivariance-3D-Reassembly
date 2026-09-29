@@ -141,12 +141,22 @@ def build_prediction_scene(meshes, args, span: float) -> trimesh.Scene:
         len(meshes), np.random.default_rng(args.seed)).astype(np.float32)).to(device)
 
     with torch.no_grad():
-        R_pred = model(**build_model_inputs(model_graph.rotate_per_fragment(rot)))["R_pred"]
+        R_own = model(**build_model_inputs(model_graph.rotate_per_fragment(rot)))["R_pred"]
     R_gt = ground_truth_rotation(rot)
+    # Shown the benchmark's way: the whole predicted assembly turned so the
+    # largest fragment sits at its true pose (vngat/evaluation/anchor.py).
+    from vngat.evaluation.anchor import anchor_alignment
 
-    geo = geodesic_angle(R_pred, R_gt)
-    print(f"  geodesic error: mean {geo.mean():.2f} deg, median {geo.median():.2f} deg")
-    print(f"  Euler RMSE    : {euler_rmse(R_pred, R_gt).mean():.2f} deg")
+    R_pred, keep = anchor_alignment(R_own.float(), R_gt, target)
+    R_gt = R_gt.to(R_pred.dtype)
+
+    if bool(keep.any()):
+        geo = geodesic_angle(R_pred[keep], R_gt[keep])
+        print(f"  geodesic error: mean {geo.mean():.2f} deg, median {geo.median():.2f} deg "
+              f"(largest fragment set to its true pose, the others scored)")
+        print(f"  Euler RMSE    : {euler_rmse(R_pred[keep], R_gt[keep]).mean():.2f} deg")
+    print(f"  absolute      : {geodesic_angle(R_own.float(), R_gt).mean():.2f} deg "
+          f"(every fragment in its object's stored frame)")
 
     rot_np = rot.cpu().numpy()
     pred_np = R_pred.cpu().numpy()

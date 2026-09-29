@@ -241,3 +241,65 @@ processes over gloo:
   prints the median on the real data.
 - `--split_by fracture` is the quickest test of the "it cannot handle unseen
   shapes" hypothesis: run it next to the object split and compare.
+
+---
+
+## 9. The largest fragment as the anchor (Sept 2026)
+
+Added after the official-split runs of Thesis 1 and My Thesis Work stayed at
+chance on validation while training fell (My Thesis Work, one epoch: 123.0 deg
+against 126.5 chance; tilt 87.0, twist 87.8; `match@1` 0.67). The label is each
+fragment's rotation into its object's stored frame, which an unseen, mostly
+round shape does not determine. The benchmark fixes one fragment instead: GARF
+trains with anchors "with identity rotations and zero translations" and
+evaluates with the largest fragment fixed (supplementary C.3).
+
+**Compatibility, checked before porting.** v5 uses the column convention
+(`x_pred = R_pred x_diffused`, `R_gt = A^T`), so a global rotation of a
+predicted assembly multiplies on the left -- the same correction as My Thesis
+Work's. Every batch carries `frag_scene` and `frag_log_scale`, and the largest
+radius is already what `normalize_mode: scene` divides by. Every
+rotation-dependent term is built from `R_pred` in one place (`build_predictions`)
+and averaged per fragment (`fragment_mean`). The model has the same symmetry as
+My Thesis Work's -- equivariant to its own fragment's pose, invariant to the
+others' (`test_rotating_one_fragment_leaves_the_others_alone`) -- and is not
+touched.
+
+**What changed.**
+
+- `vngat/evaluation/anchor.py` (new): per scene `C = R_gt[a] R_pred[a]^T`, on
+  the left of every prediction; in float32 outside autocast. Anchor: largest
+  `frag_log_scale`, ties to the first; left out of every average.
+- `_forward_loss`: under `rotation_target: anchor` (the default) the aligned
+  prediction feeds `build_predictions` and the loss, with
+  `targets["fragment_keep"]` leaving the anchors out of rot, pos, node and face.
+  The anchor-protocol figures ride along under underscored keys either way.
+- `run_phase`: micro-batches weighted by the fragments the loss scores (one
+  fewer per scene under the anchor target), the step rescale and the epoch
+  averages included; `anchor_deg`, `absolute_deg` and the anchor's tilt/twist
+  summed per fragment and divided once after the reduction over ranks.
+- Config: `rotation_target` (restored on resume; a checkpoint without it is
+  read as `absolute`, announced), `checkpoint_monitor` default `anchor_deg`,
+  `anchor_deg` and `absolute_deg` monitorable. A resumed monitor that changed
+  meaning -- a loss term after the target changed, or a protocol figure from a
+  checkpoint older than the protocol -- resets the best-so-far.
+- `scripts/evaluate.py` and `evaluate_scene`: aligned rotations, translations
+  measured from the anchor's, the anchor left out of every per-fragment number,
+  `absolute_geodesic_deg` beside them. `dump_prediction` and `visualize` show
+  the aligned prediction and name the anchor.
+- YAMLs: `rotation_target: anchor`, `checkpoint_monitor: anchor_deg`.
+
+**Verified.** 238 passed, 3 skipped (223 before, with `test_ddp` now run under
+both targets). Mutation checks -- correction on the right, anchor per batch,
+anchor left in the average, anchor not trained, weights still counting the
+anchor, loss ignoring the target, old checkpoints read with the new default,
+`fragment_mean` ignoring `keep` -- each fails at least one test. `check_version`:
+73 markers.
+
+**Two things found on the way.** v5's `geodesic_rotation_loss` has a
+`sqrt(1e-12)` floor, so an exact prediction reads ~3e-5 deg, not 0. And
+`tests/conftest.random_rotation` is not uniform on SO(3) (QR without the sign
+fix: two draws are 100.8 deg apart on average, not 126.5); harmless where a test
+needs *a* rotation, so it is left alone, and the chance test uses the data
+pipeline's sampler instead.
+

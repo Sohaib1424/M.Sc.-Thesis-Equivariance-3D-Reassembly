@@ -15,8 +15,13 @@ from typing import Any, Dict, List, Optional
 
 
 # Validation terms a scheduler or best.pt may watch (lower is better for all).
+# `anchor_deg` and `absolute_deg` are the rotation metrics every run reports
+# whatever it trains on (`vngat.evaluation.anchor`).
 MONITORABLE = ("total", "rot", "rot_deg", "pos", "node", "face", "emb_v", "emb_e",
-               "tilt", "twist")
+               "tilt", "twist", "anchor_deg", "absolute_deg")
+
+# What the rotation-dependent loss terms compare against.
+ROTATION_TARGETS = ("anchor", "absolute")
 
 
 @dataclass
@@ -105,6 +110,19 @@ class Config:
     """Recompute layer activations in backward. ~35% slower, roughly halves
     activation memory. Left off by default; the loop turns it on automatically
     for a single scene that would otherwise OOM."""
+
+    # ---------------- what the rotation is scored against ----------------
+    rotation_target: str = "anchor"
+    """'anchor' (default): each scene's largest fragment is set to its true
+    pose and every other fragment is scored relative to it -- the benchmark's
+    protocol, and a question the input can answer for a shape the model has
+    never seen. 'absolute': each fragment's rotation back into the frame its
+    object is stored in (Thesis 1's target); for an unseen round object the turn
+    about its axis in that frame is arbitrary, so that loss can only be lowered
+    by remembering training shapes. Changes the rot/pos/node/face terms only;
+    the model and the embedding terms are the same either way, and the metrics
+    always report both (`anchor_deg`, `absolute_deg`). A checkpoint from before
+    this setting existed is resumed on 'absolute'. See vngat/evaluation/anchor.py."""
 
     # ---------------- loss weights ----------------
     w_rot: float = 1.0
@@ -232,11 +250,14 @@ class Config:
     # ---------------- checkpointing ----------------
     checkpoint_dir: str = "checkpoints"
     save_every: int = 10
-    checkpoint_monitor: str = "rot"
+    checkpoint_monitor: str = "anchor_deg"
     """Validation term that decides best.pt (checked every epoch, not only on
-    save epochs). 'rot', the primary objective, by default: the composite total
-    is dominated by terms that barely move, so "best total" can be a worse
-    rotation model."""
+    save epochs). 'anchor_deg' by default: the rotation error with each scene's
+    largest fragment set to its true pose, which means the same thing whichever
+    rotation_target the run trains on. Not the composite total, which is
+    dominated by terms that barely move, so "best total" can be a worse
+    rotation model. (Before the anchor protocol this was 'rot'; a resumed
+    checkpoint keeps its own.)"""
     resume: str = "auto"
     """'auto' = resume from the newest available checkpoint (remote, then
     local); 'none' = start fresh; or an explicit path."""
@@ -297,6 +318,9 @@ class Config:
             raise ValueError(f"balance_temperature must be in [0, 1], got {self.balance_temperature}")
         if self.head_dim < 1:
             raise ValueError("head_dim must be >= 1")
+        if self.rotation_target not in ROTATION_TARGETS:
+            raise ValueError(f"rotation_target must be one of {ROTATION_TARGETS}, "
+                             f"got {self.rotation_target!r}")
         for name in ("lr_monitor", "checkpoint_monitor"):
             if getattr(self, name) not in MONITORABLE:
                 raise ValueError(f"{name} must be one of {MONITORABLE}, got {getattr(self, name)!r}")

@@ -153,6 +153,23 @@ MARKERS = [
      "scripts/evaluate.py", "**dataset_kwargs(cfg)"),
     ("DDP step verified on three ranks",
      "tests/test_ddp.py", "(3, -1), (3, 0), (3, 2)"),
+    # --- the largest fragment as the anchor (Sept 2026) --------------------
+    ("anchor: one rotation per scene, on the left",
+     "vngat/evaluation/anchor.py", "aligned = torch.matmul(correction[frag_scene.long()], R)"),
+    ("--rotation_target anchor|absolute",
+     "vngat/config.py", 'ROTATION_TARGETS = ("anchor", "absolute")'),
+    ("the loss compares the anchor-aligned prediction",
+     "vngat/training/trainer.py", 'targets["fragment_keep"] = scored'),
+    ("anchors left out of the geometric terms",
+     "vngat/losses/composite.py", "present = present & keep.to(present.device)"),
+    ("steps weighted by the fragments scored",
+     "vngat/training/trainer.py", 'fragments = [loss_fragments(m["target"], target) for m in micro_batches]'),
+    ("both protocols reported every epoch",
+     "vngat/training/trainer.py", '_PROTOCOL_SUMS = ("anchor_deg", "absolute_deg", "tilt", "twist")'),
+    ("old checkpoints resume on the absolute target",
+     "vngat/training/trainer.py", 'stored = dict(stored, rotation_target=LEGACY_ROTATION_TARGET)'),
+    ("evaluation measured from the anchor",
+     "scripts/evaluate.py", "t_gt = target.frag_centroid - target.frag_centroid[anchor]"),
 ]
 
 

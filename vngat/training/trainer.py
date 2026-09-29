@@ -43,8 +43,11 @@ from ..data.dataset import (
     BreakingBadDataset, collate_fn, dataset_kwargs, merge_micro_batches, split_batch_by_scene,
 )
 from ..data.graph import SceneBatch
+from ..evaluation.anchor import anchor_alignment, scored_fragments
+from ..evaluation.metrics import swing_twist_error
 from ..losses.composite import CompositeLoss
 from ..models.vn_gat import VNGATModel
+from ..models.vn_layers import geodesic_rotation_loss
 from ..utils.env import dataloader_worker_init, seed_everything
 from ..utils.progress import make_bar, table_header, table_row, write
 from . import distributed as D
@@ -55,6 +58,27 @@ from .history import History
 
 _LOSS_KEYS = ("total", "rot", "rot_deg", "pos", "node", "face", "emb_v", "emb_e",
               "head_cos", "tilt", "twist")
+
+# The rotation metrics every epoch reports whatever the training target, summed
+# per fragment and divided once after the reduction over ranks (exact):
+#   anchor_deg    each scene's largest fragment set to its true pose, the other
+#                 fragments' geodesic error -- the benchmark's protocol
+#   absolute_deg  every fragment against its object's stored frame
+# The protocol's tilt/twist replace the loss-side ones in the returned metrics.
+# See `vngat.evaluation.anchor`.
+_PROTOCOL_SUMS = ("anchor_deg", "absolute_deg", "tilt", "twist")
+
+
+def loss_fragments(graph: SceneBatch, rotation_target: str) -> int:
+    """
+    The fragments one micro-batch's loss is a mean over, and so its weight in
+    the step and in the epoch's averages: every fragment under the absolute
+    target, all but one per scene under the anchor target. The step divides by
+    the total of these over every rank, so each scored fragment counts once.
+    """
+    if rotation_target == "anchor":
+        return scored_fragments(graph)
+    return int(graph.num_fragments)
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +226,10 @@ _RESTORED_FIELDS = (
     "lr_warmup_epochs", "epochs", "weight_decay", "grad_clip",
     "w_rot", "w_pos", "w_node", "w_face", "w_emb_v", "w_emb_e",
     "emb_pull_margin", "emb_push_margin", "symmetry_axis", "checkpoint_monitor",
+    # A checkpoint from before this setting existed was trained on the absolute
+    # target and is restored as such (`adopt_checkpoint_config`), so resuming
+    # an old run continues it unchanged.
+    "rotation_target",
     # --- WHAT IT IS BEING LEARNED FROM -----------------------------------
     # These define the dataset and the train/val split. Letting them fall back
     # to defaults mid-run is the worst failure mode available: dropping
@@ -239,6 +267,28 @@ _ARCHITECTURE_FIELDS = (
 # effective batch -- which is why it must stay caller-controlled.
 
 
+# A checkpoint written before `rotation_target` existed was trained on the
+# absolute target. Read through this, never through the current default.
+LEGACY_ROTATION_TARGET = "absolute"
+
+# Monitorable values that mean the same thing whatever the rotation target.
+_PROTOCOL_MONITORS = ("anchor_deg", "absolute_deg", "tilt", "twist")
+
+
+def _monitor_changed_meaning(monitor: str, stored_target: str, target: str,
+                             checkpoint_knows_targets: bool) -> bool:
+    """
+    Whether the best-so-far in a checkpoint was measured differently from how
+    `monitor` is measured now, although its name is the same: a loss term
+    after the rotation target changed, or a protocol figure from a checkpoint
+    that predates the protocol (tilt and twist were then the absolute ones,
+    and anchor_deg / absolute_deg did not exist).
+    """
+    if monitor in _PROTOCOL_MONITORS:
+        return not checkpoint_knows_targets
+    return stored_target != target
+
+
 def adopt_checkpoint_config(cfg: Config, resume_path, is_main: bool) -> None:
     """
     Make a checkpoint SELF-SUFFICIENT, so resuming needs no flags.
@@ -269,6 +319,14 @@ def adopt_checkpoint_config(cfg: Config, resume_path, is_main: bool) -> None:
         )
 
     explicit = getattr(cfg, "_explicit", frozenset())
+    if "rotation_target" not in stored:
+        stored = dict(stored, rotation_target=LEGACY_ROTATION_TARGET)
+        if is_main:
+            write(f"  [ckpt] this checkpoint predates --rotation_target: it was trained on "
+                  f"the '{LEGACY_ROTATION_TARGET}' target"
+                  + (f", and the command line switches it to '{cfg.rotation_target}'"
+                     if "rotation_target" in explicit else
+                     ", which this run continues (pass --rotation_target anchor to switch)"))
     for name in _ARCHITECTURE_FIELDS:
         # Only an EXPLICIT mismatch is an error. Saying nothing means "use the
         # checkpoint's architecture", which is restored below.
@@ -366,18 +424,44 @@ def _dummy_scene(device: torch.device) -> Dict:
 
 
 def _forward_loss(model, loss_fn, scene: Dict, device: torch.device, amp: bool):
+    """
+    One forward and the loss breakdown.
+
+    Under `loss_fn.rotation_target == "anchor"` the rotation every geometric
+    term compares is the prediction with its scene's largest fragment set to
+    its true pose (`vngat.evaluation.anchor`), and the anchors are left out of
+    those terms. The anchor-protocol metrics ride along under underscored keys
+    whatever the target; they are computed without gradient and never enter
+    `total`.
+    """
     with make_autocast(device, amp):
         outputs = model(**build_model_inputs(scene["diffused_input"]))
-        predictions = build_predictions(scene["diffused_target"], outputs["R_pred"])
+        targets = build_targets(scene["clean_target"], scene["rot"], scene["diffused_input"])
+        R_raw = outputs["R_pred"]
+        aligned, scored = anchor_alignment(R_raw, targets["R_gt"], scene["clean_target"])
+        R_used = R_raw
+        if getattr(loss_fn, "rotation_target", "absolute") == "anchor":
+            R_used = aligned
+            targets["fragment_keep"] = scored
+        predictions = build_predictions(scene["diffused_target"], R_used)
         merged = dict(
-            R_pred=outputs["R_pred"],
+            R_pred=R_used,
             vertex_embedding=outputs["vertex_embedding"],
             edge_embedding=outputs["edge_embedding"],
             **predictions,
         )
-        targets = build_targets(scene["clean_target"], scene["rot"], scene["diffused_input"])
         losses = dict(loss_fn(merged, targets))
         losses["head_cos"] = outputs["head_cos"]
+    with torch.no_grad():
+        degrees = 180.0 / math.pi
+        R_gt = targets["R_gt"].to(aligned.dtype)
+        losses["_anchor_deg"] = geodesic_rotation_loss(aligned[scored].detach(), R_gt[scored]) * degrees
+        losses["_absolute_deg"] = geodesic_rotation_loss(
+            R_raw.detach().to(aligned.dtype), R_gt) * degrees
+        tilt, twist = swing_twist_error(aligned[scored].detach(), R_gt[scored],
+                                        axis=getattr(loss_fn, "symmetry_axis", "z"))
+        losses["_anchor_tilt"], losses["_anchor_twist"] = tilt, twist
+        losses["_anchor_scene"] = scene["clean_target"].frag_scene[scored]
     return losses
 
 
@@ -671,6 +755,9 @@ def run_phase(
 
     sums = {k: 0.0 for k in _LOSS_KEYS}
     weight = 0.0
+    protocol = {k: 0.0 for k in _PROTOCOL_SUMS}
+    anchored = absolute = 0.0          # fragments behind each protocol mean
+    target = getattr(loss_fn, "rotation_target", "absolute")
     cat_sum = {c: 0.0 for c in categories}
     cat_n = {c: 0.0 for c in categories}
     counts = {k: 0.0 for k in ("micro", "fp32", "nonfinite", "oom", "recovered",
@@ -688,7 +775,10 @@ def run_phase(
         max_edges = max(max_edges, batch["target"].num_edges)
 
         micro_batches = _make_micro_batches(batch, cfg.micro_batch_scenes)
-        fragments = [m["target"].num_fragments for m in micro_batches]
+        # The fragments each micro-batch's loss averages over -- all but one per
+        # scene under the anchor target -- so the step is the exact mean over
+        # every scored fragment on every rank.
+        fragments = [loss_fragments(m["target"], target) for m in micro_batches]
         rank_fragments = float(sum(fragments))
         contributed = 0.0
         if train:
@@ -713,9 +803,18 @@ def run_phase(
             weight += nf
             for key in _LOSS_KEYS:
                 sums[key] += float(result.losses[key].detach()) * nf
+            anchor_deg = result.losses["_anchor_deg"].float()
+            absolute_deg = result.losses["_absolute_deg"].float()
+            protocol["anchor_deg"] += float(anchor_deg.sum())
+            protocol["absolute_deg"] += float(absolute_deg.sum())
+            protocol["tilt"] += float(result.losses["_anchor_tilt"].float().sum())
+            protocol["twist"] += float(result.losses["_anchor_twist"].float().sum())
+            anchored += float(anchor_deg.numel())
+            absolute += float(absolute_deg.numel())
             if categories:
-                degrees = result.losses["_rot_deg_per_fragment"].float().cpu().tolist()
-                scene_of = micro["target"].frag_scene.tolist()
+                # The anchor protocol's per-fragment errors, one label each.
+                degrees = anchor_deg.cpu().tolist()
+                scene_of = result.losses["_anchor_scene"].cpu().tolist()
                 names = micro.get("categories") or []
                 for deg, s in zip(degrees, scene_of):
                     name = names[s] if s < len(names) else ""
@@ -744,6 +843,10 @@ def run_phase(
     # --- exact reduction over ranks: sums and counts, divided afterwards ----
     packed = {f"sum:{k}": v for k, v in sums.items()}
     packed["weight"] = weight
+    for name, value in protocol.items():
+        packed[f"protocol:{name}"] = value
+    packed["protocol_n:anchor"] = anchored
+    packed["protocol_n:absolute"] = absolute
     for name in categories:
         packed[f"cat:{name}"] = cat_sum[name]
         packed[f"catn:{name}"] = cat_n[name]
@@ -760,6 +863,14 @@ def run_phase(
         metrics = {k: float("nan") for k in _LOSS_KEYS}
     else:
         metrics = {k: packed[f"sum:{k}"] / total_weight for k in _LOSS_KEYS}
+    # The anchor protocol, exact over every rank: these replace the loss-side
+    # tilt/twist, so the figures read against chance mean the same thing
+    # whichever target the run trains on.
+    n_anchor, n_absolute = packed["protocol_n:anchor"], packed["protocol_n:absolute"]
+    for name in ("anchor_deg", "tilt", "twist"):
+        metrics[name] = (packed[f"protocol:{name}"] / n_anchor) if n_anchor > 0 else float("nan")
+    metrics["absolute_deg"] = ((packed["protocol:absolute_deg"] / n_absolute)
+                               if n_absolute > 0 else float("nan"))
     by_category = {
         name: (packed[f"cat:{name}"] / packed[f"catn:{name}"]
                if packed[f"catn:{name}"] > 0 else float("nan"))
@@ -771,6 +882,7 @@ def run_phase(
         "max_nodes": float(max_nodes),
         "max_edges": float(max_edges),
         "fragments": total_weight,
+        "anchor_fragments": n_anchor,
         "grad_norm": (packed["norm_sum"] / packed["norm_n"]) if packed["norm_n"] else float("nan"),
         "nan_scenes": nan_scenes,
         "by_category": by_category,
@@ -919,6 +1031,12 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
         write(f"world_size={world_size} | batch={cfg.batch_size} per rank "
               f"(micro={cfg.micro_batch_scenes}) | amp={cfg.amp} | best.pt on val "
               f"{cfg.checkpoint_monitor}")
+        write(f"rotation target: {cfg.rotation_target} -- "
+              + ("each fragment relative to its scene's largest, which is set to its "
+                 "true pose" if cfg.rotation_target == "anchor" else
+                 "each fragment in its object's stored frame")
+              + ". Metrics use the anchor protocol either way (anchor_deg), with "
+                "the stored-frame error beside it (absolute_deg).")
         if cfg.amp:
             write("!! amp=True: a controlled comparison found half precision both unstable "
                   "(non-finite losses on 6 of 8 objects from epoch 66) and WORSE than fp32 "
@@ -931,7 +1049,7 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
         w_rot=cfg.w_rot, w_pos=cfg.w_pos, w_node=cfg.w_node,
         w_face=cfg.w_face, w_emb_v=cfg.w_emb_v, w_emb_e=cfg.w_emb_e,
         emb_pull_margin=cfg.emb_pull_margin, emb_push_margin=cfg.emb_push_margin,
-        symmetry_axis=cfg.symmetry_axis,
+        symmetry_axis=cfg.symmetry_axis, rotation_target=cfg.rotation_target,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler, scheduler_needs_metric = build_scheduler(cfg, optimizer)
@@ -967,7 +1085,9 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
         state = manager.load(resume_path, model, optimizer, scheduler, scaler,
                              map_location=str(device))
         start_epoch = int(state.get("epoch", -1)) + 1
-        stored_monitor = (state.get("config") or {}).get("checkpoint_monitor", cfg.checkpoint_monitor)
+        stored_cfg = state.get("config") or {}
+        stored_monitor = stored_cfg.get("checkpoint_monitor", cfg.checkpoint_monitor)
+        stored_target = stored_cfg.get("rotation_target", LEGACY_ROTATION_TARGET)
         if stored_monitor != cfg.checkpoint_monitor:
             # best_val was measured in a different quantity; comparing the new
             # one against it would keep or discard best.pt for no reason.
@@ -975,6 +1095,16 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
             if is_main:
                 write(f"  [ckpt] checkpoint_monitor {stored_monitor} -> {cfg.checkpoint_monitor}: "
                       f"the best-so-far is reset (the old value is a different quantity)")
+        elif _monitor_changed_meaning(cfg.checkpoint_monitor, stored_target,
+                                      cfg.rotation_target, "rotation_target" in stored_cfg):
+            # Same name, different quantity: the loss terms follow the target,
+            # and a checkpoint from before the anchor protocol measured tilt and
+            # twist without it.
+            manager.best_val = float("inf")
+            if is_main:
+                write(f"  [ckpt] val {cfg.checkpoint_monitor} is not measured the way the "
+                      f"checkpoint's best was (rotation target {stored_target} -> "
+                      f"{cfg.rotation_target}); the best-so-far is reset")
         history = History.from_dict(state.get("history") or {})
         history.truncate_to(start_epoch)
         # The checkpoint's RNG state is RANK 0's, and every rank just restored
@@ -1060,6 +1190,12 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
             write(table_row(epoch, "val", val_metrics,
                             val_diag["data_seconds"], val_diag["compute_seconds"], current_lr))
             tilt_v, twist_v = val_metrics.get("tilt"), val_metrics.get("twist")
+            anchor_v = val_metrics.get("anchor_deg", float("nan"))
+            if math.isfinite(anchor_v):
+                write(f"  [val ] anchor {anchor_v:6.2f} deg  absolute "
+                      f"{val_metrics.get('absolute_deg', float('nan')):6.2f} deg  "
+                      f"(chance 126.47; anchor = each scene's largest fragment "
+                      f"set to its true pose)")
             if tilt_v is not None and math.isfinite(tilt_v):
                 write(f"  [val ] tilt {tilt_v:6.2f}  twist {twist_v:6.2f}"
                       f"  (chance 90/90){_verdict(tilt_v, twist_v)}")

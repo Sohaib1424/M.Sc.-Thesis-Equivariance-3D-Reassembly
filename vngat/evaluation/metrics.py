@@ -261,26 +261,48 @@ def evaluate_scene(
     t_gt: Optional[torch.Tensor] = None,
     pa_threshold: float = 0.01,
     symmetry_axis: str = "z",
+    keep: Optional[torch.Tensor] = None,
+    R_absolute: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     """
     All metrics for one scene. Translation-dependent entries are omitted
     (rather than faked) when translations are not supplied, so a
     rotation-only evaluation cannot silently report a meaningless RMSE(T).
+
+    Under the anchor protocol (`vngat.evaluation.anchor`) the caller passes the
+    anchor-ALIGNED `R_pred`, translations measured from the anchor's, and
+    `keep` -- every fragment but the anchor -- so the anchor's free perfect
+    score is left out of every per-fragment number. `R_absolute`, the model's
+    own prediction, adds `absolute_geodesic_deg` over every fragment.
     """
     num_fragments = R_pred.shape[0]
+    if keep is None:
+        keep = torch.ones(num_fragments, dtype=torch.bool, device=R_pred.device)
+    nothing = float("nan")
     metrics: Dict[str, float] = {
-        "rmse_R_euler_deg": float(euler_rmse(R_pred, R_gt).mean()),
-        "geodesic_deg": float(geodesic_angle(R_pred, R_gt).mean()),
-        "geodesic_median_deg": float(geodesic_angle(R_pred, R_gt).median()),
         "num_fragments": float(num_fragments),
+        "scored_fragments": float(keep.sum()),
     }
-    tilt, twist = swing_twist_error(R_pred, R_gt, axis=symmetry_axis)
+    if R_absolute is not None:
+        metrics["absolute_geodesic_deg"] = float(geodesic_angle(R_absolute, R_gt).mean())
+    if not bool(keep.any()):
+        # One fragment, and it is the anchor: nothing to score. NaN, which
+        # `aggregate` skips, rather than a perfect 0.
+        for key in ("rmse_R_euler_deg", "geodesic_deg", "geodesic_median_deg",
+                    "tilt_deg", "twist_deg"):
+            metrics[key] = nothing
+        return metrics
+    angle = geodesic_angle(R_pred[keep], R_gt[keep])
+    metrics["rmse_R_euler_deg"] = float(euler_rmse(R_pred[keep], R_gt[keep]).mean())
+    metrics["geodesic_deg"] = float(angle.mean())
+    metrics["geodesic_median_deg"] = float(angle.median())
+    tilt, twist = swing_twist_error(R_pred[keep], R_gt[keep], axis=symmetry_axis)
     metrics["tilt_deg"] = float(tilt.mean())
     metrics["twist_deg"] = float(twist.mean())
     if t_pred is not None and t_gt is not None:
-        metrics["rmse_T"] = float(translation_rmse(t_pred, t_gt).mean())
+        metrics["rmse_T"] = float(translation_rmse(t_pred[keep], t_gt[keep]).mean())
     if pred_points is not None and gt_points is not None and point_frag is not None:
-        chamfer = per_fragment_chamfer(pred_points, gt_points, point_frag, num_fragments)
+        chamfer = per_fragment_chamfer(pred_points, gt_points, point_frag, num_fragments)[keep]
         metrics["chamfer"] = float(torch.nanmean(chamfer))
         metrics["part_accuracy"] = float(part_accuracy(chamfer, pa_threshold))
     return metrics

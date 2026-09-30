@@ -303,3 +303,40 @@ fix: two draws are 100.8 deg apart on average, not 126.5); harmless where a test
 needs *a* rotation, so it is left alone, and the chance test uses the data
 pipeline's sampler instead.
 
+
+## 10. The benchmark's 2-20 pieces (Sept 2026)
+
+GARF trains and reports on break patterns of 2 to 20 pieces (section 4.5:
+"only been trained on data with 2-20 fragments"; supplementary C.5); Breaking
+Bad ships up to 100. v5 had a lower bound only (`min_fragments: 2`, checked
+after a scene was loaded), so its numbers were on a harder mix than GARF's.
+
+**What changed.**
+
+- `max_fragments` (config, flag, every YAML; 0 = no limit, the default):
+  `vngat.data.catalog.limit_fragments` keeps the patterns of `min_fragments`
+  to `max_fragments` pieces and drops objects left with none. The count comes
+  from each pattern's `compressed_fracture.npy` (`piece_count`, cached, read on
+  16 threads) -- an upper bound on what the loader builds, since a label with
+  no triangles is dropped. An unreadable label file is kept for the loader to
+  report. The load-time check now also rejects a scene above the limit.
+- Filtered in the catalogue, not after loading, for two reasons: a rejected
+  draw costs a full decompression every time (the many-piece patterns are the
+  slowest), and the fixed validation set replaces a rejected pattern with the
+  object's next, up to 8, and then stops the run.
+- Order: after the split (a pattern never moves between train and validation)
+  and before `max_scenes` (`bounded_subset`, split out of `split_objects`
+  unchanged), which then counts objects that still have a pattern.
+- `dataset_kwargs` carries it, so training, validation, `evaluate.py` and the
+  scripts agree. Restored on resume (`_RESTORED_FIELDS`); a resume onto a
+  different limit resets the best-so-far (`_fragment_limit_changed`; a
+  checkpoint without the key used every pattern).
+- `scripts/evaluate.py --max_fragments N` overrides the checkpoint's value and
+  records both bounds in `--out`. The banner and the evaluation header print
+  the range and what each split kept.
+
+**Verified.** 252 passed, 3 skipped (238 before; `tests/test_fragment_limit.py`,
+14 tests). Mutation checks -- limit applied after the subset, lower bound
+ignored, changed limit not resetting best, the evaluate flag ignored, the limit
+missing from `dataset_kwargs` or from the restored fields, an unreadable label
+file dropped -- each fails at least one test. `check_version`: 78 markers.

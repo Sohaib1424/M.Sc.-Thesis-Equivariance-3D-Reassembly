@@ -23,6 +23,7 @@ normalize_mode: scene             # 'scene' | 'fragment' | 'none'
 correspondence: true
 correspondence_tol: 1.0e-05
 min_fragments: 2
+max_fragments: 0                  # 0 = no limit; 20 = the benchmark's 2-20 pieces (GARF)
 
 # ---- model ----
 hidden_channels: 64

@@ -170,6 +170,17 @@ MARKERS = [
      "vngat/training/trainer.py", 'stored = dict(stored, rotation_target=LEGACY_ROTATION_TARGET)'),
     ("evaluation measured from the anchor",
      "scripts/evaluate.py", "t_gt = target.frag_centroid - target.frag_centroid[anchor]"),
+    # --- the benchmark's 2-20 pieces (Sept 2026) -----------------------------
+    ("--max_fragments (0 = no limit)",
+     "vngat/config.py", "max_fragments: int = 0"),
+    ("pieces counted from the label file, not by loading",
+     "vngat/data/catalog.py", "def piece_count(scene_dir: str, mode: str) -> int:"),
+    ("the limit applied after the split, before the subset",
+     "vngat/data/dataset.py", "objects, self.fragment_limit = limit_fragments("),
+    ("a resume onto another limit resets the best-so-far",
+     "vngat/training/trainer.py", "if _fragment_limit_changed(stored_cfg, cfg):"),
+    ("evaluate.py --max_fragments overrides the checkpoint",
+     "scripts/evaluate.py", "cfg.max_fragments = args.max_fragments"),
 ]
 
 

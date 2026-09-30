@@ -17,6 +17,10 @@ and rotations on every run -- so two checkpoints evaluated with the same
 arguments are compared on identical inputs. `--num_scenes 0` means one break
 pattern per object in the split.
 
+THE FRAGMENT RANGE. The checkpoint's own `max_fragments` applies unless
+`--max_fragments` is given: `--max_fragments 20` scores any checkpoint on the
+benchmark's 2-20 pieces, `--max_fragments 0` on every pattern.
+
 Rotation metrics need only the network. RMSE(T), Chamfer and Part Accuracy
 need a full assembly, so they are produced by running the classical
 translation solver on top of the predicted rotations, in WORLD units (the
@@ -97,6 +101,14 @@ def evaluate(args) -> dict:
     model, cfg, state = load_model(args.checkpoint, device)
     if args.root_dir:
         cfg.root_dir = args.root_dir
+    if args.max_fragments is not None:
+        # Scoring on a different range than the model trained on is a fair
+        # question -- how does a model trained on everything do on the
+        # benchmark's 2-20? -- so the flag overrides the checkpoint's value.
+        if args.max_fragments < 0 or 0 < args.max_fragments < cfg.min_fragments:
+            raise SystemExit(f"--max_fragments must be 0 (no limit) or at least "
+                             f"min_fragments ({cfg.min_fragments})")
+        cfg.max_fragments = args.max_fragments
 
     monitor = cfg.checkpoint_monitor
     trained_on = (state.get("config") or {}).get("rotation_target", "absolute")
@@ -110,6 +122,11 @@ def evaluate(args) -> dict:
     write(f"data: {args.split} split ({cfg.split_source}, split_by={cfg.split_by}) -- "
           f"{len(dataset)} scenes from {dataset.num_objects} objects, "
           f"normalize={cfg.normalize_mode}, input={cfg.input_source}")
+    limit = dataset.fragment_limit
+    write(f"fragments: {cfg.min_fragments}-{cfg.max_fragments} pieces per scene, keeping "
+          f"{limit.describe()}" if limit else
+          f"fragments: {cfg.min_fragments}+ pieces per scene, no upper limit "
+          f"(--max_fragments 20 for the benchmark's 2-20)")
     if cfg.split_by == "fracture":
         write("!! split_by=fracture: these are held-out BREAK PATTERNS of objects seen in "
               "training -- not comparable to object-split (benchmark) numbers.")
@@ -234,7 +251,8 @@ def evaluate(args) -> dict:
         with open(args.out, "w") as fh:
             json.dump({"summary": summary, "by_category": by_category,
                        "per_scene": per_scene, "checkpoint": args.checkpoint,
-                       "split": args.split}, fh, indent=2)
+                       "split": args.split, "min_fragments": cfg.min_fragments,
+                       "max_fragments": cfg.max_fragments}, fh, indent=2)
         write(f"\nwrote {args.out}")
     return summary
 
@@ -249,6 +267,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "release has no test split.")
     p.add_argument("--num_scenes", type=int, default=0,
                    help="0 = one break pattern per object in the split.")
+    p.add_argument("--max_fragments", type=int, default=None,
+                   help="Score only break patterns of up to this many pieces: 20 = the "
+                        "benchmark's 2-20, 0 = every pattern. Default: the checkpoint's own "
+                        "setting.")
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--pa_threshold", type=float, default=0.01)

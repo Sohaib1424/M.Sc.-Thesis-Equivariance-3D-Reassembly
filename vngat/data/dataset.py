@@ -34,6 +34,10 @@ length, `steps_per_epoch * batch_size`.
 A FIXED item list (`fixed=True`, the default for validation) instead maps
 index i to the same (object, break pattern, rotations) every epoch, so
 validation numbers from different epochs measure the same thing.
+
+With `max_fragments` set, the catalogue holds only the break patterns of
+`min_fragments` to `max_fragments` pieces (`vngat.data.catalog.limit_fragments`),
+so both kinds of item are drawn from those alone.
 """
 from __future__ import annotations
 
@@ -45,7 +49,9 @@ import torch
 from torch.utils.data import Dataset
 
 from ..utils.progress import write
-from .catalog import build_catalog, fixed_items, object_weights, split_objects
+from .catalog import (
+    bounded_subset, build_catalog, fixed_items, limit_fragments, object_weights, split_objects,
+)
 from .correspondence import compute_scene_correspondence
 from .features import get_features
 from .graph import SceneBatch, collate_scenes, merge_fragments, split_scenes
@@ -78,6 +84,7 @@ class BreakingBadDataset(Dataset):
         correspondence_tol: float = 1e-5,
         nominal_length: int = 10_000,
         min_fragments: int = 2,
+        max_fragments: int = 0,
         max_retries: int = 8,
         keep_meshes: bool = False,
     ) -> None:
@@ -92,16 +99,28 @@ class BreakingBadDataset(Dataset):
         self.correspondence_tol = correspondence_tol
         self.nominal_length = nominal_length
         self.min_fragments = min_fragments
+        self.max_fragments = max_fragments
         self.max_retries = max_retries
         self.keep_meshes = keep_meshes
         self.fixed = fixed
 
         catalog = build_catalog(root_dir, subsets, fracture_pattern)
-        self.objects = split_objects(
+        objects = split_objects(
             catalog, split, root=root_dir, split_by=split_by, split_source=split_source,
             fracture_pool=fracture_pool, val_frac=val_frac, test_frac=test_frac,
-            seed=split_seed, max_objects=max_objects,
+            seed=split_seed,
         )
+        # The fragment limit comes AFTER the split, so it only ever removes
+        # break patterns -- none moves between train and validation because of
+        # it -- and BEFORE the subset, so `max_objects` counts objects that
+        # still have a pattern to draw.
+        objects, self.fragment_limit = limit_fragments(objects, min_fragments, max_fragments)
+        if not objects:
+            raise ValueError(
+                f"split={split!r} has no break pattern of {min_fragments} to {max_fragments} "
+                f"pieces. Raise --max_fragments, or set it to 0 for no limit."
+            )
+        self.objects = bounded_subset(objects, max_objects)
         self.weights = object_weights(self.objects, balance, balance_temperature)
         self._probs = (None if self.weights is None
                        else np.asarray(self.weights, dtype=np.float64) / float(sum(self.weights)))
@@ -152,9 +171,10 @@ class BreakingBadDataset(Dataset):
         """
         The same scene and the same rotations for index `idx`, every time.
 
-        Should that pattern be unusable (it fails to load, or has fewer than
-        `min_fragments` pieces), the object's other patterns are tried in a
-        fixed order -- so the substitute is deterministic too.
+        Should that pattern be unusable (it fails to load, or its piece count
+        is outside `min_fragments`..`max_fragments`), the object's other
+        patterns are tried in a fixed order -- so the substitute is
+        deterministic too.
         """
         obj_index, scene_dir, mode = self.items[idx]
         entry = self.objects[obj_index]
@@ -177,7 +197,10 @@ class BreakingBadDataset(Dataset):
                       rng: Optional[np.random.Generator]) -> Optional[Dict]:
         t0 = time.perf_counter()
         meshes = load_scene(str(scene_dir), mode)
-        if len(meshes) < self.min_fragments:
+        # The catalogue has already dropped patterns above `max_fragments`;
+        # this checks the loaded count, which can only be lower than the
+        # labelled one, so it holds even for a pattern the count could not read.
+        if len(meshes) < self.min_fragments or 0 < self.max_fragments < len(meshes):
             return None
         target_graph, input_graph, info = build_graphs(
             meshes, normalize_mode=self.normalize_mode, input_source=self.input_source,
@@ -369,4 +392,5 @@ def dataset_kwargs(cfg) -> Dict:
         with_correspondence=cfg.correspondence,
         correspondence_tol=cfg.correspondence_tol,
         min_fragments=cfg.min_fragments,
+        max_fragments=cfg.max_fragments,
     )

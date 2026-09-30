@@ -1,6 +1,6 @@
 from .catalog import (
-    ObjectEntry, build_catalog, effective_sample_size, fixed_items, object_weights,
-    partition_modes, split_objects,
+    FragmentLimit, ObjectEntry, build_catalog, effective_sample_size, fixed_items,
+    limit_fragments, object_weights, partition_modes, piece_count, split_objects,
 )
 from .correspondence import cluster_shared_points, compute_scene_correspondence
 from .dataset import BreakingBadDataset, collate_fn, merge_micro_batches, split_batch_by_scene
@@ -24,6 +24,6 @@ __all__ = [
     "extract_fractures", "extract_shell", "find_neighbors",
     "compute_scene_correspondence", "cluster_shared_points",
     "ObjectEntry", "build_catalog", "split_objects", "partition_modes", "object_weights",
-    "effective_sample_size", "fixed_items",
+    "effective_sample_size", "fixed_items", "FragmentLimit", "limit_fragments", "piece_count",
     "list_scene_directories", "assign_split", "load_official_split", "read_official_entries",
 ]

@@ -211,6 +211,30 @@ included, the catalogue groups each shape's copies into ONE object with the
 union of their break patterns, so nothing is double-counted and one shape can
 never sit in two splits.
 
+### The benchmark's 2-20 pieces
+
+Breaking Bad's break patterns run from 2 to 100 pieces (GARF, Table 1). GARF
+trains and reports on those of 2 to 20 (section 4.5: "only been trained on data
+with 2-20 fragments"; supplementary C.5 calls it the common setting), so a
+number is comparable with its tables only from a run on the same range:
+
+```bash
+python -m scripts.train --config configs/kaggle_2xt4_full.yaml --max_fragments 20
+python -m scripts.evaluate --checkpoint checkpoints/best.pt --split val --max_fragments 20
+```
+
+* `max_fragments: 0` (the default) is no limit: every pattern, as before.
+* The limit filters the list of break patterns when the run starts, reading
+  each one's piece count from its `compressed_fracture.npy` -- one small file,
+  not a decompression. Objects left with no pattern drop out, and the banner
+  prints what each split kept.
+* Applied after the split, so no pattern moves between train and validation,
+  and before `max_scenes`, which then counts objects that still have one.
+* Restored on resume. A resume onto a different limit validates on different
+  scenes, so the best-so-far is reset -- better to start a fresh run.
+* `scripts.evaluate --max_fragments N` overrides the checkpoint's own value:
+  an existing model can be scored on 2-20 without retraining.
+
 ## The largest fragment as the anchor
 
 `R_gt` is each fragment's rotation back into the frame its object is *stored*

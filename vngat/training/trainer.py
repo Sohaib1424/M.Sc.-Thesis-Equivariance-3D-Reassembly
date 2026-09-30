@@ -241,7 +241,7 @@ _RESTORED_FIELDS = (
     # `normalize_mode` changes the units the network was trained in.
     "data_subsets", "split_source", "split_by", "fracture_pool", "val_frac",
     "test_frac", "split_seed", "max_scenes", "fracture_pattern", "input_source",
-    "correspondence", "correspondence_tol", "min_fragments", "balance",
+    "correspondence", "correspondence_tol", "min_fragments", "max_fragments", "balance",
     "balance_temperature", "normalize_mode", "val_fixed", "val_scenes",
     # --- what an "epoch" means -------------------------------------------
     # The schedule is indexed in epochs, so changing these mid-run rescales the
@@ -273,6 +273,15 @@ LEGACY_ROTATION_TARGET = "absolute"
 
 # Monitorable values that mean the same thing whatever the rotation target.
 _PROTOCOL_MONITORS = ("anchor_deg", "absolute_deg", "tilt", "twist")
+
+
+def _fragment_limit_changed(stored_cfg: Dict, cfg: Config) -> bool:
+    """
+    Whether validation is a different set of scenes from the one the
+    checkpoint's best was measured on, because `max_fragments` differs. A
+    checkpoint from before the setting existed used every break pattern.
+    """
+    return int(stored_cfg.get("max_fragments") or 0) != cfg.max_fragments
 
 
 def _monitor_changed_meaning(monitor: str, stored_target: str, target: str,
@@ -942,6 +951,21 @@ def _wrap_ddp(model, device: torch.device, rank: int, sync_buffers: bool):
     return DDP(model, broadcast_buffers=sync_buffers, **kwargs)
 
 
+def _fragment_lines(cfg: Config, train_set: BreakingBadDataset,
+                    val_set: BreakingBadDataset) -> List[str]:
+    """The pieces-per-scene range, and what the limit removed from each split."""
+    if cfg.max_fragments <= 0:
+        return [f"  fragments     {cfg.min_fragments}+ pieces per scene, no upper limit "
+                f"(--max_fragments 20 is the benchmark's 2-20)"]
+    train, val = train_set.fragment_limit, val_set.fragment_limit
+    return [
+        f"  fragments     {cfg.min_fragments}-{cfg.max_fragments} pieces per scene "
+        f"(counted in {train.seconds + val.seconds:.1f} s)",
+        f"                train keeps {train.describe()}",
+        f"                val   keeps {val.describe()}",
+    ]
+
+
 def _data_banner(cfg: Config, train_set: BreakingBadDataset, val_set: BreakingBadDataset,
                  world_size: int) -> List[str]:
     """What the run is trained and judged on, as numbers rather than flags."""
@@ -952,6 +976,7 @@ def _data_banner(cfg: Config, train_set: BreakingBadDataset, val_set: BreakingBa
         f"| input={cfg.input_source}",
     ]
     lines += describe(train_set.objects, train_set.weights, cfg.balance, cfg.balance_temperature)
+    lines += _fragment_lines(cfg, train_set, val_set)
     if cfg.val_fixed:
         lines.append(f"  val           FIXED: {len(val_set)} scenes from {val_set.num_objects} "
                      f"objects, same rotations every epoch, sharded over {world_size} rank(s)")
@@ -1105,6 +1130,15 @@ def run_worker(rank: int, world_size: int, cfg: Config) -> None:
                 write(f"  [ckpt] val {cfg.checkpoint_monitor} is not measured the way the "
                       f"checkpoint's best was (rotation target {stored_target} -> "
                       f"{cfg.rotation_target}); the best-so-far is reset")
+        if _fragment_limit_changed(stored_cfg, cfg):
+            # A different limit is a different validation set: the best-so-far
+            # was measured on other scenes, so comparing against it keeps or
+            # discards best.pt for no reason.
+            manager.best_val = float("inf")
+            if is_main:
+                was = int(stored_cfg.get("max_fragments") or 0)
+                write(f"  [ckpt] max_fragments {was or 'none'} -> {cfg.max_fragments or 'none'}: "
+                      f"validation is a different set of scenes, so the best-so-far is reset")
         history = History.from_dict(state.get("history") or {})
         history.truncate_to(start_epoch)
         # The checkpoint's RNG state is RANK 0's, and every rank just restored

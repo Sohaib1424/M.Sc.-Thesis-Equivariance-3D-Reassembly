@@ -23,17 +23,25 @@ answers the three questions that decide what a number MEANS:
   -- 17 bottles against 5 cups in Everyday -- so a bottle-shaped prior is the
   cheapest thing to learn. `object_weights` can correct for that, and is off by
   default so the old behaviour is one setting away.
+
+* HOW MANY PIECES A SCENE MAY HAVE. Breaking Bad's break patterns run from 2
+  to ~100 pieces; the benchmark uses those of 2 to 20. `limit_fragments` keeps
+  only the patterns in a given range, and is off by default.
 """
 from __future__ import annotations
 
 import hashlib
 import os
 import random
+import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 from .splits import assign_split, list_scene_directories, read_official_entries
 
@@ -333,17 +341,123 @@ def split_objects(
                 chosen.append(ObjectEntry(entry.key, entry.subset, entry.category,
                                           entry.category_dir, entry.name, tuple(modes)))
 
-    if max_objects and max_objects > 0:
-        # Deterministic bounded subset, keyed on the name exactly as the previous
-        # `max_scenes` was, so the same objects are kept.
-        chosen = sorted(chosen, key=lambda e: hashlib.md5(f"sub:{e.name}".encode()).hexdigest())
-        chosen = sorted(chosen[:max_objects], key=lambda e: e.key)
+    chosen = bounded_subset(chosen, max_objects)
     if not chosen:
         raise ValueError(
             f"split={split!r} is empty (split_by={split_by!r}, split_source={split_source!r}, "
             f"val_frac={val_frac}, test_frac={test_frac}, split_seed={seed})."
         )
     return tuple(chosen)
+
+
+def bounded_subset(objects: Sequence[ObjectEntry], max_objects: int = 0) -> Tuple[ObjectEntry, ...]:
+    """
+    A deterministic subset of `max_objects` objects; all of them when <= 0.
+    Keyed on the name exactly as the previous `max_scenes` was, so the same
+    objects are kept.
+    """
+    chosen = list(objects)
+    if max_objects and max_objects > 0:
+        chosen = sorted(chosen, key=lambda e: hashlib.md5(f"sub:{e.name}".encode()).hexdigest())
+        chosen = sorted(chosen[:max_objects], key=lambda e: e.key)
+    return tuple(chosen)
+
+
+# ---------------------------------------------------------------------------
+# Pieces per break pattern
+# ---------------------------------------------------------------------------
+FRACTURE_LABELS = "compressed_fracture.npy"
+
+
+@lru_cache(maxsize=None)
+def piece_count(scene_dir: str, mode: str) -> int:
+    """
+    Pieces in one break pattern, read from its label file alone.
+
+    `compressed_fracture.npy` holds a piece label per cell, and `load_scene`
+    builds one mesh per label 0..max -- so this is one small file read rather
+    than a decompression, cheap enough to count a whole split at start-up. A
+    label left with no triangles is dropped by the loader, so the loaded count
+    can be lower than this, never higher. Cached, so the training set, the
+    validation set and every rebuild read each file once.
+    """
+    labels = np.load(os.path.join(scene_dir, mode, FRACTURE_LABELS))
+    return int(labels.max()) + 1 if labels.size else 0
+
+
+@dataclass(frozen=True)
+class FragmentLimit:
+    """What `limit_fragments` kept of one split, for the start-up banner."""
+
+    min_fragments: int
+    max_fragments: int
+    patterns: int              # break patterns before the limit
+    patterns_kept: int
+    objects: int
+    objects_kept: int
+    unreadable: int            # label files that could not be read -- kept
+    seconds: float
+
+    def describe(self) -> str:
+        text = (f"{self.patterns_kept:,} of {self.patterns:,} break patterns "
+                f"({self.objects_kept:,} of {self.objects:,} objects)")
+        if self.unreadable:
+            text += (f", {self.unreadable} with an unreadable label file "
+                     f"kept for the loader to report")
+        return text
+
+
+def limit_fragments(objects: Sequence[ObjectEntry], min_fragments: int = 2,
+                    max_fragments: int = 0, workers: int = 16,
+                    ) -> Tuple[Tuple[ObjectEntry, ...], Optional[FragmentLimit]]:
+    """
+    `(objects, report)`: only the break patterns of `min_fragments` to
+    `max_fragments` pieces, and only the objects left with at least one.
+
+    `max_fragments <= 0` is no limit: the objects come back as they are and the
+    report is None, so a run without the limit is exactly what it was.
+
+    Why here rather than where `min_fragments` is checked, after a scene is
+    loaded: a pattern rejected after loading costs a full decompression every
+    time it is drawn (and the many-piece patterns are the slowest to load),
+    and the fixed validation set replaces a rejected pattern with the object's
+    next one, up to `max_retries` of them, before stopping the run. Filtered
+    here, both only ever see patterns they can use.
+
+    A pattern whose label file cannot be read is kept: the loader reads the
+    same file, and reports the failure the way it always has.
+    """
+    objects = tuple(objects)
+    if max_fragments <= 0:
+        return objects, None
+    started = time.perf_counter()
+    pairs = [pair for entry in objects for pair in entry.modes]
+
+    def count(pair: Tuple[str, str]) -> Optional[int]:
+        try:
+            return piece_count(*pair)
+        except Exception:  # noqa: BLE001 - the loader reports it when drawn
+            return None
+
+    # One small file per pattern, thousands per split: bound by the
+    # filesystem's latency rather than by CPU, so threads overlap the waits.
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(pairs)))) as pool:
+        counts = dict(zip(pairs, pool.map(count, pairs)))
+    kept = []
+    for entry in objects:
+        modes = tuple(pair for pair in entry.modes
+                      if counts[pair] is None
+                      or min_fragments <= counts[pair] <= max_fragments)
+        if modes:
+            kept.append(replace(entry, modes=modes))
+    report = FragmentLimit(
+        min_fragments=min_fragments, max_fragments=max_fragments,
+        patterns=len(pairs), patterns_kept=sum(len(entry) for entry in kept),
+        objects=len(objects), objects_kept=len(kept),
+        unreadable=sum(value is None for value in counts.values()),
+        seconds=time.perf_counter() - started,
+    )
+    return tuple(kept), report
 
 
 def fracture_split_report(objects: Sequence[ObjectEntry], val_frac: float = 0.1,
@@ -491,9 +605,9 @@ def fixed_items(objects: Sequence[ObjectEntry], count: int = 0,
 
 
 __all__ = [
-    "BALANCE_SCHEMES", "FRACTURE_POOLS", "SPLIT_BY", "ObjectEntry",
-    "base_subset", "build_catalog", "category_shares", "describe",
-    "effective_sample_size", "fixed_items", "fracture_split_report",
-    "object_splits", "object_weights", "official_assignment",
-    "partition_modes", "split_objects",
+    "BALANCE_SCHEMES", "FRACTURE_LABELS", "FRACTURE_POOLS", "SPLIT_BY", "FragmentLimit",
+    "ObjectEntry", "base_subset", "bounded_subset", "build_catalog", "category_shares",
+    "describe", "effective_sample_size", "fixed_items", "fracture_split_report",
+    "limit_fragments", "object_splits", "object_weights", "official_assignment",
+    "partition_modes", "piece_count", "split_objects",
 ]

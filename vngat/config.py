@@ -91,6 +91,13 @@ class Config:
     correspondence: bool = True
     correspondence_tol: float = 1e-5
     min_fragments: int = 2
+    max_fragments: int = 0
+    """Largest break pattern the run uses, in pieces. 0 = no limit: every
+    pattern Breaking Bad ships, up to ~100 pieces. 20 is the benchmark's
+    setting -- GARF trains and reports on patterns of 2 to 20 pieces -- so a
+    number is comparable with its tables only from a run with 20 here. Applied
+    to the list of break patterns when the run starts, for training,
+    validation and evaluation alike (`vngat.data.catalog.limit_fragments`)."""
 
     # ---------------- model ----------------
     hidden_channels: int = 64
@@ -326,6 +333,11 @@ class Config:
                 raise ValueError(f"{name} must be one of {MONITORABLE}, got {getattr(self, name)!r}")
         if self.val_scenes < 0:
             raise ValueError("val_scenes must be >= 0 (0 = one per validation object)")
+        if self.max_fragments < 0:
+            raise ValueError("max_fragments must be >= 0 (0 = no limit)")
+        if 0 < self.max_fragments < self.min_fragments:
+            raise ValueError(f"max_fragments ({self.max_fragments}) must be at least "
+                             f"min_fragments ({self.min_fragments}), or 0 for no limit")
         if self.norm not in ("layer", "batch", "none"):
             raise ValueError(f"norm must be 'layer', 'batch' or 'none', got {self.norm!r}")
         if self.micro_batch_scenes < 1:

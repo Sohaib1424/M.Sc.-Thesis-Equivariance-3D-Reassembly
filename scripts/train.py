@@ -6,6 +6,7 @@ Train, resume, or evaluate the V-GAT reassembly model.
     python -m scripts.train --root_dir ... --evaluate          # score best.pt, assembled
     python -m scripts.train --root_dir ... --num_gpus 2        # both GPUs (the default: all)
     python -m scripts.train --root_dir ... --num_gpus 1        # one GPU
+    python -m scripts.train --root_dir ... --max_fragments 20  # the benchmark's 2-20 pieces
 
 The flags are Thesis 1's wherever the two projects share a setting, with
 Thesis 1's meaning (``scripts/config_flags.py`` lists the conversions):
@@ -142,9 +143,14 @@ def main() -> None:
     if args.preflight:
         raise SystemExit(0 if preflight(config) else 1)
     if args.evaluate:
+        # The rest of the data definition stays the checkpoint's unless
+        # --data_from_flags, but an explicit --max_fragments wins: how a model
+        # does on the benchmark's 2-20 pieces is a fair question whatever range
+        # it was trained on.
+        override = ("max_fragments",) if args.max_fragments is not None else ()
         evaluate(config, checkpoint=args.checkpoint, split=args.split,
                  assemble=args.assemble, collision=args.collision,
-                 data_from_checkpoint=not args.data_from_flags)
+                 data_from_checkpoint=not args.data_from_flags, override=override)
     else:
         train(config)
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterator, List, Optional, Sequence
 
@@ -167,6 +168,22 @@ class SceneReader:
         """
         for mode in (self.mode_names() if modes is None else modes):
             yield self.load_mode(mode)
+
+
+@lru_cache(maxsize=None)
+def piece_count(scene_dir: str | Path, mode: str) -> int:
+    """
+    Pieces in one fracture mode, read from its label file alone.
+
+    One small ``compressed_fracture.npy`` instead of the intact mesh, the cell
+    matrix and a decompression -- cheap enough to count a whole split when a
+    run starts. :meth:`SceneReader.load_mode` builds one fragment per label up
+    to the maximum and drops those that come out empty, so its count can be
+    lower than this, never higher. Cached: the training set is rebuilt every
+    epoch, and each file is read once per process.
+    """
+    labels = np.load(Path(scene_dir) / mode / FRACTURE_FILE)
+    return int(labels.max()) + 1 if labels.size else 0
 
 
 def load_scene(scene_dir: str | Path, mode: Optional[str] = None,

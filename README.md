@@ -389,6 +389,31 @@ fresh `--checkpoint_dir`. It fits more slowly — measured on the six-scene
 memorisation test, 19–30° after 80 epochs against 23–36° after 45 for the
 absolute target — because its targets move with the anchor's own prediction.
 
+### The benchmark's 2–20 pieces
+
+Breaking Bad's break patterns run from 2 to 100 pieces (median 3, mean 8,
+largest 99 in this dataset). GARF trains and reports on those of 2 to 20
+(section 4.5: "only been trained on data with 2-20 fragments"; supplementary
+C.5 calls it the common setting), so a number is comparable with its tables
+only from a run on the same range:
+
+```bash
+python -m scripts.train --root_dir data --max_fragments 20
+python -m scripts.train --root_dir data --evaluate --checkpoint path/to/best.pt --split val --max_fragments 20
+```
+
+* Off by default (`--max_fragments 0`): every pattern, as before.
+* The limit filters the catalogue when the run starts, reading each pattern's
+  piece count from its `compressed_fracture.npy` — one small file, not a
+  decompression (`reassembly/data/catalog.py:limit_fragments`). Objects left
+  with no pattern drop out; the banner prints what each split kept.
+* After the split, so no pattern moves between train and val; before
+  `--max_objects`, which then counts objects that still have one.
+* A data setting: resuming onto a different limit is announced and resets the
+  best-so-far, because validation is then a different set of scenes — start a
+  fresh run instead. With `--evaluate`, an explicit `--max_fragments` wins over
+  the checkpoint's value, so any model can be scored on 2–20 without retraining.
+
 ### One GPU, two, or more
 
 `--num_gpus` picks them: `-1` (the default) every visible GPU, `1` one, `N` the

@@ -135,6 +135,17 @@ MARKERS = [
      'LEGACY_ROTATION_TARGET = "absolute"'),
     ("stage two measured from the anchor", "src/reassembly/assembly/scoring.py",
      "t_true = centroid - centroid[reference]"),
+    # -- Thesis v6: the benchmark's 2-20 pieces ---------------------------------
+    ("--max_fragments (0 = no limit)", "src/reassembly/training.py",
+     "max_fragments: Optional[int] = None"),
+    ("pieces counted from the label file, not by loading", "src/reassembly/data/scene.py",
+     "def piece_count(scene_dir: str | Path, mode: str) -> int:"),
+    ("the limit applied after the split, before max_objects", "src/reassembly/training.py",
+     "self.catalog, self.fragment_limit = limit_fragments("),
+    ("a resume onto another limit resets the best-so-far", "src/reassembly/training.py",
+     'if _fragment_limit_changed(state.get("config") or {}, config):'),
+    ("--evaluate --max_fragments overrides the checkpoint", "scripts/train.py",
+     'override = ("max_fragments",) if args.max_fragments is not None else ()'),
 ]
 
 

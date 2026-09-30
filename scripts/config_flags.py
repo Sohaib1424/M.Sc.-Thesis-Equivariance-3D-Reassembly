@@ -79,6 +79,9 @@ HELP = {
     "limit_train": "use only this many training scenes, strided across the "
                    "split; 0 = all",
     "modes_per_scene": "break patterns drawn per object per epoch; 0 = all",
+    "max_fragments": "only break patterns of 2 to this many pieces, for "
+                     "training, validation and --evaluate; 20 = the "
+                     "benchmark's 2-20 (GARF); 0 = no limit",
 }
 
 # Config fields that only the converted flags below set.
@@ -136,6 +139,10 @@ class _Refused(argparse.Action):
                      f"here: {self.reason}.")
 
 
+# Integer settings whose default is None, "no limit" -- 0 on the command line.
+_OPTIONAL_INTS = ("modes_per_scene", "limit_train", "max_objects", "max_fragments")
+
+
 def add_config_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add the Config flags to ``parser``, under their Thesis 1 names."""
     default = Config()
@@ -160,7 +167,7 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         elif name in CHOICES:
             parser.add_argument(option, dest=name, choices=CHOICES[name], default=None,
                                 help=(text + "; " if text else "") + f"default {current}")
-        elif name in ("modes_per_scene", "limit_train", "max_objects") or isinstance(current, int):
+        elif name in _OPTIONAL_INTS or isinstance(current, int):
             parser.add_argument(option, dest=name, type=int, default=None, metavar=metavar,
                                 help=(text + "; " if text else "") + f"default {current}")
         elif isinstance(current, float):
@@ -212,7 +219,7 @@ def config_from_args(args: argparse.Namespace, **forced) -> Config:
         overrides["subsets"] = [p for p in parts if p] or None
     if overrides.get("mode_filter") == "":
         overrides["mode_filter"] = None
-    for name in ("modes_per_scene", "limit_train", "max_objects"):
+    for name in _OPTIONAL_INTS:
         if overrides.get(name) == 0:
             overrides[name] = None                 # 0 = no limit
 

@@ -71,6 +71,10 @@ ROTATION_TARGETS = ("anchor", "absolute")
 # that happens to be something else.
 LEGACY_ROTATION_TARGET = "absolute"
 
+# A single-fragment pattern has no relative pose to learn, so the smallest
+# scene is two fragments -- with or without `max_fragments`.
+MIN_FRAGMENTS = 2
+
 
 @dataclass
 class Config:
@@ -90,6 +94,15 @@ class Config:
     standard break patterns and excludes the ``mode_*`` variants, so results
     stay comparable with the benchmark. ``None`` (``--fracture_pattern ""``)
     keeps every mode.
+    """
+    max_fragments: Optional[int] = None
+    """
+    Largest break pattern the run uses, in pieces; ``None`` (``0`` on the
+    command line) is no limit -- every pattern, up to ~100 pieces. ``20`` is the
+    benchmark's setting: GARF trains and reports on patterns of 2 to 20 pieces,
+    so a number is comparable with its tables only from a run with 20 here.
+    Applied to the catalogue when the run starts, for training, validation and
+    ``--evaluate`` alike (:func:`reassembly.data.catalog.limit_fragments`).
     """
     split_by: str = "object"
     """
@@ -406,6 +419,9 @@ class Config:
             raise ValueError("steps_per_epoch must be >= 0 (0 = one full pass)")
         if self.max_objects is not None and self.max_objects < 1:
             raise ValueError("max_objects must be >= 1, or None for every object")
+        if self.max_fragments is not None and self.max_fragments < MIN_FRAGMENTS:
+            raise ValueError(f"max_fragments must be >= {MIN_FRAGMENTS}, or None (0 on "
+                             f"the command line) for no limit")
         if self.accumulate < 1:
             raise ValueError("accumulate must be >= 1")
         if self.split_source not in ("auto", "official", "hash"):
@@ -540,7 +556,7 @@ class BreakingBadScenes:
 
     def __init__(self, config: Config, split: str, epoch_seed: int = 0,
                  cache_size: int = 4):
-        from .data.catalog import Catalog, build_catalog, split_catalog
+        from .data.catalog import Catalog, build_catalog, limit_fragments, split_catalog
         from .data.paths import find_scenes, load_official_split
 
         self.config = config
@@ -582,6 +598,19 @@ class BreakingBadScenes:
         )
         if config.split_by == "object" and split in ("train", "val") and official:
             _assert_splits_disjoint(full, config, official)
+        # The fragment limit comes after the split, so it only ever removes
+        # break patterns -- none moves between train and val because of it --
+        # and before `max_objects`, which then strides over objects that still
+        # have a pattern to draw.
+        self.fragment_limit = None
+        if config.max_fragments is not None:
+            self.catalog, self.fragment_limit = limit_fragments(
+                self.catalog, MIN_FRAGMENTS, config.max_fragments)
+            if not self.catalog.objects:
+                raise FileNotFoundError(
+                    f"no break pattern of {MIN_FRAGMENTS} to {config.max_fragments} "
+                    f"pieces in split {split!r}. Raise --max_fragments, or pass 0 "
+                    f"for no limit.")
         if split == "train" and config.max_objects:
             objects = list(self.catalog.objects)
             if config.max_objects < len(objects):
@@ -734,11 +763,17 @@ class BreakingBadScenes:
         scene_index, _mode = self.items[i]
         key = self.key(i)
         meshes = self.meshes(i)
-        if len(meshes) < 2:
+        if len(meshes) < MIN_FRAGMENTS:
             # A single-fragment mode has no cross-fragment structure and no
             # relative pose to learn from. Returned as a named Skipped rather
             # than None, so the loop can tally which items keep failing.
             return Skipped(key, f"{len(meshes)} fragment(s)")
+        if config.max_fragments is not None and len(meshes) > config.max_fragments:
+            # The catalogue has already dropped these by their label count,
+            # which the loaded count can only be below -- so this holds for a
+            # pattern whose label file could not be read there.
+            return Skipped(key, f"{len(meshes)} fragments, above --max_fragments "
+                                f"{config.max_fragments}")
 
         vertices = [np.asarray(m.vertices, dtype=np.float64) for m in meshes]
         faces = [np.asarray(m.faces) for m in meshes]
@@ -1886,7 +1921,13 @@ _DATA = ("label_method", "sharp_threshold", "tokens_per_scene", "token_mode",
          # disk is identical.
          "split_by", "fracture_pool", "val_frac", "test_frac", "split_seed",
          "mode_filter", "official_subset", "balance", "balance_temperature",
-         "max_objects")
+         "max_objects",
+         # A different limit is a different set of training AND validation
+         # scenes. A resume onto one also resets the best-so-far (`train`).
+         "max_fragments")
+# Data fields added after checkpoints were first written, read as what those
+# runs did: a checkpoint without `max_fragments` used every break pattern.
+_DATA_BEFORE_IT_EXISTED = {"max_fragments": None}
 
 
 def _resume_path(config: Config, default: Path) -> Optional[Path]:
@@ -1948,6 +1989,7 @@ def _check_resume_compatible(config: Config, saved: Dict, announce: bool) -> Non
               f"curve steps here; the metrics do not, they use the anchor "
               f"protocol either way.")
 
+    saved = {**_DATA_BEFORE_IT_EXISTED, **saved}
     changed = [(k, saved.get(k), current.get(k)) for k in _DATA
                if k in saved and _differs(saved[k], current[k])]
     if changed and announce:
@@ -1963,6 +2005,15 @@ def _check_resume_compatible(config: Config, saved: Dict, announce: bool) -> Non
         print(f"[resume] epochs changed {saved['epochs']} -> {config.epochs}: "
               f"the learning-rate curve is recomputed, so the rate will jump "
               f"at this step rather than continuing smoothly.")
+
+
+def _fragment_limit_changed(saved: Dict, config: Config) -> bool:
+    """
+    Whether validation is a different set of scenes from the one the
+    checkpoint's best was measured on, because ``max_fragments`` differs. A
+    checkpoint from before the setting existed used every break pattern.
+    """
+    return {**_DATA_BEFORE_IT_EXISTED, **saved}.get("max_fragments") != config.max_fragments
 
 
 def _differs(a, b) -> bool:
@@ -2352,6 +2403,14 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
                   f"{_hms(elapsed)} trained so far{partial}")
             if history:
                 print(f"  best val geodesic so far: {best:.3f} deg")
+        if _fragment_limit_changed(state.get("config") or {}, config):
+            # A different limit is a different validation set: the best-so-far
+            # was measured on other scenes, so comparing against it would keep
+            # or discard best.pt for no reason.
+            best = float("inf")
+            if main:
+                print("[resume] --max_fragments changed: validation is a different "
+                      "set of scenes, so the best-so-far is reset")
         if main and load_path.resolve() != last_path.resolve():
             # Copy the resume point into *this* run's out_dir straight away.
             # Two failures otherwise break the chain: a session killed during
@@ -2663,6 +2722,20 @@ def _epoch_lines(config, items: int, world: int, per_epoch: int) -> List[str]:
     return lines
 
 
+def _fragment_banner(config: Config, train_set, val_set) -> List[str]:
+    """The pieces-per-scene range, and what the limit removed from each split."""
+    if config.max_fragments is None:
+        return [f"  fragments     {MIN_FRAGMENTS}+ per scene, no upper limit "
+                f"(--max_fragments 20 is the benchmark's 2-20)"]
+    train, val = train_set.fragment_limit, val_set.fragment_limit
+    return [
+        f"  fragments     {MIN_FRAGMENTS}-{config.max_fragments} per scene "
+        f"(counted in {train.seconds + val.seconds:.1f} s)",
+        f"                train keeps {train.describe()}",
+        f"                val   keeps {val.describe()}",
+    ]
+
+
 def _banner(config, train_set, val_set, parameters, device, world, per_epoch) -> str:
     lines = [
         "=" * 74,
@@ -2675,6 +2748,7 @@ def _banner(config, train_set, val_set, parameters, device, world, per_epoch) ->
         f"  objects       {len(train_set.scenes)} train / {len(val_set.scenes)} val"
         + ("  (official split)" if train_set.official else "  (hashed split)"),
         f"  samples       {len(train_set)} train / {len(val_set)} val",
+        *_fragment_banner(config, train_set, val_set),
         *_epoch_lines(config, len(train_set), world, per_epoch),
         *_split_banner(config, train_set, val_set),
         *_balance_banner(config, train_set),
@@ -2753,7 +2827,8 @@ def _final_report(history: List[dict]) -> None:
 def evaluate(config: Config, checkpoint: str = "best.pt",
              split: str = "test", assemble: bool = True,
              collision: bool = False,
-             data_from_checkpoint: bool = True) -> Dict[str, float]:
+             data_from_checkpoint: bool = True,
+             override: Sequence[str] = ()) -> Dict[str, float]:
     """
     Score a saved checkpoint on a held-out split: rotation, and -- with
     ``assemble`` -- the full assembly the benchmark scores.
@@ -2769,7 +2844,9 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     normalisation it was trained with, whatever the flags say, and every
     setting that differed is printed. ``data_from_checkpoint=False`` keeps the
     flags' data settings (to score a fracture-split model on the object split,
-    say); the architecture is always the checkpoint's.
+    say); the architecture is always the checkpoint's. ``override`` names data
+    settings whose flag value wins even so -- ``("max_fragments",)`` scores any
+    checkpoint on the benchmark's 2-20 pieces.
 
     Single-device on purpose: an evaluation that shards across GPUs has to
     gather predictions to be correct, and getting that subtly wrong produces a
@@ -2781,7 +2858,8 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model, config, state, path = load_checkpoint(
-        checkpoint, config, device, data_from_checkpoint=data_from_checkpoint)
+        checkpoint, config, device, data_from_checkpoint=data_from_checkpoint,
+        override=override)
 
     dataset = BreakingBadScenes(config, split, epoch_seed=0)
     loader = _loader(dataset, config, False, 0, 1, 0,
@@ -2800,6 +2878,7 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
 
     print(f"\n{split} ({len(dataset)} samples, checkpoint {path.name} from epoch "
           f"{state['epoch'] + 1})")
+    print(_fragment_line(config, dataset))
     print(f"  loss on the {config.rotation_target!r} target, the one this "
           f"checkpoint was trained on:")
     print(f"  {format_losses(summary)}")
@@ -2850,6 +2929,7 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
 
     summary.pop("failures", None)
     summary.pop("most_repaired", None)
+    summary["max_fragments"] = config.max_fragments
     out = Path(config.out_dir) / f"{split}_metrics.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(summary, indent=2, default=str))
@@ -2857,16 +2937,17 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
 
 
 def load_checkpoint(checkpoint, config: Optional[Config] = None, device="cpu",
-                    data_from_checkpoint: bool = True):
+                    data_from_checkpoint: bool = True, override: Sequence[str] = ()):
     """
     ``(model, config, state, path)`` for a saved checkpoint, the model in eval
     mode on ``device``.
 
     ``checkpoint`` is a path, or a file name inside ``config.out_dir``. The
     architecture is always the checkpoint's; the data definition too unless
-    ``data_from_checkpoint=False``. Every setting that differs from ``config``
-    is printed, because a model scored or inspected on data it was not trained
-    for gives a number that looks fine and means something else.
+    ``data_from_checkpoint=False``, or for the data settings named in
+    ``override``. Every setting that differs from ``config`` is printed,
+    because a model scored or inspected on data it was not trained for gives a
+    number that looks fine and means something else.
     """
     import torch
 
@@ -2878,7 +2959,7 @@ def load_checkpoint(checkpoint, config: Optional[Config] = None, device="cpu",
         raise FileNotFoundError(f"no checkpoint at {checkpoint} or {path}")
     state = torch.load(path, map_location=device, weights_only=False)
     config = _adopt_checkpoint_settings(config, state.get("config") or {},
-                                        data=data_from_checkpoint)
+                                        data=data_from_checkpoint, override=override)
     model = build_model(config).to(device)
     model.load_state_dict(state["model"])
     model.eval()
@@ -2894,7 +2975,7 @@ def find_scene(config: Config, key: str, splits=("train", "val", "test")):
     when there is no such scene.
     """
     searched = dataclasses.replace(config, modes_per_scene=None, limit_train=None,
-                                   limit_val=None, max_objects=None)
+                                   limit_val=None, max_objects=None, max_fragments=None)
     names: List[str] = []
     for split in splits:
         try:
@@ -2912,15 +2993,17 @@ def find_scene(config: Config, key: str, splits=("train", "val", "test")):
                    + (f"; closest: {', '.join(close)}" if close else ""))
 
 
-def _adopt_checkpoint_settings(config: Config, stored: Dict, data: bool) -> Config:
+def _adopt_checkpoint_settings(config: Config, stored: Dict, data: bool,
+                               override: Sequence[str] = ()) -> Config:
     """
-    The checkpoint's architecture (always) and data definition (by default),
-    with every change announced.
+    The checkpoint's architecture (always) and data definition (by default,
+    except the data settings named in ``override``), with every change
+    announced.
     """
     import dataclasses
 
     names = {field.name for field in dataclasses.fields(Config)}
-    keys = _ARCHITECTURE + (_DATA if data else ())
+    keys = _ARCHITECTURE + (tuple(k for k in _DATA if k not in override) if data else ())
     changes = {key: stored[key] for key in keys
                if key in stored and key in names and _differs(stored[key], getattr(config, key))}
     # The loss is reported on the target the model was trained on, so the
@@ -2937,6 +3020,15 @@ def _adopt_checkpoint_settings(config: Config, stored: Dict, data: bool) -> Conf
     if "schedule" in changes:
         changes["schedule"] = tuple(changes["schedule"])
     return dataclasses.replace(config, **changes) if changes else config
+
+
+def _fragment_line(config: Config, dataset) -> str:
+    """The range an evaluation scored, and what the limit kept of the split."""
+    if config.max_fragments is None:
+        return (f"  fragments: {MIN_FRAGMENTS}+ per scene, no upper limit "
+                f"(--max_fragments 20 for the benchmark's 2-20)")
+    return (f"  fragments: {MIN_FRAGMENTS}-{config.max_fragments} per scene, keeping "
+            f"{dataset.fragment_limit.describe()}")
 
 
 def _print_assembly(assembly: Dict[str, float], by_category: Dict[str, Dict],
@@ -3187,6 +3279,7 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     print(f"  objects: {len(train_set.scenes)} train / {len(val_set.scenes)} val")
     print(f"  samples: {len(train_set)} train / {len(val_set)} val "
           f"({config.modes_per_scene} modes per object)")
+    print("\n".join(_fragment_banner(config, train_set, val_set)))
     if train_set.official:
         print("  split:   official Breaking Bad lists")
     else:

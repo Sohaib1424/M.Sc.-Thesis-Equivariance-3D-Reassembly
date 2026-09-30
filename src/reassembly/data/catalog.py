@@ -23,14 +23,21 @@ three questions that decide what a number means:
   Everyday has 17 distinct bottles against 5 cups -- so under natural sampling
   a bottle-shaped prior is the cheapest thing the model can learn. See
   :func:`balance_weights`.
+
+* **How many pieces a scene may have.** Breaking Bad's break patterns run from
+  2 to ~100 pieces; the benchmark uses those of 2 to 20. See
+  :func:`limit_fragments`, off by default.
 """
 from __future__ import annotations
 
+import dataclasses
 import random
+import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .paths import Scene, assign_split, scene_split_key
 
@@ -408,6 +415,80 @@ def balance_report(catalog: Catalog, scheme: str, temperature: float,
     return lines
 
 
+# ------------------------------------------------------------ fragments --
+
+@dataclass(frozen=True)
+class FragmentLimit:
+    """What :func:`limit_fragments` kept of one split, for the banner."""
+
+    minimum: int
+    maximum: int
+    patterns: int              # break patterns before the limit
+    patterns_kept: int
+    objects: int
+    objects_kept: int
+    unreadable: int            # label files that could not be read -- kept
+    seconds: float
+
+    def describe(self) -> str:
+        text = (f"{self.patterns_kept:,} of {self.patterns:,} break patterns "
+                f"({self.objects_kept:,} of {self.objects:,} objects)")
+        if self.unreadable:
+            text += (f", {self.unreadable} with an unreadable label file kept "
+                     f"for the loader to report")
+        return text
+
+
+def limit_fragments(catalog: Catalog, minimum: int, maximum: int,
+                    count: Optional[Callable[[Path, str], int]] = None,
+                    workers: int = 16) -> Tuple[Catalog, FragmentLimit]:
+    """
+    Only the break patterns of ``minimum`` to ``maximum`` pieces, and only the
+    objects left with at least one -- the benchmark's 2-20 is
+    ``limit_fragments(catalog, 2, 20)``.
+
+    Why on the catalogue rather than after a scene is loaded, where the
+    single-fragment rule lives: a pattern rejected after loading costs a full
+    decompression every epoch it is drawn (the many-piece patterns are the
+    slowest to load), and it would still count towards the epoch's length and
+    the balanced sampler's weights. Filtered here, the item list, the sampler
+    and the validation set only ever see patterns they can use.
+
+    ``count`` defaults to :func:`reassembly.data.scene.piece_count`, one small
+    label file per pattern, read on ``workers`` threads because the cost is the
+    filesystem's latency rather than CPU. A pattern whose file cannot be read
+    is kept: the loader reads the same file, and reports the failure the way it
+    always has.
+    """
+    if count is None:
+        from .scene import piece_count as count
+    started = time.perf_counter()
+    pairs = [pair for entry in catalog.objects for pair in entry.modes]
+
+    def safe(pair: Tuple[Path, str]) -> Optional[int]:
+        try:
+            return count(*pair)
+        except Exception:  # noqa: BLE001 -- the loader reports it when drawn
+            return None
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(pairs)))) as pool:
+        counts = dict(zip(pairs, pool.map(safe, pairs)))
+    kept = []
+    for entry in catalog.objects:
+        modes = tuple(pair for pair in entry.modes
+                      if counts[pair] is None or minimum <= counts[pair] <= maximum)
+        if modes:
+            kept.append(dataclasses.replace(entry, modes=modes))
+    report = FragmentLimit(
+        minimum=minimum, maximum=maximum,
+        patterns=len(pairs), patterns_kept=sum(len(entry) for entry in kept),
+        objects=len(catalog.objects), objects_kept=len(kept),
+        unreadable=sum(value is None for value in counts.values()),
+        seconds=time.perf_counter() - started,
+    )
+    return Catalog(tuple(kept)), report
+
+
 def effective_sample_size(weights: Sequence[float]) -> float:
     """
     Kish's effective sample size, ``(sum w)^2 / sum w^2``.
@@ -428,6 +509,7 @@ def effective_sample_size(weights: Sequence[float]) -> float:
 __all__ = [
     "BALANCE_SCHEMES",
     "Catalog",
+    "FragmentLimit",
     "ObjectEntry",
     "SPLIT_MODES",
     "balance_report",
@@ -436,6 +518,7 @@ __all__ = [
     "effective_sample_size",
     "fracture_split_report",
     "item_weights",
+    "limit_fragments",
     "partition_modes",
     "split_catalog",
 ]

@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 461 tests, clean under `-W error` |
+| Pipeline | **built** — 476 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -25,6 +25,7 @@ implementing anything from it.
 | Audit against the earlier design | seven defects found and fixed, two experiment controls added — see §10 |
 | Multi-GPU rework | two silent faults (replica drift, collective desync) and five more fixed; stage two, fixed-length epochs, OOM retry, failure tracking, tools — see §11 |
 | Thesis v6 | the largest fragment as the anchor: metrics always, loss by default; re-scores My Thesis Work checkpoints — see §12 |
+| Benchmark range | `--max_fragments 20` trains and scores on GARF's 2–20 pieces; off by default — see §13 |
 
 ---
 
@@ -813,4 +814,43 @@ over *all* fragments would spread that evenly; it is not built.
   embedding matches as stage two takes translations. Training does not fall
   either: optimisation, not generalisation — compare its pace with the
   memorisation numbers above before concluding anything.
+
+---
+
+## 13 · The benchmark's 2–20 pieces (Sept 2026)
+
+GARF trains and reports on break patterns of 2 to 20 pieces (section 4.5: "only
+been trained on data with 2-20 fragments"; supplementary C.5). This dataset's
+scenes run to 99 (§3), and v6 had no upper bound — only the build-time rule that
+skips a single-fragment scene — so its numbers were on a harder mix than GARF's.
+
+**What changed.**
+
+- `Config.max_fragments` (`--max_fragments`, `0` = `None` = no limit, the
+  default): `limit_fragments` in `data/catalog.py` keeps the patterns of 2 to
+  `max_fragments` pieces and drops objects left with none. The count is
+  `data/scene.py:piece_count` — each pattern's `compressed_fracture.npy`, read
+  on 16 threads and cached per process, so the per-epoch rebuild of the
+  training set costs nothing after the first. It is an upper bound on what the
+  loader builds (a label that comes out empty is dropped). An unreadable label
+  file is kept for the loader to report; `build` also skips, by name, a loaded
+  scene above the limit.
+- On the catalogue rather than at build time: a scene rejected after loading
+  costs a decompression every epoch it is drawn and still counts towards the
+  epoch length and the balanced sampler's weights.
+- After the split (no pattern moves between train and val), before
+  `--max_objects` (which then strides over objects that still have one).
+- In `_DATA`: a resume onto a different limit is announced — a checkpoint
+  without the key reads as no limit (`_DATA_BEFORE_IT_EXISTED`) — and resets
+  the best-so-far (`_fragment_limit_changed`). With `--evaluate`, an explicit
+  `--max_fragments` overrides the checkpoint's value (`override`), the rest of
+  the data definition stays the checkpoint's; the range is printed and written
+  to `<split>_metrics.json`. `find_scene` searches every pattern regardless.
+
+**Verified.** 476 tests (461 before; `tests/test_fragment_limit.py`, 15).
+Mutation checks — limit after `--max_objects`, lower bound ignored, a legacy
+checkpoint's missing key not read as "no limit" (both in the reset and in the
+resume warning), the evaluate override ignored, the build-time check removed,
+an unreadable label file dropped, `--max_fragments 0` not meaning "no limit" —
+each fails at least one test. 61 version markers.
 

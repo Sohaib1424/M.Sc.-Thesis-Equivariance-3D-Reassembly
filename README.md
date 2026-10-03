@@ -573,6 +573,29 @@ project how many more sessions are left:
   ~1:04:12/epoch, 31 epoch(s) left = ~33:10:12  (4 more session(s) at 11h)
 ```
 
+### Mirroring to the Hugging Face Hub (optional)
+
+Give all three and the run's files go to a Hugging Face repository after every
+epoch; give none and nothing changes:
+
+```bash
+python -m scripts.train ... --checkpoint_dir ./checkpoint \
+    --hf_repo_id <user>/<repo> --hf_local_dir ./checkpoint --hf_token <token>
+```
+
+* `--hf_local_dir` must be the `--checkpoint_dir`. `last.pt`, `best.pt`,
+  `history.json`, `history.csv` and `offenders.json` are pushed in one commit
+  per epoch, after they are written. The repository is created private if it
+  does not exist.
+* With `--resume auto` and no `last.pt` in the folder (a fresh machine), the
+  files are pulled from the repository first, so the run continues. A folder
+  that has `last.pt` is never overwritten.
+* The token is not a `Config` field: it never reaches a checkpoint and is never
+  printed. A failed push or pull prints a warning and training continues
+  (`reassembly/hub.py`).
+* Each epoch's `last.pt` stays in the repository's history, so its storage
+  grows by one checkpoint per epoch.
+
 ### Stage two and the benchmark numbers
 
 `--evaluate` assembles as well as rotates: the translation solver

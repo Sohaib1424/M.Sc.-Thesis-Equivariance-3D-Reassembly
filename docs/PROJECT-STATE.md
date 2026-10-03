@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 476 tests, clean under `-W error` |
+| Pipeline | **built** — 487 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -26,6 +26,7 @@ implementing anything from it.
 | Multi-GPU rework | two silent faults (replica drift, collective desync) and five more fixed; stage two, fixed-length epochs, OOM retry, failure tracking, tools — see §11 |
 | Thesis v6 | the largest fragment as the anchor: metrics always, loss by default; re-scores My Thesis Work checkpoints — see §12 |
 | Benchmark range | `--max_fragments 20` trains and scores on GARF's 2–20 pieces; off by default — see §13 |
+| Hub mirror | optional `--hf_repo_id/--hf_local_dir/--hf_token`: files pushed every epoch, pulled into a fresh folder — see §14 |
 
 ---
 
@@ -853,4 +854,31 @@ checkpoint's missing key not read as "no limit" (both in the reset and in the
 resume warning), the evaluate override ignored, the build-time check removed,
 an unreadable label file dropped, `--max_fragments 0` not meaning "no limit" —
 each fails at least one test. 61 version markers.
+
+---
+
+## 14 · Optional Hugging Face Hub mirror (Oct 2026)
+
+`--hf_repo_id`, `--hf_local_dir`, `--hf_token`: with all three, the run's files
+are pushed to a Hugging Face repository after every epoch; with none, nothing
+changes; with some, one line says so and training continues without it.
+
+- `src/reassembly/hub.py` (new): `HubSync.start` checks that `--hf_local_dir` is
+  the `--checkpoint_dir`, that `huggingface_hub` imports and that the repository
+  can be created (private, `exist_ok`); with `--resume auto` and no local
+  `last.pt`, it pulls first. `push` uploads `last.pt`, `best.pt`,
+  `history.json`, `history.csv` and `offenders.json` in one commit. Every Hub
+  call is guarded: a failure warns and training continues.
+- `train(config, hub=...)` starts it once, before any GPU process looks for
+  `last.pt`; rank 0 pushes after the epoch's files are written and before the
+  stop decision, so a session's last epoch is mirrored too.
+- Script-level flags in `scripts/train.py`, not `Config` fields: `Config` is
+  stored in every checkpoint, and the checkpoints are what gets uploaded.
+
+**Verified.** 487 tests (`tests/test_hub.py`, 11, against a stand-in for
+`huggingface_hub`, end to end through `train`: a push per epoch after the files
+exist, a fresh folder resumed from the repository, the epoch a time budget stops
+on pushed). Mutation checks -- hub not passed to the worker, pull overwriting a
+local `last.pt`, no pull, folder check removed, repository not private, push
+after the stop, token in `repr` -- each fails a test. 64 version markers.
 

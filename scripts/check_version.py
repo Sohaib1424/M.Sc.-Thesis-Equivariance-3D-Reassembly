@@ -146,6 +146,13 @@ MARKERS = [
      'if _fragment_limit_changed(state.get("config") or {}, config):'),
     ("--evaluate --max_fragments overrides the checkpoint", "scripts/train.py",
      'override = ("max_fragments",) if args.max_fragments is not None else ()'),
+    # -- Thesis v6: the optional Hugging Face Hub mirror -------------------------
+    ("hub mirror off unless all three --hf_* are given", "src/reassembly/hub.py",
+     "return bool(self.repo_id and self.local_dir and self._token)"),
+    ("hub pushed after every epoch, before the stop", "src/reassembly/training.py",
+     'hub.push(f"epoch {epoch + 1}: val geodesic {score:.3f}")'),
+    ("hub token kept out of Config and checkpoints", "scripts/train.py",
+     "train(config, hub=HubSync(args.hf_repo_id, args.hf_local_dir, args.hf_token))"),
 ]
 
 

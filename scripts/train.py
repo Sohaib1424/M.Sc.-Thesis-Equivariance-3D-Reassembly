@@ -99,6 +99,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from reassembly.hub import HubSync  # noqa: E402
 from reassembly.training import evaluate, preflight, train  # noqa: E402
 from scripts.config_flags import add_config_arguments, config_from_args  # noqa: E402,F401
 
@@ -134,6 +135,14 @@ def build_parser() -> argparse.ArgumentParser:
              "is no official test partition and asking for one falls back to a "
              "hashed split that is comparable with nothing. --split_by fracture "
              "does define a test partition, of held-out break patterns.")
+    hub = parser.add_argument_group(
+        "Hugging Face Hub mirror", "optional; on only when all three are given")
+    hub.add_argument("--hf_repo_id", default="",
+                     help="repository to push last.pt, best.pt, history.json, "
+                          "history.csv and offenders.json to after every epoch")
+    hub.add_argument("--hf_local_dir", default="",
+                     help="the folder mirrored: must be --checkpoint_dir")
+    hub.add_argument("--hf_token", default="", help="Hugging Face access token")
     return add_config_arguments(parser)
 
 
@@ -152,7 +161,9 @@ def main() -> None:
                  assemble=args.assemble, collision=args.collision,
                  data_from_checkpoint=not args.data_from_flags, override=override)
     else:
-        train(config)
+        # Not Config fields: the token must not reach a checkpoint, and the
+        # checkpoints are what gets uploaded.
+        train(config, hub=HubSync(args.hf_repo_id, args.hf_local_dir, args.hf_token))
 
 
 if __name__ == "__main__":

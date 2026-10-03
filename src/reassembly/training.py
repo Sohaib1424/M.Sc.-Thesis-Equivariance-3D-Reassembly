@@ -2244,14 +2244,21 @@ def _launch_size(config: Config) -> int:
     return visible if config.devices < 0 else min(config.devices, visible)
 
 
-def train(config: Config) -> List[dict]:
+def train(config: Config, hub=None) -> List[dict]:
     """
     Run training: inline on one GPU (or the CPU), one process per GPU on more.
 
     Returns the history -- read back from ``out_dir`` when several processes
     ran, since only rank 0 records it.
+
+    ``hub`` is an optional :class:`reassembly.hub.HubSync`: when its settings
+    are usable, the run's files are pulled before a resume into an empty
+    folder and pushed after every epoch.
     """
     requested = _launch_size(config)
+    if hub is not None:
+        # Once, here, before any GPU process looks for last.pt.
+        hub.start(config.out_dir, resume=bool(config.resume and not config.resume_from))
     if 0 < requested < config.devices:
         # Said out loud: a run told to use two GPUs that quietly used one would
         # read as a two-GPU result.
@@ -2283,14 +2290,14 @@ def train(config: Config) -> List[dict]:
         # A fresh port per launch unless one is pinned, so two runs on one
         # machine -- or a run and the test suite -- cannot collide on it.
         os.environ.setdefault("MASTER_PORT", str(free_port()))
-        context = mp.spawn(_worker, args=(requested, config), nprocs=requested,
+        context = mp.spawn(_worker, args=(requested, config, hub), nprocs=requested,
                            join=False)
         with _ForwardTerminate(context.processes):
             while not context.join():
                 pass
         path = Path(config.out_dir) / "history.json"
         return json.loads(path.read_text()) if path.exists() else []
-    return _worker(0, requested, config)
+    return _worker(0, requested, config, hub)
 
 
 class _ForwardTerminate:
@@ -2335,7 +2342,7 @@ class _ForwardTerminate:
         return False
 
 
-def _worker(rank: int, world: int, config: Config) -> List[dict]:
+def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
     """
     One GPU's whole run. ``world`` processes run this at once; ``world <= 1``
     means this is the only one (``0``: on the CPU).
@@ -2568,6 +2575,10 @@ def _worker(rank: int, world: int, config: Config) -> List[dict]:
                               start_epoch, steps_per_epoch=per_epoch)
         if report:
             print(report)
+        if hub is not None and hub.enabled:
+            # After this epoch's files are written, before the stop decision,
+            # so the last epoch of a session is mirrored too.
+            hub.push(f"epoch {epoch + 1}: val geodesic {score:.3f}")
         if stopped or val_stopped or out_of_time:
             break
 

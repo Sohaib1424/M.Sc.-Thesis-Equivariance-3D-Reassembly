@@ -8,7 +8,7 @@ perturbations), predicts, and writes per-fragment and per-pair numbers that the
 history cannot show.
 
     cd "E:\\Thesis v6"
-    python path\\to\\probe_val.py --checkpoint path\\to\\W10\\best.pt --root_dir <dataset> --out probe\\W10
+    python probe_val.py --checkpoint path\\to\\W10\\best.pt --out probe\\W10
 
 Outputs <out>/fragments.csv, <out>/pairs.csv and <out>/summary.txt, and prints:
 
@@ -21,11 +21,31 @@ Outputs <out>/fragments.csv, <out>/pairs.csv and <out>/summary.txt, and prints:
   (c)           tilt/twist of the error in the OBJECT frame, E = (C R_hat) R^T,
                 per category, about x, y and z -- beside the logged values,
                 which use R_hat^T R (the input frame)
+  (d)           with --procrustes: the relative rotation of each pair fitted
+                from the model's own embedding matches, against the network's
 
---split train scores training scenes the same way, for a train-vs-val
-comparison of the same tables. --print_flags prints the scripts.train command
-that reproduces the checkpoint's run, and exits. Run from the repository root,
-or pass --repo <repository root>.
+Two tests
+---------
+--cross none   The cross layers get no partners: every fragment is predicted
+               as if it were alone in its scene.
+--cross swap   Each scene's tokens attend to the tokens of a DIFFERENT object's
+               scene instead of their own. The cross layers get realistic input
+               that carries no information about this scene. Run with fewer
+               scenes per batch (4 by default) to bound memory.
+               If the validation error barely moves under these, the cross
+               layers are not contributing to the rotation.
+
+--procrustes   For every pair of fragments, match fracture-surface points by
+               their embeddings (mutual nearest neighbours, as the assembly
+               stage does), fit the rotation that lines the matched points up
+               (Kabsch with RANSAC), and compare its error with the network's.
+               Then chain those fitted rotations outward from the anchor along
+               the best-matched pairs -- no ground-truth contacts used -- and
+               report the per-fragment error that would give.
+
+--split train scores training scenes the same way. --print_flags prints the
+scripts.train command that reproduces the checkpoint's run, and exits. Run from
+the repository root, or pass --repo <repository root>.
 """
 from __future__ import annotations
 
@@ -56,6 +76,21 @@ def parse_args(argv=None):
                         "0: the whole split; N: N scenes, strided like --val_steps")
     p.add_argument("--min_contact", type=int, default=10,
                    help="shared coincident vertices for two fragments to count as touching")
+    p.add_argument("--cross", default="normal", choices=("normal", "none", "swap"),
+                   help="what the cross layers see: the scene's own fragments (normal), "
+                        "nothing (none), or another object's scene (swap)")
+    p.add_argument("--batch_scenes", type=int, default=None,
+                   help="scenes per forward pass; default: the run's own (at most 4 with "
+                        "--cross swap)")
+    p.add_argument("--procrustes", action="store_true",
+                   help="fit each pair's rotation from the embedding matches (table d)")
+    p.add_argument("--min_matches", type=int, default=6,
+                   help="--procrustes: matches (and RANSAC inliers) a pair needs")
+    p.add_argument("--ransac_tau", type=float, default=0.05,
+                   help="--procrustes: inlier distance, in units of the largest fragment's "
+                        "radius")
+    p.add_argument("--ransac_iters", type=int, default=256)
+    p.add_argument("--seed", type=int, default=0, help="RANSAC draws and the swap order")
     p.add_argument("--num_workers", type=int, default=None,
                    help="data-loader workers; default: the run's own")
     p.add_argument("--device", default=None, help="default: cuda:0 if available, else cpu")
@@ -97,6 +132,170 @@ def cross_hops(schedule):
             for i, kind in enumerate(schedule) if kind == "cross"]
 
 
+# ---------------------------------------------------------------------------
+# --cross: what the cross layers are allowed to see
+# ---------------------------------------------------------------------------
+
+def rewire(batch, mode, counters):
+    """The batch with its cross-fragment pair lists replaced, per ``mode``."""
+    import torch
+
+    if mode == "normal":
+        return batch
+    device = batch.token_index.device
+    empty = torch.zeros(0, dtype=torch.long, device=device)
+    S = int(batch.num_scenes)
+    if mode == "none" or S < 2:
+        if mode == "swap":
+            counters["swap_alone"] += S
+        return batch._replace(token_query=empty, token_key=empty)
+
+    # swap: tokens are stored scene by scene, so each scene's are one block.
+    token_scene = batch.fragment_scene[batch.vertex_fragment[batch.token_index]]
+    counts = torch.bincount(token_scene, minlength=S).tolist()
+    starts = np.cumsum([0] + counts[:-1]).tolist()
+    objects = [key.rsplit("/", 1)[0] for key in batch.scene_keys] if batch.scene_keys \
+        else [str(s) for s in range(S)]
+    queries, keys = [], []
+    for s in range(S):
+        if counts[s] == 0:
+            continue
+        order = [(s + k) % S for k in range(1, S)]
+        partner = next((p for p in order if counts[p] and objects[p] != objects[s]), None)
+        if partner is None:
+            partner = next((p for p in order if counts[p]), None)
+            counters["swap_same_object"] += 1
+        if partner is None:
+            counters["swap_alone"] += 1
+            continue
+        q = torch.arange(starts[s], starts[s] + counts[s], device=device)
+        k = torch.arange(starts[partner], starts[partner] + counts[partner], device=device)
+        queries.append(q.repeat_interleave(k.numel()))
+        keys.append(k.repeat(q.numel()))
+    if not queries:
+        return batch._replace(token_query=empty, token_key=empty)
+    return batch._replace(token_query=torch.cat(queries), token_key=torch.cat(keys))
+
+
+# ---------------------------------------------------------------------------
+# --procrustes: rotations fitted from the embedding matches
+# ---------------------------------------------------------------------------
+
+def kabsch(P, Q):
+    """``(R, t)`` minimising ``sum ||R p + t - q||^2`` over the last-but-one axis."""
+    import torch
+
+    cp, cq = P.mean(-2), Q.mean(-2)
+    H = (P - cp.unsqueeze(-2)).transpose(-1, -2) @ (Q - cq.unsqueeze(-2))
+    U, _, Vt = torch.linalg.svd(H)
+    V, Ut = Vt.transpose(-1, -2), U.transpose(-1, -2)
+    d = torch.sign(torch.det(V @ Ut))
+    d = torch.where(d == 0, torch.ones_like(d), d)
+    D = torch.diag_embed(torch.stack([torch.ones_like(d), torch.ones_like(d), d], -1))
+    R = V @ D @ Ut
+    t = cq - (R @ cp.unsqueeze(-1)).squeeze(-1)
+    return R, t
+
+
+def ransac_rotation(P, Q, iterations, tau, generator):
+    """Best rotation mapping ``P`` onto ``Q`` despite wrong matches, and its inlier count."""
+    import torch
+
+    m = P.shape[0]
+    weights = torch.ones(iterations, m, device=P.device)
+    sample = torch.multinomial(weights, 3, replacement=False, generator=generator)
+    R, t = kabsch(P[sample], Q[sample])                            # (K, 3, 3), (K, 3)
+    residual = (torch.einsum("kij,mj->kmi", R, P) + t[:, None, :] - Q[None]).norm(dim=-1)
+    inliers = residual < tau
+    best = int(inliers.sum(1).argmax())
+    mask = inliers[best]
+    for _ in range(2):                                             # refit on the inliers
+        if int(mask.sum()) < 3:
+            break
+        R_fit, t_fit = kabsch(P[mask], Q[mask])
+        mask = (P @ R_fit.T + t_fit - Q).norm(dim=-1) < tau
+        R[best], t[best] = R_fit, t_fit
+    return R[best], int(mask.sum())
+
+
+def fitted_rotations(batch, prediction, args, generator):
+    """``{(i, j): (R_ij, matches, inliers)}``, global fragment indices ``i < j``;
+    ``R_ij`` maps fragment i's input frame onto fragment j's."""
+    import torch
+
+    from reassembly.assembly.translation import mutual_nearest_neighbours, subsample_per_fragment
+
+    fitted = {}
+    points = batch.node_features[:, 0, :].double()
+    unit = batch.unit.double()
+    fragment = batch.vertex_fragment.long()
+    fragment_ptr = batch.fragment_ptr.tolist()
+    vertex_ptr = batch.vertex_ptr.tolist()
+    embedding = prediction.vertex_embedding
+    for s in range(int(batch.num_scenes)):
+        f0, f1 = fragment_ptr[s], fragment_ptr[s + 1]
+        v0, v1 = vertex_ptr[f0], vertex_ptr[f1]
+        if f1 - f0 < 2:
+            continue
+        local = fragment[v0:v1] - f0
+        # In units of the scene's largest fragment, whatever the normalisation mode.
+        scale = unit[f0:f1] / unit[f0:f1].max()
+        p = points[v0:v1] * scale[local, None]
+        candidates = None if batch.fracture is None else batch.fracture[v0:v1]
+        keep = subsample_per_fragment(local, 2048, candidates)
+        source, target = mutual_nearest_neighbours(embedding[v0:v1][keep], local[keep])
+        source, target = keep[source], keep[target]
+        if source.numel() == 0:
+            continue
+        a, b = local[source], local[target]                       # a < b by construction
+        pair_id = a * (f1 - f0) + b
+        for pid in torch.unique(pair_id).tolist():
+            chosen = pair_id == pid
+            count = int(chosen.sum())
+            if count < args.min_matches:
+                continue
+            i, j = divmod(pid, f1 - f0)
+            R, inliers = ransac_rotation(p[source[chosen]], p[target[chosen]],
+                                         args.ransac_iters, args.ransac_tau, generator)
+            fitted[(f0 + i, f0 + j)] = (R, count, inliers)
+    return fitted
+
+
+def chain_from_anchor(fitted, anchors, fragment_ptr, T, min_inliers):
+    """Fitted rotations composed outward from each scene's anchor along a maximum
+    spanning tree of inlier counts. ``{fragment: (R, parent)}`` for reached fragments."""
+    reached = {}
+    for s, a in enumerate(anchors):
+        f0, f1 = fragment_ptr[s], fragment_ptr[s + 1]
+        if a >= f1 or a < f0:
+            continue
+        edges = {}
+        for (i, j), (R, _, inliers) in fitted.items():
+            if f0 <= i < f1 and inliers >= min_inliers:
+                edges[(i, j)] = (inliers, R)
+        pose = {a: T[a]}
+        reached[a] = (T[a], -1)
+        while True:
+            best = None
+            for (i, j), (w, R) in edges.items():
+                if (i in pose) != (j in pose) and (best is None or w > best[0]):
+                    best = (w, i, j, R)
+            if best is None:
+                break
+            _, i, j, R = best
+            if i in pose:            # parent i, child j: R maps i's input onto j's
+                pose[j] = pose[i] @ R.transpose(-1, -2)
+                reached[j] = (pose[j], i)
+            else:                    # parent j, child i
+                pose[i] = pose[j] @ R
+                reached[i] = (pose[i], j)
+    return reached
+
+
+# ---------------------------------------------------------------------------
+# One batch
+# ---------------------------------------------------------------------------
+
 def contact_matrix(cluster, vertex_fragment, count):
     """(F, F) number of coincidence clusters each pair of fragments shares."""
     import torch
@@ -121,7 +320,7 @@ def contact_matrix(cluster, vertex_fragment, count):
     return contact + contact.T
 
 
-def analyse(batch, prediction, config, min_contact):
+def analyse(batch, prediction, config, args, generator=None):
     """Per-fragment rows, per-pair rows and reach counts for one batch."""
     import torch
     from scipy.sparse import csr_matrix
@@ -180,7 +379,7 @@ def analyse(batch, prediction, config, min_contact):
     reach_counts = np.array([float((dist <= h).sum()) for h in range(HOPS + 1)])
 
     contact = contact_matrix(batch.cluster if has_cluster else None, vf, F)
-    touch = contact >= min_contact
+    touch = contact >= args.min_contact
     np.fill_diagonal(touch, False)
 
     anchors = anchor.cpu().numpy()
@@ -215,6 +414,16 @@ def analyse(batch, prediction, config, min_contact):
         rel_matrix[I, J] = rel
         rel_matrix[J, I] = rel
 
+    fitted, chained = {}, {}
+    if args.procrustes:
+        fitted = fitted_rotations(batch, prediction, args, generator)
+        chained = chain_from_anchor(fitted, anchors.tolist(), ptr.tolist(), T,
+                                    args.min_matches)
+
+    def fit_error(R, i, j):
+        truth = T[j].transpose(-1, -2) @ T[i]
+        return float(geodesic_angle(R[None].to(T.dtype), truth[None])[0] * deg)
+
     log_scale = batch.log_scale.reshape(-1).double().cpu().numpy()
     counts = count.cpu().numpy()
     scene_vertices = np.bincount(scene_np, weights=counts, minlength=S)
@@ -242,15 +451,30 @@ def analyse(batch, prediction, config, min_contact):
             **{f"twist_{x}": obj[x][1][f] for x in AXES},
             tilt_logged=logged[0][f], twist_logged=logged[1][f],
         )
+        if args.procrustes:
+            pose = chained.get(f)
+            parent = pose[1] if pose else -1
+            row.update(
+                chain_reached=int(pose is not None and f != a),
+                chain_err_deg=(float(geodesic_angle(pose[0][None], T[f][None])[0] * deg)
+                               if pose is not None and f != a else np.nan),
+                chain_edge_touching=(int(touch[f, parent]) if pose is not None and f != a
+                                     else -1))
         rows.append(row)
 
-    pairs = [dict(scene=rows[i]["scene"], category=rows[i]["category"],
-                  i=rows[i]["fragment"], j=rows[j]["fragment"],
-                  with_anchor=int(rows[i]["anchor"] or rows[j]["anchor"]),
-                  contact=int(contact[i, j]), touching=int(touch[i, j]),
-                  vertices_i=rows[i]["vertices"], vertices_j=rows[j]["vertices"],
-                  rel_err_deg=float(r))
-             for i, j, r in zip(I, J, rel)]
+    pairs = []
+    for i, j, r in zip(I, J, rel):
+        row = dict(scene=rows[i]["scene"], category=rows[i]["category"],
+                   i=rows[i]["fragment"], j=rows[j]["fragment"],
+                   with_anchor=int(rows[i]["anchor"] or rows[j]["anchor"]),
+                   contact=int(contact[i, j]), touching=int(touch[i, j]),
+                   vertices_i=rows[i]["vertices"], vertices_j=rows[j]["vertices"],
+                   rel_err_deg=float(r))
+        if args.procrustes:
+            hit = fitted.get((int(i), int(j)))
+            row.update(matches=hit[1] if hit else 0, inliers=hit[2] if hit else 0,
+                       fit_err_deg=fit_error(hit[0], int(i), int(j)) if hit else np.nan)
+        pairs.append(row)
     return rows, pairs, reach_counts, N
 
 
@@ -281,21 +505,31 @@ def quartiles(x, e):
     return cells, rho
 
 
-def summarise(rows, pairs, reach_counts, vertex_total, config, state, args, seconds):
+def summarise(rows, pairs, reach_counts, vertex_total, config, state, args, seconds, counters):
     out = []
     say = out.append
     scored = column(rows, "anchor") == 0
     err = column(rows, "err_anchor_deg")
     scenes = len({r["scene"] for r in rows})
     say(f"{args.split}: {scenes} scenes, {int(scored.sum())} scored fragments "
-        f"({len(rows) - int(scored.sum())} anchors), {seconds:.0f} s")
+        f"({len(rows) - int(scored.sum())} anchors), {seconds:.0f} s, cross layers: {args.cross}")
     say(f"  mean anchor-aligned error {err[scored].mean():.2f} deg, median "
         f"{np.median(err[scored]):.2f} (chance {CHANCE_DEG})")
     history = state.get("history") or []
     logged = [r for r in history if r.get("epoch") == state.get("epoch")] or history[-1:]
     if logged and args.split == "val" and "val_geodesic_deg" in logged[0]:
-        say(f"  the run logged val_geodesic_deg {logged[0]['val_geodesic_deg']:.2f} at epoch "
-            f"{logged[0].get('epoch')} -- the two should agree (same scenes, same draws)")
+        if args.cross == "normal":
+            say(f"  the run logged val_geodesic_deg {logged[0]['val_geodesic_deg']:.2f} at epoch "
+                f"{logged[0].get('epoch')} -- the two should agree (same scenes, same draws)")
+        else:
+            say(f"  the run logged val_geodesic_deg {logged[0]['val_geodesic_deg']:.2f} at epoch "
+                f"{logged[0].get('epoch')} with the cross layers working normally")
+    if args.cross == "swap":
+        say(f"  swap partners: {counters['swap_same_object']} scene(s) had to take a scene of "
+            f"the same object, {counters['swap_alone']} had no partner (left with none)")
+    if counters["oom"]:
+        say(f"  {counters['oom']} batch(es) ran out of memory and were skipped "
+            f"(lower --batch_scenes)")
 
     # -- token reach (check 3) ----------------------------------------------
     share = reach_counts / max(vertex_total, 1)
@@ -391,6 +625,59 @@ def summarise(rows, pairs, reach_counts, vertex_total, config, state, args, seco
         cells += (f"   {column(sub, 'tilt_logged')[mask].mean():6.1f}/"
                   f"{column(sub, 'twist_logged')[mask].mean():6.1f}")
         say(f"    {name[:18]:18}{int(mask.sum()):6d}{e[mask].mean():7.1f}{cells}")
+
+    # -- (d) rotations fitted from the embedding matches ----------------------
+    if args.procrustes:
+        say("")
+        say("(d) relative rotation fitted from the embedding matches (mutual nearest neighbours "
+            "on fracture-surface")
+        say(f"    points, Kabsch + RANSAC, inliers within {args.ransac_tau:g} of the largest "
+            f"fragment's radius, >= {args.min_matches} needed)")
+        fit = column(pairs, "fit_err_deg")
+        has_fit = np.isfinite(fit)
+
+        def compare(label, mask):
+            n = int(mask.sum())
+            if not n:
+                say(f"    {label}: none")
+                return
+            net, fitted_ = rel[mask], fit[mask]
+            say(f"    {label}: {n} pairs")
+            say(f"      {'':16}{'network':>16}{'fitted':>16}")
+            say(f"      {'mean / median':16}{net.mean():8.1f}/{np.median(net):6.1f}"
+                f"{fitted_.mean():9.1f}/{np.median(fitted_):6.1f}")
+            for threshold in (5, 15, 30):
+                say(f"      {f'< {threshold} deg':16}{100 * (net < threshold).mean():15.0f}%"
+                    f"{100 * (fitted_ < threshold).mean():15.0f}%")
+            say(f"      fitted closer to the truth in {100 * (fitted_ < net).mean():.0f}% "
+                f"of them")
+
+        say(f"    touching pairs with a fit: {int((touching & has_fit).sum())} of "
+            f"{int(touching.sum())}")
+        compare("touching", touching & has_fit)
+        compare("touching, with the anchor", touching & has_fit & with_anchor)
+        say(f"    pairs that do NOT touch but still got a fit (false matches): "
+            f"{int((~touching & has_fit).sum())} of {int((~touching).sum())}, fitted error "
+            + (f"{np.median(fit[~touching & has_fit]):.1f} median" if (~touching & has_fit).any()
+               else "-"))
+        chain = column(sub, "chain_err_deg")
+        got = np.isfinite(chain)
+        say("    chained outward from the anchor along the best-matched pairs (no ground-truth "
+            "contacts used):")
+        if got.any():
+            edge = column(sub, "chain_edge_touching")
+            say(f"      reached {int(got.sum())} of {len(sub)} scored fragments "
+                f"({100 * got.mean():.0f}%); tree edges between pieces that really touch: "
+                f"{100 * (edge[got] == 1).mean():.0f}%")
+            say(f"      on those fragments: network {e[got].mean():.1f} / {np.median(e[got]):.1f}"
+                f"   chained {chain[got].mean():.1f} / {np.median(chain[got]):.1f}  "
+                f"(mean / median)")
+            combined = np.where(got, chain, e)
+            say(f"      all scored fragments, chained where reached and the network elsewhere: "
+                f"{combined.mean():.1f} mean, {np.median(combined):.1f} median "
+                f"(network alone {e.mean():.1f})")
+        else:
+            say("      no fragment reached")
     return out
 
 
@@ -405,8 +692,8 @@ def main(argv=None) -> int:
 
     import torch
 
-    from reassembly.training import (BreakingBadScenes, _forward, _loader, _to_device,
-                                     build_criterion, build_model)
+    from reassembly.training import (BreakingBadScenes, _forward, _is_oom, _loader,
+                                     _to_device, build_criterion, build_model)
 
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -430,26 +717,46 @@ def main(argv=None) -> int:
     model.load_state_dict(state["model"])
     model.eval()
 
+    scenes_per_batch = args.batch_scenes or (min(config.batch_size, 4) if args.cross == "swap"
+                                             else config.batch_size)
+    config = dataclasses.replace(config, batch_size=scenes_per_batch)
     dataset = BreakingBadScenes(config, args.split, epoch_seed=0)
+    if args.cross == "swap":
+        # Neighbouring scenes are often break patterns of the same object; mixing
+        # the order puts different objects in each batch to swap between.
+        order = np.random.default_rng(args.seed).permutation(len(dataset.items))
+        dataset.items = [dataset.items[i] for i in order]
     loader = _loader(dataset, config, False, 0, 1, 0,
                      pairs_in_worker=not str(device).startswith("cuda"))
     criterion = build_criterion(config)
+    generator = torch.Generator(device=device).manual_seed(args.seed)
     print(f"checkpoint {args.checkpoint} (epoch {state.get('epoch')}), {len(dataset)} "
-          f"{args.split} scenes, schedule {' '.join(config.schedule)}, device {device}")
+          f"{args.split} scenes, schedule {' '.join(config.schedule)}, cross layers: "
+          f"{args.cross}, {scenes_per_batch} scenes per batch, device {device}")
 
     rows, pairs = [], []
     reach_counts = np.zeros(HOPS + 1)
     vertex_total = dropped = 0
+    counters = {"swap_same_object": 0, "swap_alone": 0, "oom": 0}
     began = time.time()
     with torch.no_grad():
         for index, (batch, skipped) in enumerate(loader):
             dropped += len(skipped)
             if batch is None:
                 continue
+            batch = rewire(_to_device(batch, device), args.cross, counters)
             keep = {}
-            _forward(model, _to_device(batch, device), criterion, config, keep=keep)
-            r, p, counts, n = analyse(keep["batch"], keep["prediction"], config,
-                                      args.min_contact)
+            try:
+                _forward(model, batch, criterion, config, keep=keep)
+            except Exception as error:                      # noqa: BLE001
+                if not _is_oom(error):
+                    raise
+                counters["oom"] += 1
+                if str(device).startswith("cuda"):
+                    torch.cuda.empty_cache()
+                continue
+            r, p, counts, n = analyse(keep["batch"], keep["prediction"], config, args,
+                                      generator)
             rows += r
             pairs += p
             reach_counts += counts
@@ -467,7 +774,7 @@ def main(argv=None) -> int:
     write_csv(out / "fragments.csv", rows)
     write_csv(out / "pairs.csv", pairs)
     lines = summarise(rows, pairs, reach_counts, vertex_total, config, state, args,
-                      time.time() - began)
+                      time.time() - began, counters)
     text = "\n".join(lines)
     print("\n" + text)
     (out / "summary.txt").write_text(text + "\n")

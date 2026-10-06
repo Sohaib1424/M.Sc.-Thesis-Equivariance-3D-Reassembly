@@ -34,6 +34,10 @@ Conventions, stated because published numbers depend on them:
 * Scenes are averaged **per scene, then over scenes** by the caller, as the
   benchmark does. Training logs are fragment-weighted instead; the two differ
   when scenes differ in fragment count.
+* **Rotations** are the rotation head's (``rotations="network"``, the default)
+  or fitted from the embedding matches and chained from the anchor
+  (``rotations="matched"``, :mod:`reassembly.assembly.rotation`). Either way the
+  translation solver and every score below use the rotations chosen.
 
 Chamfer runs on an evenly strided subset of each fragment's vertices -- the
 same subset for prediction and truth, which share their vertex order -- because
@@ -41,38 +45,67 @@ a fragment can have 83,000 vertices and the distance is quadratic.
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Dict, List
 
 import torch
 
 from ..evaluation.metrics import chamfer_distance, part_accuracy
 from ..nn.losses import euler_rmse, geodesic_angle
+from .rotation import INLIER_DISTANCE, MIN_MATCHES, RANSAC_ITERATIONS, match_rotations
 from .translation import assemble, subsample_per_fragment
+
+ROTATION_SOURCES = ("network", "matched")
+
+
+def _scene_generator(batch, scene: int, seed: int, device) -> torch.Generator:
+    """
+    One RANSAC stream per scene, keyed by the scene's name: a scene draws the
+    same hypotheses whatever batch it lands in, so two evaluations of one
+    checkpoint agree. (A digest, not ``hash()``, which Python salts per process.)
+    """
+    name = batch.scene_keys[scene] if batch.scene_keys else str(scene)
+    digest = hashlib.blake2b(f"{name}\x1f{seed}".encode(), digest_size=8).digest()
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int.from_bytes(digest, "little") & ((1 << 63) - 1))
+    return generator
 
 
 @torch.no_grad()
 def score_batch(batch, prediction, *, threshold: float = 0.01,
                 max_match_points: int = 2048, chamfer_points: int = 2048,
                 iterations: int = 5, huber: float = 0.05,
-                collision: bool = False, anchor: bool = True) -> List[Dict[str, float]]:
+                collision: bool = False, anchor: bool = True,
+                rotations: str = "network", min_matches: int = MIN_MATCHES,
+                inlier_distance: float = INLIER_DISTANCE,
+                ransac_iterations: int = RANSAC_ITERATIONS,
+                seed: int = 0) -> List[Dict[str, float]]:
     """
     One dict per scene: ``geodesic_deg`` and ``euler_rmse_deg`` (the scene's
-    own means, which need no solver), ``rmse_t``, ``chamfer``,
-    ``part_chamfer``, ``part_accuracy``, ``matches`` and ``fragments`` -- plus,
-    skipped by averaging, ``_part_chamfer`` (per fragment), ``_translation``
-    (the solved ``(F, 3)`` translations in world units: relative to the
-    anchor's with ``anchor``, zero-mean without), ``_rotation`` (the ``(F, 3,
-    3)`` rotations the fragments were placed with) and ``_anchor`` (the
-    anchor's index within the scene, or -1).
+    own means), ``rmse_t``, ``chamfer``, ``part_chamfer``, ``part_accuracy``,
+    ``matches`` and ``fragments`` -- plus, skipped by averaging,
+    ``_part_chamfer`` (per fragment), ``_translation`` (the solved ``(F, 3)``
+    translations in world units: relative to the anchor's with ``anchor``,
+    zero-mean without), ``_rotation`` (the ``(F, 3, 3)`` rotations the
+    fragments were placed with), ``_scored_geodesic_deg`` (the scored
+    fragments' angles, for fragment-weighted means) and ``_anchor`` (the
+    anchor's index within the scene, or -1). With ``rotations="matched"``,
+    also ``matched_share`` (the scored fragments the chain reached; the rest
+    keep the head's rotation) and ``_reached`` (per fragment).
 
     ``batch`` is a :class:`~reassembly.data.features.Batch` on any device and
     ``prediction`` the model's output for it. ``anchor`` picks the convention
-    (module docstring).
+    (module docstring); ``rotations`` picks where the rotations come from, and
+    ``min_matches``, ``inlier_distance``, ``ransac_iterations`` and ``seed``
+    tune the matched route (:mod:`reassembly.assembly.rotation`).
     """
     from ..data.features import complete_batch
-    from ..nn.anchor import anchor_alignment
+    from ..nn.anchor import anchor_alignment, anchor_fragments
     from ..nn.model import apply_rotation
 
+    if rotations not in ROTATION_SOURCES:
+        raise ValueError(f"rotations must be one of {ROTATION_SOURCES}, got {rotations!r}")
+    matched = rotations == "matched"
     batch = complete_batch(batch)
     fragment = batch.vertex_fragment
     unit = batch.unit.to(batch.node_features.dtype)[fragment, None]
@@ -81,6 +114,13 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
         rotation, scored = anchor_alignment(batch, rotation)
     else:
         scored = torch.ones(rotation.shape[0], dtype=torch.bool, device=rotation.device)
+    if matched:
+        # Replaced scene by scene below; a copy, so the prediction is untouched.
+        rotation = rotation.clone()
+        # The chain's root: the largest fragment -- the anchor, whose rotation
+        # is its true pose under the anchor convention.
+        roots = anchor_fragments(batch.log_scale, batch.fragment_scene,
+                                 batch.num_scenes).tolist()
     points = apply_rotation(batch.node_features[:, 0, :], rotation, fragment) * unit
     normals = apply_rotation(batch.node_features[:, 1, :], rotation, fragment)
     truth_local = batch.target_vertices * unit
@@ -94,6 +134,23 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
         v0, v1 = vertex_ptr[f0], vertex_ptr[f1]
         count = f1 - f0
         local = fragment[v0:v1] - f0
+        reached = None
+        if matched and count:
+            # The INPUT coordinates, in units of the scene's largest fragment
+            # (the same scale under either normalisation mode).
+            scale = batch.unit[f0:f1].double() / batch.unit[f0:f1].double().max()
+            raw = batch.node_features[v0:v1, 0, :].double() * scale[local, None]
+            fitted, reached, _ = match_rotations(
+                raw, local, embedding[v0:v1], rotation[f0:f1], roots[scene] - f0,
+                candidates=None if batch.fracture is None else batch.fracture[v0:v1],
+                max_points=max_match_points, min_matches=min_matches,
+                tau=inlier_distance, iterations=ransac_iterations,
+                generator=_scene_generator(batch, scene, seed, raw.device),
+            )
+            rotation[f0:f1] = fitted
+            points[v0:v1] = apply_rotation(batch.node_features[v0:v1, 0, :], fitted,
+                                           local) * unit[v0:v1]
+            normals[v0:v1] = apply_rotation(batch.node_features[v0:v1, 1, :], fitted, local)
         radii = None
         if collision:
             reach = points[v0:v1].norm(dim=-1)
@@ -133,7 +190,7 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
         finite = torch.isfinite(parts)
         scored_any = bool(own.any())
         nothing = float("nan")
-        scenes.append({
+        entry = {
             # NaN when a scene has no scored fragment (a single fragment, under
             # the anchor): the per-scene averages skip it rather than count 0.
             "geodesic_deg": float(angle[own].mean()) if scored_any else nothing,
@@ -150,8 +207,14 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
             "_part_chamfer": per_part.tolist(),
             "_translation": t_pred.tolist(),
             "_rotation": predicted.tolist(),
+            "_scored_geodesic_deg": angle[own].tolist(),
             "_anchor": reference,
-        })
+        }
+        if reached is not None:
+            entry["matched_share"] = (float(reached[own].double().mean()) if scored_any
+                                      else nothing)
+            entry["_reached"] = reached.tolist()
+        scenes.append(entry)
     return scenes
 
 

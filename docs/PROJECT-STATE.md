@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 487 tests, clean under `-W error` |
+| Pipeline | **built** — 504 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -882,3 +882,54 @@ on pushed). Mutation checks -- hub not passed to the worker, pull overwriting a
 local `last.pt`, no pull, folder check removed, repository not private, push
 after the stop, token in `repr` -- each fails a test. 64 version markers.
 
+## 15 · Rotations from the matches, and two diagnostics fixed (Oct 2026)
+
+### Why
+
+Read on W10 (interleaved schedule, 128 channels, wd 0.1) with `probe_val.py`,
+which rebuilds a run's own validation set from its checkpoint and reproduced
+the logged `val_geodesic_deg` exactly (102.05 deg at epoch 334):
+
+- The rotation head is the bottleneck, not the data or the embedding. Between
+  fragments that touch, the head's relative rotation was 98.7 deg off at the
+  median; the rotation that lines up the two fragments' embedding-matched
+  points was 0.1 deg off (91% of fits under 5 deg). Chained from the anchor,
+  those fits reached 90% of the scored fragments at 2.7 deg mean, and took the
+  validation error from 102.0 to 14.8 deg (median 0.3) with no retraining; most
+  of what remains is the unreached 10%, tiny fragments where the head is at
+  chance.
+- The cross layers matter: with their partners removed the error rose to 116.5
+  deg, with another object's fragments swapped in to 122.3. They carry the
+  large-fragment advantage and the 2-piece scenes. The touching advantage among
+  small fragments survives without them, so that part is neighbours making the
+  same mistake.
+- Caveat for every number from this route: the two sides of a Breaking Bad
+  break share the same vertices, so a correct match lines up exactly. Tables
+  built on independently sampled points (GARF's) never see that.
+
+### What changed
+
+- `src/reassembly/assembly/rotation.py` (new): `pairwise_rotations` (mutual
+  nearest neighbours as in the translation solver, Kabsch + RANSAC per pair of
+  fragments, on the input coordinates), `chain_rotations` (a maximum spanning
+  tree of RANSAC inlier counts, grown from the anchor; unreached fragments keep
+  the head's rotation), `match_rotations` (both, for one scene).
+- `score_batch(..., rotations="matched")` and `--evaluate --rotations matched`:
+  scored over the same fragments as the head, printed beside it, assembled with,
+  written to `<split>_metrics_matched.json`. RANSAC is seeded per scene by name.
+  `dump_prediction --rotations matched` places a dump with them.
+- `evaluation.metrics.swing_twist_error` reads the error in the object's frame,
+  `predicted @ target^T`. It took `predicted^T @ target`, the input frame, so
+  every `tilt_deg` / `twist_deg` written before this is uninformative (plates
+  showed 59/54 deg that are 32/72 in the object's frame).
+- `scripts/config_flags.config_flags` writes `0` for a "no limit" setting whose
+  default is not `None`: `--modes_per_scene 0` used to come back as 8, so
+  `scaling_sweep` passed its children fewer modes than asked.
+
+**Verified.** 504 tests (17 new: `tests/test_assembly_rotation.py`, an
+object-frame tilt/twist test, the `config_flags` round trip, `evaluate` and
+`dump_prediction` with matched rotations). Exact fits and an exact chain from
+exact matches; RANSAC exact with 60% wrong matches; a head made wrong on
+purpose scores perfectly through the matched route and does not enter the
+result. Mutation checks -- the old tilt/twist residual, the chain composed the
+wrong way round -- each fail a test. 68 version markers.

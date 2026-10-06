@@ -75,6 +75,19 @@ def test_the_dump_round_trips_and_its_poses_are_exact(trained, tmp_path, capsys)
         assert np.allclose(placed, fragment["vertices"], atol=1e-5)
 
 
+def test_the_dump_can_place_the_fragments_with_the_matched_rotations(trained, tmp_path):
+    from scripts.dump_prediction import main
+
+    root, config, checkpoint = trained
+    out = tmp_path / "matched.npz"
+    assert main(_flags(root, config) + ["--checkpoint", str(checkpoint), "--scene",
+                                        _val_key(root, config), "--rotations", "matched",
+                                        "--out", str(out)]) == 0
+    data = np.load(out, allow_pickle=False)
+    assert str(data["rotations"]) == "matched"
+    assert np.isfinite(data["geodesic_deg"]).all()
+
+
 def test_render_gif_writes_a_still_and_an_animation(trained, tmp_path):
     pytest.importorskip("matplotlib")
     pytest.importorskip("PIL")

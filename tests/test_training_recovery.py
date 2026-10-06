@@ -378,6 +378,36 @@ def test_evaluate_assembles_the_prediction_and_scores_it(root, capsys):
     assert "tokens_per_scene" not in capsys.readouterr().out
 
 
+def test_evaluate_scores_the_matched_rotations_on_the_same_fragments(root, capsys):
+    """
+    ``--rotations matched``: the rotations fitted from the embedding matches
+    are scored over exactly the fragments the head's error is, written to their
+    own file, and assembled with -- and still reported under --no_assemble.
+    """
+    config = _config(root, epochs=1, steps_per_epoch=2)
+    training.train(config)
+    capsys.readouterr()
+    summary = training.evaluate(config, checkpoint="last.pt", split="val",
+                                rotations="matched")
+    matched = summary["matched"]
+    assert matched["fragments"] == summary["geodesic_fragments"]
+    assert 0.0 <= matched["reached"] <= 1.0
+    for key in ("geodesic_deg", "geodesic_median_deg", "acc@5deg", "acc@30deg"):
+        assert np.isfinite(matched[key]), key
+    assert np.isfinite(summary["assembly"]["part_accuracy"])
+    assert summary["rotations"] == "matched"
+    out = capsys.readouterr().out
+    assert "rotations from the embedding matches" in out
+    assert "translation solver on rotations fitted from the embedding matches" in out
+    assert (Path(config.out_dir) / "val_metrics_matched.json").exists()
+
+    summary = training.evaluate(config, checkpoint="last.pt", split="val",
+                                rotations="matched", assemble=False)
+    assert "matched" in summary and "assembly" not in summary
+    out = capsys.readouterr().out
+    assert "rotations from the embedding matches" in out and "rotation only" in out
+
+
 def test_a_checkpoint_from_before_the_anchor_is_rescored_on_both_protocols(root, capsys):
     """
     My Thesis Work's checkpoints carry no ``rotation_target``: they were

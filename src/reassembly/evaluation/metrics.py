@@ -97,10 +97,22 @@ def swing_twist_error(predicted: Tensor, target: Tensor,
     ``axis`` names the dataset's canonical up-axis. Verify it rather than
     assume it -- run with x, y and z and see which shows the signature. A wrong
     choice makes the diagnostic meaningless, not the training wrong.
+
+    IN WHICH FRAME
+    --------------
+    The object's. A rotation here carries a fragment's input pose into the
+    object's frame (``nn/losses.py``), so the error rotation that acts *in that
+    frame* -- where the up-axis is defined -- is ``E = predicted @ target^T``:
+    an error about the object's axis multiplies the truth on the left,
+    ``predicted = Rz(theta) @ target``, and reads as pure twist. This used to
+    take ``predicted^T @ target``, the same angle read in the fragment's
+    *input* frame, where the object's axis points anywhere: on a trained run
+    that showed plates at tilt/twist 59/54 deg that are 32/72 in the object's
+    frame. Histories written before this fix have uninformative tilt/twist.
     """
     if axis not in _AXES:
         raise ValueError(f"axis must be one of {sorted(_AXES)}, got {axis!r}")
-    residual = torch.matmul(predicted.transpose(-1, -2), target)
+    residual = torch.matmul(predicted, target.transpose(-1, -2))
     direction = residual.new_tensor(_AXES[axis])
 
     # -- tilt: how far the axis itself moves -------------------------------

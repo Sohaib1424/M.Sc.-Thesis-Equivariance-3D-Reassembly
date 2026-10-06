@@ -4,6 +4,7 @@ Train, resume, or evaluate the V-GAT reassembly model.
     python -m scripts.train --root_dir D:\\path\\to\\breaking_bad --preflight
     python -m scripts.train --root_dir D:\\path\\to\\breaking_bad --epochs 40
     python -m scripts.train --root_dir ... --evaluate          # score best.pt, assembled
+    python -m scripts.train --root_dir ... --evaluate --rotations matched   # rotations from the matches
     python -m scripts.train --root_dir ... --num_gpus 2        # both GPUs (the default: all)
     python -m scripts.train --root_dir ... --num_gpus 1        # one GPU
     python -m scripts.train --root_dir ... --max_fragments 20  # the benchmark's 2-20 pieces
@@ -128,6 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="with --evaluate: use the flags' data settings "
                              "instead of the checkpoint's (split, labels, "
                              "tokens, normalisation)")
+    parser.add_argument("--rotations", default="network", choices=["network", "matched"],
+                        help="with --evaluate: score and assemble with the rotation "
+                             "head's rotations (network), or with rotations fitted "
+                             "from the embedding matches and chained from the anchor "
+                             "(matched, reassembly/assembly/rotation.py). Matched "
+                             "results go to <split>_metrics_matched.json")
     parser.add_argument(
         "--split", default="val", choices=["train", "val", "test"],
         help="which split to score. Defaults to val, NOT test: Breaking Bad "
@@ -159,7 +166,8 @@ def main() -> None:
         override = ("max_fragments",) if args.max_fragments is not None else ()
         evaluate(config, checkpoint=args.checkpoint, split=args.split,
                  assemble=args.assemble, collision=args.collision,
-                 data_from_checkpoint=not args.data_from_flags, override=override)
+                 data_from_checkpoint=not args.data_from_flags, override=override,
+                 rotations=args.rotations)
     else:
         # Not Config fields: the token must not reach a checkpoint, and the
         # checkpoints are what gets uploaded.

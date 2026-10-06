@@ -87,6 +87,23 @@ def test_rotation_off_the_axis_is_all_tilt(degrees):
     assert float(twist) < 1e-9
 
 
+def test_the_split_is_read_in_the_objects_frame():
+    """
+    A rotation carries the input fragment into the object's frame, so an error
+    about the object's up-axis multiplies the truth on the LEFT. That must read
+    as pure twist whatever the fragment's input pose. The earlier residual,
+    ``predicted^T @ target``, read it in the input frame, where the object's
+    axis points anywhere -- this test fails on it.
+    """
+    target = _haar(200, 6)
+    tilt, twist = swing_twist_error(_about("z", 40.0) @ target, target, axis="z")
+    assert float(tilt.max()) < 1e-6
+    assert torch.allclose(twist, torch.full_like(twist, 40.0), atol=1e-6)
+    tilt, twist = swing_twist_error(_about("x", 30.0) @ target, target, axis="z")
+    assert torch.allclose(tilt, torch.full_like(tilt, 30.0), atol=1e-6)
+    assert float(twist.max()) < 1e-6
+
+
 def test_tilt_has_no_arccos_floor():
     """
     The regime the metric exists to detect is ``tilt ~ 0``. An ``arccos`` with

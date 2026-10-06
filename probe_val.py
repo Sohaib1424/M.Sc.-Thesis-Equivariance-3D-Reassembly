@@ -19,8 +19,9 @@ Outputs <out>/fragments.csv, <out>/pairs.csv and <out>/summary.txt, and prints:
   (b)           relative-rotation error of touching vs non-touching pairs, and
                 the error through the anchor by contact hops from it
   (c)           tilt/twist of the error in the OBJECT frame, E = (C R_hat) R^T,
-                per category, about x, y and z -- beside the logged values,
-                which use R_hat^T R (the input frame)
+                per category, about x, y and z -- beside what the installed code
+                logs (the input frame, R_hat^T R, before metrics.swing_twist_error
+                was fixed; the object frame after)
   (d)           with --procrustes: the relative rotation of each pair fitted
                 from the model's own embedding matches, against the network's
 
@@ -343,9 +344,13 @@ def analyse(batch, prediction, config, args, generator=None):
     aligned, _ = align_to_anchor(R_hat, T, scene, anchor)
     err = (geodesic_angle(aligned, T) * deg).cpu().numpy()
     absolute = (geodesic_angle(R_hat, T) * deg).cpu().numpy()
-    # Object frame: residual = aligned @ T^T (swing_twist_error uses pred^T @ target).
-    obj = {a: [t.cpu().numpy() for t in swing_twist_error(
-        aligned.transpose(-1, -2), T.transpose(-1, -2), axis=a)] for a in AXES}
+    # Object frame, E = aligned @ T^T. Computed with the identity as the
+    # "prediction", so it does not depend on which residual the installed
+    # swing_twist_error takes: both conventions then give E or E^T, whose
+    # tilt/twist are the same. 'logged' is whatever the installed code writes.
+    E = aligned @ T.transpose(-1, -2)
+    eye = torch.eye(3, dtype=E.dtype, device=E.device).expand_as(E)
+    obj = {a: [t.cpu().numpy() for t in swing_twist_error(eye, E, axis=a)] for a in AXES}
     logged = [t.cpu().numpy() for t in swing_twist_error(aligned, T, axis=config.symmetry_axis)]
 
     ones = torch.ones(N, dtype=torch.float64, device=dev)
@@ -609,8 +614,8 @@ def summarise(rows, pairs, reach_counts, vertex_total, config, state, args, seco
     say("")
     say("(c) tilt / twist of the anchor-aligned error, deg (chance 90 / 90). Object frame "
         "E = (C R_hat) R^T,")
-    say(f"    about the object's x, y, z; 'logged' is R_hat^T R about "
-        f"{config.symmetry_axis!r}, as val_tilt_deg / val_twist_deg")
+    say(f"    about the object's x, y, z; 'logged' is what this code version writes to "
+        f"val_tilt_deg / val_twist_deg, about {config.symmetry_axis!r}")
     say(f"    {'category':18}{'n':>6}{'geo':>7}   {'x tilt/twist':>13}   {'y tilt/twist':>13}"
         f"   {'z tilt/twist':>13}   {'logged':>13}")
     categories = np.array([r["category"] for r in sub])

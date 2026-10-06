@@ -35,7 +35,7 @@ Contents (plain arrays with offsets, so ``np.load`` needs no ``allow_pickle``)::
                                 measured from the anchor's true centroid
     geodesic_deg, tilt_deg, twist_deg, part_chamfer   (F,)
     rmse_t, chamfer, part_accuracy, matches           scalars for the scene
-    scene, checkpoint, seed, epoch
+    scene, checkpoint, seed, epoch, rotations   (rotations: network or matched)
 
 A fragment's vertex ``v`` with centroid ``c`` is shown scattered at
 ``A (v - c) + c + shift``, and reassembled at ``R_pred A (v - c) + placement``.
@@ -55,8 +55,9 @@ from scripts.config_flags import add_config_arguments, config_from_args  # noqa:
 
 
 def dump(dataset, index, model, config, device, seed: int, out: Path,
-         checkpoint: str = "", epoch: int = -1) -> dict:
-    """Build the scene, predict, assemble, score, and write the dump."""
+         checkpoint: str = "", epoch: int = -1, rotations: str = "network") -> dict:
+    """Build the scene, predict, assemble, score, and write the dump. ``rotations``
+    is the rotation head's (network) or fitted from the matches (matched)."""
     import torch
 
     from reassembly.assembly import score_batch
@@ -80,7 +81,7 @@ def dump(dataset, index, model, config, device, seed: int, out: Path,
     with torch.no_grad():
         _forward(model, batch, build_criterion(config), config, keep=keep)
     prediction = keep["prediction"]
-    scene = score_batch(batch, prediction)[0]
+    scene = score_batch(batch, prediction, rotations=rotations, seed=config.seed)[0]
 
     # Placed the way the scorer placed them: with the largest fragment set to
     # its true pose (reassembly.nn.anchor), so the anchor's error is 0 and the
@@ -122,7 +123,7 @@ def dump(dataset, index, model, config, device, seed: int, out: Path,
         rmse_t=np.float32(scene["rmse_t"]), chamfer=np.float32(scene["chamfer"]),
         part_accuracy=np.float32(scene["part_accuracy"]), matches=np.float32(scene["matches"]),
         scene=np.array(dataset.key(index)), checkpoint=np.array(checkpoint),
-        seed=np.array(seed), epoch=np.array(epoch),
+        seed=np.array(seed), epoch=np.array(epoch), rotations=np.array(rotations),
     )
     return {"geodesic": geodesic, "tilt": tilt.numpy(), "twist": twist.numpy(),
             "scene": scene, "part_chamfer": part_chamfer}
@@ -140,6 +141,9 @@ def main(argv=None) -> int:
     parser.add_argument("--list", action="store_true", help="list the scenes of --split")
     parser.add_argument("--split", default="val", choices=["train", "val", "test"])
     parser.add_argument("--device", default=None)
+    parser.add_argument("--rotations", default="network", choices=["network", "matched"],
+                        help="the rotation head's rotations, or ones fitted from the "
+                             "embedding matches (reassembly/assembly/rotation.py)")
     add_config_arguments(parser)
     args = parser.parse_args(argv)
     config = config_from_args(args)
@@ -173,9 +177,11 @@ def main(argv=None) -> int:
         return 2
     out = Path(args.out)
     result = dump(dataset, index, model, config, device, args.scatter_seed, out,
-                  checkpoint=str(args.checkpoint), epoch=int(state.get("epoch", -1)))
+                  checkpoint=str(args.checkpoint), epoch=int(state.get("epoch", -1)),
+                  rotations=args.rotations)
 
-    print(f"scene {args.scene}   ({split} split, scatter seed {args.scatter_seed})")
+    print(f"scene {args.scene}   ({split} split, scatter seed {args.scatter_seed}, "
+          f"{args.rotations} rotations)")
     print(f"  {'fragment':>8} {'geodesic':>9} {'tilt':>7} {'twist':>7} {'chamfer':>10}")
     for f, (g, t, w, c) in enumerate(zip(result["geodesic"], result["tilt"], result["twist"],
                                          result["part_chamfer"])):

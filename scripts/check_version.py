@@ -153,6 +153,15 @@ MARKERS = [
      'hub.push(f"epoch {epoch + 1}: val geodesic {score:.3f}")'),
     ("hub token kept out of Config and checkpoints", "scripts/train.py",
      "train(config, hub=HubSync(args.hf_repo_id, args.hf_local_dir, args.hf_token))"),
+    # -- Thesis v6: rotations from the matches, and two diagnostics fixed --------
+    ("rotations fitted from the embedding matches", "src/reassembly/assembly/rotation.py",
+     "def chain_rotations"),
+    ("--evaluate --rotations matched", "src/reassembly/assembly/scoring.py",
+     'ROTATION_SOURCES = ("network", "matched")'),
+    ("tilt/twist read in the object's frame", "src/reassembly/evaluation/metrics.py",
+     "residual = torch.matmul(predicted, target.transpose(-1, -2))"),
+    ("'no limit' survives config_flags", "scripts/config_flags.py",
+     'out += [flag(name), "0"]'),
 ]
 
 

@@ -290,7 +290,13 @@ def config_flags(config: Config, fields=None) -> list:
             continue
         value = getattr(config, name)
         if value is None:
-            out += [flag(name), ""] if name == "mode_filter" else []
+            if name == "mode_filter":
+                out += [flag(name), ""]
+            elif name in _OPTIONAL_INTS:
+                # 0 is "no limit" on the command line. Leaving the flag out
+                # would bring the default back -- --modes_per_scene 8 for a run
+                # that drew every mode -- which is what this used to do.
+                out += [flag(name), "0"]
         elif isinstance(value, bool):
             out += [flag(name), str(value)]
         elif name == "subsets":

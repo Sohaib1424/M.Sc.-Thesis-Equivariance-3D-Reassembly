@@ -2839,7 +2839,8 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
              split: str = "test", assemble: bool = True,
              collision: bool = False,
              data_from_checkpoint: bool = True,
-             override: Sequence[str] = ()) -> Dict[str, float]:
+             override: Sequence[str] = (),
+             rotations: str = "network") -> Dict[str, float]:
     """
     Score a saved checkpoint on a held-out split: rotation, and -- with
     ``assemble`` -- the full assembly the benchmark scores.
@@ -2849,6 +2850,14 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     and part accuracy in world units, averaged per scene then over scenes as
     the benchmark does. Without it, only rotation is reported -- and said to be,
     rather than the other numbers being silently absent.
+
+    ``rotations="matched"`` replaces the rotation head's rotations with ones
+    fitted from the embedding matches and chained from the anchor
+    (:mod:`reassembly.assembly.rotation`), reports their error over the same
+    scored fragments as the head's, and assembles with them. A fragment the
+    chain cannot reach keeps the head's rotation, and the share reached is
+    printed. Not comparable with tables built on independently sampled points:
+    see that module's docstring.
 
     The model, and by default the DATA definition, come from the checkpoint's
     own config: a model is scored on the split, labels, tokens and
@@ -2865,8 +2874,11 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     """
     import torch
 
-    from .assembly import mean_over_scenes, score_batch
+    from .assembly import ROTATION_SOURCES, mean_over_scenes, score_batch
 
+    if rotations not in ROTATION_SOURCES:
+        raise ValueError(f"rotations must be one of {ROTATION_SOURCES}, got {rotations!r}")
+    matched = rotations == "matched"
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model, config, state, path = load_checkpoint(
         checkpoint, config, device, data_from_checkpoint=data_from_checkpoint,
@@ -2878,14 +2890,17 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     scenes: List[Dict] = []
 
     def collect(batch, prediction) -> None:
-        scores = score_batch(batch, prediction, collision=collision)
+        scores = score_batch(batch, prediction, collision=collision, rotations=rotations,
+                             seed=config.seed)
         for key, category, score in zip(batch.scene_keys, batch.categories, scores):
             score["_scene"], score["_category"] = key, category
             scenes.append(score)
 
+    # The matched rotations are built by the scorer, so it runs for them even
+    # under --no_assemble; only the assembly report is then left out.
     summary, _, _ = run_epoch(model, loader, build_criterion(config), config,
                               device=device, label=split,
-                              on_prediction=collect if assemble else None)
+                              on_prediction=collect if (assemble or matched) else None)
 
     print(f"\n{split} ({len(dataset)} samples, checkpoint {path.name} from epoch "
           f"{state['epoch'] + 1})")
@@ -2921,6 +2936,8 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
           f"with GARF's tables. Compare against the VANILLA Everyday "
           f"supplementary\n  table -- SE(3)-Equiv 79.30 deg, GARF-mini 10.41 deg "
           f"-- not the headline row.")
+    if matched:
+        summary["matched"] = _report_matched(scenes, summary)
 
     if assemble:
         public = [{k: v for k, v in scene.items() if not k.startswith("_")}
@@ -2933,7 +2950,7 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
         summary["assembly"] = assembly
         summary["assembly_by_category"] = by_category
         summary["assembly_scenes"] = [dict(scene) for scene in scenes]
-        _print_assembly(assembly, by_category, len(scenes))
+        _print_assembly(assembly, by_category, len(scenes), rotations=rotations)
     else:
         print("  (rotation only: --no_assemble skipped the translation solver, so "
               "there is no RMSE(T), Chamfer or part accuracy)")
@@ -2941,7 +2958,10 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     summary.pop("failures", None)
     summary.pop("most_repaired", None)
     summary["max_fragments"] = config.max_fragments
-    out = Path(config.out_dir) / f"{split}_metrics.json"
+    summary["rotations"] = rotations
+    # One file per rotation source, so scoring both ways keeps both.
+    out = Path(config.out_dir) / (f"{split}_metrics.json" if not matched
+                                  else f"{split}_metrics_matched.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(summary, indent=2, default=str))
     return summary
@@ -3042,14 +3062,59 @@ def _fragment_line(config: Config, dataset) -> str:
             f"{dataset.fragment_limit.describe()}")
 
 
+def _report_matched(scenes: List[Dict], summary: Dict) -> Dict[str, float]:
+    """
+    The matched rotations' error over the same scored fragments as the head's
+    (fragment-weighted, as ``geodesic_deg`` is), printed beside it.
+    """
+    import torch
+
+    angles = torch.tensor([a for scene in scenes for a in scene.get("_scored_geodesic_deg", [])],
+                          dtype=torch.float64)
+    # Scored = every fragment but the anchor (`_anchor` is -1 without one).
+    reached = [bool(r) for scene in scenes
+               for index, r in enumerate(scene.get("_reached", []))
+               if index != scene.get("_anchor", -1)]
+    if not angles.numel():
+        print("\n  rotations from the embedding matches: no fragment could be scored")
+        return {}
+    out = {
+        "geodesic_deg": float(angles.mean()),
+        "geodesic_median_deg": float(angles.median()),
+        "reached": sum(reached) / max(len(reached), 1),
+        "fragments": int(angles.numel()),
+    }
+    for threshold in (5.0, 10.0, 30.0):
+        out[f"acc@{threshold:g}deg"] = float((angles < threshold).double().mean())
+    print("\n  rotations from the embedding matches (--rotations matched, "
+          "assembly/rotation.py), same fragments:")
+    print(f"    matched   {out['geodesic_deg']:7.2f} deg   median {out['geodesic_median_deg']:6.2f}   "
+          f"acc@5 {out['acc@5deg']:.3f}  acc@10 {out['acc@10deg']:.3f}  "
+          f"acc@30 {out['acc@30deg']:.3f}   ({out['fragments']} fragments)")
+    if "geodesic_deg" in summary:
+        print(f"    network   {summary['geodesic_deg']:7.2f} deg   median "
+              f"{summary.get('geodesic_median_deg', float('nan')):6.2f}   "
+              f"acc@5 {summary.get('acc@5deg', float('nan')):.3f}  "
+              f"acc@10 {summary.get('acc@10deg', float('nan')):.3f}  "
+              f"acc@30 {summary.get('acc@30deg', float('nan')):.3f}   (the rotation head)")
+    print(f"    the chain reached {100 * out['reached']:.0f}% of the scored fragments; the "
+          f"rest kept the head's rotation")
+    print("    Breaking Bad's fragments share their break vertices, so correct matches "
+          "line up exactly:\n    not comparable with tables built on independently "
+          "sampled points without saying so.")
+    return out
+
+
 def _print_assembly(assembly: Dict[str, float], by_category: Dict[str, Dict],
-                    scenes: int) -> None:
+                    scenes: int, rotations: str = "network") -> None:
     if not assembly:
         print("  assembly: no scene could be scored")
         return
-    print(f"\n  assembly ({scenes} scenes, translation solver on the predicted "
-          f"rotations, world units, per-scene means;\n  largest fragment set to its "
-          f"true pose, the other fragments scored):")
+    source = ("rotations fitted from the embedding matches" if rotations == "matched"
+              else "the predicted rotations")
+    print(f"\n  assembly ({scenes} scenes, translation solver on {source}, world units, "
+          f"per-scene means;\n  largest fragment set to its true pose, the other "
+          f"fragments scored):")
     print(f"    RMSE(T)        {assembly.get('rmse_t', float('nan')):.4f}")
     print(f"    Chamfer (CD)   {assembly.get('chamfer', float('nan')):.5f}   "
           f"(whole shape; per part {assembly.get('part_chamfer', float('nan')):.5f})")

@@ -546,6 +546,22 @@ def test_the_flags_reproduce_a_config():
                 (list(theirs) if isinstance(theirs, (list, tuple)) else theirs), field.name
 
 
+def test_no_limit_survives_the_flags():
+    """
+    ``modes_per_scene=None`` (every mode) is ``0`` on the command line. It used
+    to be left out of the flags, which brought the default 8 back -- so a sweep
+    passing a run's settings on silently trained its children on fewer modes.
+    """
+    from scripts.config_flags import config_flags
+    from scripts.train import build_parser, config_from_args
+
+    config = Config(root="/d", modes_per_scene=None)
+    flags = config_flags(config)
+    assert flags[flags.index("--modes_per_scene") + 1] == "0"
+    again = config_from_args(build_parser().parse_args(flags))
+    assert again.modes_per_scene is None
+
+
 def test_multi_gpu_from_a_notebook_raises_something_actionable(monkeypatch, no_gpu):
     """
     `mp.spawn` re-imports `__main__` in each child, which does not exist in a

@@ -267,6 +267,7 @@ src/reassembly/
 ├── distributed.py                 1, 2 or N GPUs: one all-reduce per optimizer step
 ├── assembly/
 │   ├── translation.py             stage two: match in embedding space, solve for t
+│   ├── rotation.py                rotations from those matches (--rotations matched)
 │   └── scoring.py                 RMSE(T), Chamfer, part accuracy, in world units
 ├── nn/
 │   ├── vn.py                  ★   Vector Neuron primitives, Gram-Schmidt head
@@ -296,7 +297,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             445 tests, no skips
+tests/                             504 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -619,6 +620,33 @@ python -m scripts.render_gif --dump pred.npz --out reassembly.gif
 A dump is a small `.npz` with plain arrays, so it can be copied off Kaggle and
 watched on any machine with a clone and trimesh (no torch).
 
+### Rotations from the matches (`--rotations matched`)
+
+The same embedding matches also determine the rotations. `--rotations matched`
+fits, for every pair of fragments with enough matches, the rotation that lines
+up their matched points (Kabsch with RANSAC, on the network's *input*
+coordinates), chains those fits outward from the anchor along the pairs with
+the most agreeing matches, and scores and assembles with the result
+(`reassembly.assembly.rotation`). A fragment the chain cannot reach keeps the
+rotation head's rotation; the share reached is printed. The head's own numbers
+are printed beside the matched ones, over the same fragments, and the matched
+results go to `<split>_metrics_matched.json`.
+
+```bash
+python -m scripts.train --root_dir data --evaluate --checkpoint path/to/best.pt --split val --rotations matched
+python -m scripts.dump_prediction --root_dir data --checkpoint path/to/best.pt --scene <object>/<mode> --rotations matched --out pred.npz
+```
+
+Why it exists: on W10 (epoch 334, 1,023 validation scenes) the head's relative
+rotation between touching fragments was 98.7° off at the median, while the
+fitted one was 0.1° off, and the chained rotations took the validation error
+from 102.0° to 14.8° (median 0.3°) with no retraining. Read that number with
+its caveat: a Breaking Bad object's fragments are cut from one mesh, so the two
+sides of a break share the *same* vertices and a correct match lines up
+exactly. Pipelines that sample points independently on each fragment (GARF and
+most published tables) never see coincident points, so this is not directly
+comparable with their numbers without saying so.
+
 ### Tools
 
 | | |
@@ -641,7 +669,10 @@ That ~90° level is a **landmark, not a floor**, and the earlier design's own
 later measurements refute reading it as one: a fragment of a symmetric object
 is not itself symmetric, because its fracture boundary is jagged and unique,
 and a scaling run on eight Everyday objects reached 30.9°. The tilt/twist split
-in `reassembly.evaluation.metrics` distinguishes the two readings directly.
+in `reassembly.evaluation.metrics` distinguishes the two readings directly. It
+is read in the object's frame, where the up-axis is defined; histories written
+before that fix took it in each fragment's input frame, so their `tilt_deg` and
+`twist_deg` columns are uninformative.
 
 Reference values used throughout, worth checking any number against:
 

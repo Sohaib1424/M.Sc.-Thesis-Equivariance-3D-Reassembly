@@ -44,6 +44,23 @@ Two tests
                the best-matched pairs -- no ground-truth contacts used -- and
                report the per-fragment error that would give.
 
+Is the matched route using anything it should not?
+---------------------------------------------------
+--hide_truth            Every ground-truth field of the batch (target rotations,
+                        positions, normals, centroids, coincidence clusters) is
+                        replaced by NaN / none before the network and the solver
+                        run; the truth is used only afterwards, to score. If
+                        anything read it, the numbers would change or turn NaN.
+--untrained             Random weights, same architecture: fingerprints that
+                        learned nothing. The matched route should fail.
+--shuffle_fingerprints  The trained fingerprints, dealt out at random among each
+                        fragment's fracture-surface vertices. Should fail too.
+--jitter S --drop P     Noise on every input vertex (S, in largest-fragment
+                        radii) and P of the fracture vertices left out of the
+                        matching: the two sides of a break no longer coincide
+                        and many partners are missing. Measures how much the
+                        result owes to Breaking Bad's shared break vertices.
+
 --split train scores training scenes the same way. --print_flags prints the
 scripts.train command that reproduces the checkpoint's run, and exits. Run from
 the repository root, or pass --repo <repository root>.
@@ -92,6 +109,23 @@ def parse_args(argv=None):
                         "radius")
     p.add_argument("--ransac_iters", type=int, default=256)
     p.add_argument("--seed", type=int, default=0, help="RANSAC draws and the swap order")
+    # -- tests of what the matched route depends on ------------------------
+    p.add_argument("--hide_truth", action="store_true",
+                   help="replace every ground-truth field of the batch (target rotations, "
+                        "positions, normals, centroids, coincidence clusters) with NaN / none "
+                        "before the network and the solver run; the truth is used only "
+                        "afterwards, to score. The numbers must not change")
+    p.add_argument("--untrained", action="store_true",
+                   help="the same architecture with random weights instead of the checkpoint's")
+    p.add_argument("--shuffle_fingerprints", action="store_true",
+                   help="--procrustes: shuffle the embeddings among each fragment's "
+                        "fracture-surface vertices before matching")
+    p.add_argument("--jitter", type=float, default=0.0,
+                   help="Gaussian noise on every input vertex, in units of the scene's largest "
+                        "fragment's radius, so the two sides of a break no longer coincide")
+    p.add_argument("--drop", type=float, default=0.0,
+                   help="--procrustes: drop this share of each fragment's fracture-surface "
+                        "vertices from the matching at random, so many partners are missing")
     p.add_argument("--num_workers", type=int, default=None,
                    help="data-loader workers; default: the run's own")
     p.add_argument("--device", default=None, help="default: cuda:0 if available, else cpu")
@@ -124,6 +158,15 @@ def config_from_checkpoint(state, args):
     elif args.split == "train":
         values[key] = values.get("limit_val")       # as many scenes as validation scores
     return Config(**values)
+
+
+def tests(args) -> str:
+    """The active tests, for the headers; '' when none."""
+    active = [name for name in ("hide_truth", "untrained", "shuffle_fingerprints")
+              if getattr(args, name)]
+    active += [f"{name}={getattr(args, name):g}" for name in ("jitter", "drop")
+               if getattr(args, name) > 0]
+    return ", ".join(active)
 
 
 def cross_hops(schedule):
@@ -179,6 +222,48 @@ def rewire(batch, mode, counters):
 
 
 # ---------------------------------------------------------------------------
+# --hide_truth, --jitter: what the network and the solver are allowed to see
+# ---------------------------------------------------------------------------
+
+TRUTH_FIELDS = ("target_rotation", "target_vertices", "target_normals",
+                "target_edge_normals", "centroid")
+
+
+def hide_truth(batch):
+    """
+    The batch with every ground-truth field gone: the target rotations,
+    positions, normals and edge normals and the true centroids become NaN, and
+    the coincidence clusters (which vertices of two fragments were one point)
+    become "none". What is left is what the model is given at inference -- the
+    scattered input, the mesh graph, the fracture mask, the tokens, the scale.
+    Anything that still read a hidden field would turn NaN or find nothing.
+    """
+    import torch
+
+    hidden = {name: torch.full_like(getattr(batch, name), float("nan"))
+              for name in TRUTH_FIELDS if getattr(batch, name) is not None}
+    hidden["cluster"] = torch.full_like(batch.cluster, -1)
+    hidden["num_clusters"] = 0
+    return batch._replace(**hidden)
+
+
+def jitter_inputs(batch, sigma, generator):
+    """
+    Independent Gaussian noise on every input vertex, so the two sides of a
+    break no longer share exact positions; each edge's relative-position
+    feature (``p_source - p_destination``) is recomputed to match.
+    """
+    import torch
+
+    node = batch.node_features.clone()
+    node[:, 0, :] += sigma * torch.randn(node[:, 0, :].shape, generator=generator,
+                                         device=node.device, dtype=node.dtype)
+    edge = batch.edge_attr.clone()
+    edge[:, 2, :] = node[batch.edge_index[0], 0, :] - node[batch.edge_index[1], 0, :]
+    return batch._replace(node_features=node, edge_attr=edge)
+
+
+# ---------------------------------------------------------------------------
 # --procrustes: rotations fitted from the embedding matches
 # ---------------------------------------------------------------------------
 
@@ -219,9 +304,15 @@ def ransac_rotation(P, Q, iterations, tau, generator):
     return R[best], int(mask.sum())
 
 
-def fitted_rotations(batch, prediction, args, generator):
+def fitted_rotations(batch, prediction, args, generator, noise=None):
     """``{(i, j): (R_ij, matches, inliers)}``, global fragment indices ``i < j``;
-    ``R_ij`` maps fragment i's input frame onto fragment j's."""
+    ``R_ij`` maps fragment i's input frame onto fragment j's.
+
+    Reads only the network's input (scattered coordinates, which fragment each
+    vertex is in, the fracture mask, the normalisation scale) and its output
+    (the embeddings) -- never a ground-truth field; ``--hide_truth`` checks it.
+    ``noise`` is the generator for ``--drop`` and ``--shuffle_fingerprints``,
+    kept apart from the RANSAC one so those draws are unchanged without them."""
     import torch
 
     from reassembly.assembly.translation import mutual_nearest_neighbours, subsample_per_fragment
@@ -242,9 +333,24 @@ def fitted_rotations(batch, prediction, args, generator):
         # In units of the scene's largest fragment, whatever the normalisation mode.
         scale = unit[f0:f1] / unit[f0:f1].max()
         p = points[v0:v1] * scale[local, None]
-        candidates = None if batch.fracture is None else batch.fracture[v0:v1]
+        candidates = None if batch.fracture is None else batch.fracture[v0:v1].clone()
+        if args.drop > 0 and candidates is not None:
+            candidates &= torch.rand(candidates.shape, generator=noise,
+                                     device=candidates.device) >= args.drop
+        scene_embedding = embedding[v0:v1]
+        if args.shuffle_fingerprints:
+            # Same fingerprints, each fragment's dealt out among its own
+            # fracture-surface vertices at random: what they encode about the
+            # piece survives, which vertex carries which does not.
+            scene_embedding = scene_embedding.clone()
+            pool = candidates if candidates is not None else torch.ones_like(local, dtype=torch.bool)
+            for f in range(f1 - f0):
+                index = torch.nonzero((local == f) & pool).flatten()
+                if index.numel() > 1:
+                    order = torch.randperm(index.numel(), generator=noise, device=index.device)
+                    scene_embedding[index] = scene_embedding[index[order]]
         keep = subsample_per_fragment(local, 2048, candidates)
-        source, target = mutual_nearest_neighbours(embedding[v0:v1][keep], local[keep])
+        source, target = mutual_nearest_neighbours(scene_embedding[keep], local[keep])
         source, target = keep[source], keep[target]
         if source.numel() == 0:
             continue
@@ -262,9 +368,14 @@ def fitted_rotations(batch, prediction, args, generator):
     return fitted
 
 
-def chain_from_anchor(fitted, anchors, fragment_ptr, T, min_inliers):
+def chain_from_anchor(fitted, anchors, fragment_ptr, roots, min_inliers):
     """Fitted rotations composed outward from each scene's anchor along a maximum
-    spanning tree of inlier counts. ``{fragment: (R, parent)}`` for reached fragments."""
+    spanning tree of inlier counts. ``{fragment: (R, parent)}`` for reached fragments.
+
+    ``roots`` are the NETWORK's rotations: each tree starts from the anchor's
+    predicted rotation, so nothing here touches the truth. Scoring then sets the
+    anchor to its true pose (the benchmark protocol), which turns ``R`` into
+    ``T_a R_hat_a^T R`` -- exactly as if the tree had started from ``T_a``."""
     reached = {}
     for s, a in enumerate(anchors):
         f0, f1 = fragment_ptr[s], fragment_ptr[s + 1]
@@ -274,8 +385,8 @@ def chain_from_anchor(fitted, anchors, fragment_ptr, T, min_inliers):
         for (i, j), (R, _, inliers) in fitted.items():
             if f0 <= i < f1 and inliers >= min_inliers:
                 edges[(i, j)] = (inliers, R)
-        pose = {a: T[a]}
-        reached[a] = (T[a], -1)
+        pose = {a: roots[a]}
+        reached[a] = (roots[a], -1)
         while True:
             best = None
             for (i, j), (w, R) in edges.items():
@@ -321,8 +432,12 @@ def contact_matrix(cluster, vertex_fragment, count):
     return contact + contact.T
 
 
-def analyse(batch, prediction, config, args, generator=None):
-    """Per-fragment rows, per-pair rows and reach counts for one batch."""
+def analyse(batch, prediction, config, args, generator=None, seen=None, noise=None):
+    """Per-fragment rows, per-pair rows and reach counts for one batch.
+
+    ``batch`` carries the truth and is used to SCORE; ``seen`` is what the
+    solver is given (the same batch, or with ``--hide_truth`` one whose
+    ground-truth fields are NaN)."""
     import torch
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import shortest_path
@@ -421,9 +536,16 @@ def analyse(batch, prediction, config, args, generator=None):
 
     fitted, chained = {}, {}
     if args.procrustes:
-        fitted = fitted_rotations(batch, prediction, args, generator)
-        chained = chain_from_anchor(fitted, anchors.tolist(), ptr.tolist(), T,
+        # The solver gets `seen` -- with --hide_truth, a batch whose ground-truth
+        # fields are NaN -- and starts each tree from the network's own rotation.
+        fitted = fitted_rotations(seen if seen is not None else batch, prediction, args,
+                                  generator, noise)
+        chained = chain_from_anchor(fitted, anchors.tolist(), ptr.tolist(), R_hat,
                                     args.min_matches)
+        # Scoring only: the benchmark protocol sets each anchor to its true pose.
+        for f, (R, parent) in list(chained.items()):
+            a = int(anchors[int(scene_np[f])])
+            chained[f] = (T[a] @ R_hat[a].transpose(-1, -2) @ R, parent)
 
     def fit_error(R, i, j):
         truth = T[j].transpose(-1, -2) @ T[i]
@@ -518,17 +640,21 @@ def summarise(rows, pairs, reach_counts, vertex_total, config, state, args, seco
     scenes = len({r["scene"] for r in rows})
     say(f"{args.split}: {scenes} scenes, {int(scored.sum())} scored fragments "
         f"({len(rows) - int(scored.sum())} anchors), {seconds:.0f} s, cross layers: {args.cross}")
+    if tests(args):
+        say(f"  tests: {tests(args)}")
     say(f"  mean anchor-aligned error {err[scored].mean():.2f} deg, median "
         f"{np.median(err[scored]):.2f} (chance {CHANCE_DEG})")
     history = state.get("history") or []
     logged = [r for r in history if r.get("epoch") == state.get("epoch")] or history[-1:]
+    unchanged_model = not (args.untrained or args.jitter > 0)
     if logged and args.split == "val" and "val_geodesic_deg" in logged[0]:
-        if args.cross == "normal":
+        if args.cross == "normal" and unchanged_model:
             say(f"  the run logged val_geodesic_deg {logged[0]['val_geodesic_deg']:.2f} at epoch "
                 f"{logged[0].get('epoch')} -- the two should agree (same scenes, same draws)")
         else:
             say(f"  the run logged val_geodesic_deg {logged[0]['val_geodesic_deg']:.2f} at epoch "
-                f"{logged[0].get('epoch')} with the cross layers working normally")
+                f"{logged[0].get('epoch')} with the trained model, clean input and the cross "
+                f"layers working normally")
     if args.cross == "swap":
         say(f"  swap partners: {counters['swap_same_object']} scene(s) had to take a scene of "
             f"the same object, {counters['swap_alone']} had no partner (left with none)")
@@ -697,8 +823,9 @@ def main(argv=None) -> int:
 
     import torch
 
-    from reassembly.training import (BreakingBadScenes, _forward, _is_oom, _loader,
-                                     _to_device, build_criterion, build_model)
+    from reassembly.data.features import complete_batch
+    from reassembly.training import (BreakingBadScenes, _is_oom, _loader, _to_device,
+                                     build_model)
 
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -718,8 +845,11 @@ def main(argv=None) -> int:
         quote = (lambda s: f'"{s}"' if not s or any(c.isspace() for c in s) else s)
         print("python -m scripts.train " + " ".join(quote(str(f)) for f in flags))
         return 0
+    if args.untrained:
+        torch.manual_seed(args.seed)               # random weights, same architecture
     model = build_model(config).to(device)
-    model.load_state_dict(state["model"])
+    if not args.untrained:
+        model.load_state_dict(state["model"])
     model.eval()
 
     scenes_per_batch = args.batch_scenes or (min(config.batch_size, 4) if args.cross == "swap"
@@ -733,11 +863,14 @@ def main(argv=None) -> int:
         dataset.items = [dataset.items[i] for i in order]
     loader = _loader(dataset, config, False, 0, 1, 0,
                      pairs_in_worker=not str(device).startswith("cuda"))
-    criterion = build_criterion(config)
     generator = torch.Generator(device=device).manual_seed(args.seed)
+    # A separate stream for the tests, so RANSAC draws exactly as it does without them.
+    noise = torch.Generator(device=device).manual_seed(args.seed + 1)
     print(f"checkpoint {args.checkpoint} (epoch {state.get('epoch')}), {len(dataset)} "
           f"{args.split} scenes, schedule {' '.join(config.schedule)}, cross layers: "
           f"{args.cross}, {scenes_per_batch} scenes per batch, device {device}")
+    if tests(args):
+        print(f"tests: {tests(args)}")
 
     rows, pairs = [], []
     reach_counts = np.zeros(HOPS + 1)
@@ -749,10 +882,19 @@ def main(argv=None) -> int:
             dropped += len(skipped)
             if batch is None:
                 continue
-            batch = rewire(_to_device(batch, device), args.cross, counters)
-            keep = {}
+            # The scattered input is made from the truth here, as the data
+            # loader always does; after this point the truth is only for scoring.
+            batch = rewire(complete_batch(_to_device(batch, device)), args.cross, counters)
+            if args.jitter > 0:
+                batch = jitter_inputs(batch, args.jitter, noise)
+            seen = hide_truth(batch) if args.hide_truth else batch
             try:
-                _forward(model, batch, criterion, config, keep=keep)
+                # Exactly the inputs `training._forward` passes the model.
+                prediction = model(
+                    seen.node_features, seen.edge_index, seen.edge_attr,
+                    seen.vertex_fragment, seen.num_fragments,
+                    log_scale=seen.log_scale, token_index=seen.token_index,
+                    token_query=seen.token_query, token_key=seen.token_key)
             except Exception as error:                      # noqa: BLE001
                 if not _is_oom(error):
                     raise
@@ -760,8 +902,8 @@ def main(argv=None) -> int:
                 if str(device).startswith("cuda"):
                     torch.cuda.empty_cache()
                 continue
-            r, p, counts, n = analyse(keep["batch"], keep["prediction"], config, args,
-                                      generator)
+            r, p, counts, n = analyse(batch, prediction, config, args, generator,
+                                      seen=seen, noise=noise)
             rows += r
             pairs += p
             reach_counts += counts

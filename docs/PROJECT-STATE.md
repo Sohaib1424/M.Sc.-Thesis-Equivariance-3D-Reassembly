@@ -1198,7 +1198,10 @@ The second change in `E:\Thesis v7`, and the one that needs retraining.
   (`_PredictionWriter`, `assembly/dump.py` -- the writer `dump_prediction`
   uses too).
 - `probe_val.py`: the matched route only (`--procrustes` accepted, always on);
-  `--table` gathers several probes' summaries into one table.
+  `--table` gathers several probes' summaries into one table. `--max_fragments
+  N` probes break patterns of 2 to N pieces instead of the run's own range (0:
+  every count), named in the report and in the table's `pieces` column; under
+  `--cross none` the report says that no vertex hears another fragment.
 - `viz/results.py`, `viz/figures.py`, `scripts/make_figures.py`: the best
   epoch by acc@5, a validation-accuracy figure, `tables/by_type.csv/.md`
   (every number per object type and for the whole subset); files from before
@@ -1220,7 +1223,7 @@ it to be right: on one thread, over seven seeds, 120 epochs took them from
 chance to exact (0.0 deg, every fragment reached), where 80 epochs got one seed
 in four there. Mutation checks -- the coincidence labels shuffled over the
 vertices, the fitted rotations transposed, the anchor alignment on the wrong
-side, the best-so-far kept across a change of metric -- each fail a test. 106
+side, the best-so-far kept across a change of metric -- each fail a test. 107
 version markers.
 
 ### Next

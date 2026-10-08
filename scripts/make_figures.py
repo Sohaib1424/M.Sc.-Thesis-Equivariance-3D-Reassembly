@@ -22,7 +22,7 @@ training/<run>/   the loss (the embedding term); the four geometric scores,
                   one panel each; the embedding term beside match@1; the
                   rotation error against chance; validation acc@5/10/30 and
                   the share the matching reached (best.pt is the highest
-                  acc@10); the error per category and epoch.
+                  acc@5); the error per category and epoch.
 training/         with two or more runs: every run on one set of axes,
                   training and validation (for ablations).
 evaluation/       per-piece rotation error by object type and dataset, as

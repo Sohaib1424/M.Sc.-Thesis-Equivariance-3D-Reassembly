@@ -506,10 +506,13 @@ CHANCE = {
 # VN-GAT design reached 30.9 deg training error on eight Everyday objects --
 # bottles, bowls and mugs -- which is well under it.
 
-BEST_METRIC = "acc@10deg"
+BEST_METRIC = "acc@5deg"
 """What ``best.pt`` is chosen by: the validation share of scored fragments
-whose matched rotation is within 10 deg of the truth, higher is better."""
-_BEST_NAME = "acc@10"
+whose matched rotation is within 5 deg of the truth, higher is better. Stored
+in every checkpoint beside ``best`` (``best_metric``), so a run resumed after
+it changes recomputes its best-so-far; checkpoints written before it was
+stored chose by ``acc@10deg``."""
+_BEST_NAME = "acc@5"
 
 # The parameters of the rotation head v7 removed (`nn/model.py`). A checkpoint
 # trained before that carries them; it can still be evaluated -- they are
@@ -1959,6 +1962,8 @@ def save_checkpoint(path: Path, model, optimizer, config: Config, epoch: int,
         "step": step,
         "history": history,
         "best": best,
+        # Which metric `best` is a value of, so a resume can tell (BEST_METRIC).
+        "best_metric": BEST_METRIC,
         "elapsed": elapsed,
         "epoch_step": step if epoch_step is None else epoch_step,
         "offenders": offenders or {},
@@ -2465,7 +2470,7 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
     scaler = torch.amp.GradScaler(device.split(":")[0]) if config.amp else None
 
     history: List[dict] = []
-    # best.pt holds the epoch with the highest validation acc@10 of the
+    # best.pt holds the epoch with the highest validation acc@5 of the
     # matched rotations (BEST_METRIC); -inf until one is measured.
     start_epoch, step, best, elapsed = 0, 0, float("-inf"), 0.0
     offenders: Dict[str, Dict] = {}
@@ -2494,6 +2499,15 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
         step = state["step"] if completed else state.get("epoch_step", state["step"])
         history = state.get("history", [])
         best = state.get("best", float("-inf"))
+        chosen_by = state.get("best_metric", "acc@10deg")
+        if chosen_by != BEST_METRIC:
+            # `best` is a value of the metric best.pt was chosen by. Compared
+            # with another one it would keep or replace best.pt for no reason,
+            # so it is recomputed from the epochs logged so far.
+            key = f"val_{BEST_METRIC}"
+            measured = [row[key] for row in history
+                        if row.get(key) is not None and not row.get("partial")]
+            best = max(measured) if measured else float("-inf")
         elapsed = float(state.get("elapsed", 0.0))
         offenders = dict(state.get("offenders") or {})
         _restore_rng(state, rank)
@@ -2502,7 +2516,12 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
             print(f"resumed from {load_path}")
             print(f"  epoch {start_epoch}, step {step}, "
                   f"{_hms(elapsed)} trained so far{partial}")
-            if history:
+            if chosen_by != BEST_METRIC:
+                print(f"  [resume] best.pt was chosen by val {chosen_by.replace('deg', '')}; "
+                      f"it is now chosen by val {_BEST_NAME}, so the best-so-far is the "
+                      f"highest logged so far ({best:.4f}). best.pt keeps its earlier "
+                      f"pick until an epoch beats that.")
+            elif history:
                 print(f"  best val {_BEST_NAME} so far: {best:.4f}")
         if _fragment_limit_changed(state.get("config") or {}, config):
             # A different limit is a different validation set: the best-so-far
@@ -2654,7 +2673,7 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
         # overwrote best.pt with it.
         #
         # The share of validation fragments the matched rotations put within
-        # 10 deg, higher is better: the method's own success rate, which a
+        # 5 deg, higher is better: the method's own success rate, which a
         # few unreachable fragments at ~126 deg cannot swing the way they
         # swing a mean.
         score = val_summary.get(BEST_METRIC, float("-inf"))

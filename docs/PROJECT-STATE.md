@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 523 tests, clean under `-W error` |
+| Pipeline | **built** — 524 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -28,7 +28,7 @@ implementing anything from it.
 | Benchmark range | `--max_fragments 20` trains and scores on GARF's 2–20 pieces; off by default — see §13 |
 | Hub mirror | optional `--hf_repo_id/--hf_local_dir/--hf_token`: files pushed every epoch, pulled into a fresh folder — see §14 |
 | Thesis v7 | matched rotations placed from the pair fits the chain agrees with, the anchor held, not one solve over every match; `--evaluate --jitter/--drop` without shared break vertices — see §17 |
-| Thesis v7, no head | the rotation head removed: trained on the embedding term alone, every rotation fitted from the matches, the four geometric terms scores only, `best.pt` on validation acc@10; `--split all`, `--predictions` — see §18 |
+| Thesis v7, no head | the rotation head removed: trained on the embedding term alone, every rotation fitted from the matches, the four geometric terms scores only, `best.pt` on validation acc@5; `--split all`, `--predictions` — see §18 |
 
 ---
 
@@ -1179,8 +1179,11 @@ The second change in `E:\Thesis v7`, and the one that needs retraining.
 - `training.py`: every validation batch is matched and scored (training
   batches too with `--score_train True`; off, because it matches 2,560 scenes
   an epoch at the user's settings); a batch with no cluster is left out of the
-  step and named (`no-objective`); `best.pt` is the highest validation acc@10
-  (`BEST_METRIC`); the epoch line and the report give the share reached, and
+  step and named (`no-objective`); `best.pt` is the highest validation acc@5
+  (`BEST_METRIC`, stored in every checkpoint as `best_metric`: a run resumed
+  from one chosen by another metric -- the first head-less copy used acc@10 --
+  recomputes its best-so-far from the complete epochs logged); the epoch line
+  and the report give the share reached, and
   the report the scores and accuracy per category. `--w_rot`, `--w_pos`,
   `--w_normal`, `--w_face` and `--rotation_target` are refused by name
   (`scripts/config_flags.py`). A checkpoint with the head evaluates and probes,
@@ -1197,14 +1200,14 @@ The second change in `E:\Thesis v7`, and the one that needs retraining.
 - `probe_val.py`: the matched route only (`--procrustes` accepted, always on);
   `--table` gathers several probes' summaries into one table.
 - `viz/results.py`, `viz/figures.py`, `scripts/make_figures.py`: the best
-  epoch by acc@10, a validation-accuracy figure, `tables/by_type.csv/.md`
+  epoch by acc@5, a validation-accuracy figure, `tables/by_type.csv/.md`
   (every number per object type and for the whole subset); files from before
   still read.
 - `evaluation/metrics.py`: `head_collinearity` removed with the head.
 
 ### Verified
 
-523 tests, all passing (535 before: the tests of the head and of its training
+524 tests, all passing (535 before: the tests of the head and of its training
 went with it). The head's tests were rewritten for what replaced it: the features
 turn with their fragment and the embedding does not move under any pose
 (`test_model.py`); exact matches score 0 in any frame, and the metrics and the
@@ -1217,7 +1220,8 @@ it to be right: on one thread, over seven seeds, 120 epochs took them from
 chance to exact (0.0 deg, every fragment reached), where 80 epochs got one seed
 in four there. Mutation checks -- the coincidence labels shuffled over the
 vertices, the fitted rotations transposed, the anchor alignment on the wrong
-side -- each fail a test. 105 version markers.
+side, the best-so-far kept across a change of metric -- each fail a test. 106
+version markers.
 
 ### Next
 

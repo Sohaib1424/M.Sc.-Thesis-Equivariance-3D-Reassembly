@@ -128,7 +128,7 @@ tests still pass and the network tests skip.
 git clone <this-repo> && cd <this-repo>
 python -m venv .venv && source .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest                                        # 523 passed
+python -m pytest                                        # 524 passed
 ```
 
 Installing is optional — `pytest.ini` sets `pythonpath = src .` and each script
@@ -305,7 +305,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             523 tests
+tests/                             524 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -381,13 +381,14 @@ the embedding matches and chained from each scene's largest fragment
 position, normal, face — are computed from those rotations under `no_grad`, as
 scores: every validation epoch, in `--evaluate` and in `probe_val.py` (on the
 training batches too with `--score_train True`). Nothing they say reaches a
-gradient. `best.pt` is the epoch with the highest validation acc@10 of the
-matched rotations — a mean over them mixes pieces placed to a degree or two
-with pieces left at chance. Why: on W10 the head's rotations stayed 102° off
-(anchor-aligned) on Everyday's validation scenes while the rotations fitted
-from its own embedding's matches were 15° off, and a run trained on the
-embedding term alone (nrhl) beat W10 on the same split — 10.2° against 15.2°,
-acc@5 0.905 against 0.847 — so training the head bought nothing.
+gradient. `best.pt` is the epoch with the highest validation acc@5 of the
+matched rotations (the share of pieces within 5°) — a mean over them mixes
+pieces placed to a degree or two with pieces left at chance. Why: on W10 the
+head's rotations stayed 102° off (anchor-aligned) on Everyday's validation
+scenes while the rotations fitted from its own embedding's matches were 15°
+off, and a run trained on the embedding term alone (nrhl) beat W10 on the
+same split — 10.2° against 15.2°, acc@5 0.905 against 0.847 — so training the
+head bought nothing.
 `--w_rot`, `--w_pos`, `--w_normal`, `--w_face` and `--rotation_target` are
 refused with that reason. A checkpoint with the head still evaluates and
 probes (its head's weights are left behind, said out loud) but does not

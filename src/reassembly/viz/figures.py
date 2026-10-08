@@ -23,7 +23,7 @@ Since v7 a run trains on the embedding term alone -- the total is it -- and
 rotation, position, normal and face are scores of the rotations fitted from
 its matches, on validation every epoch (on training too with
 ``--score_train``). ``best.pt`` is the epoch with the highest validation
-acc@10 and is marked on every single-run curve. A run from before, with the
+acc@5 and is marked on every single-run curve. A run from before, with the
 rotation head, logged the five terms unweighted, their weighted sum as the
 total, and kept the epoch with the lowest validation error as ``best.pt``;
 its figures say so.
@@ -213,7 +213,7 @@ def plot_rotation_error(history: History, writer: FigureWriter, smooth: int = 1)
 
 def plot_accuracy(history: History, writer: FigureWriter, smooth: int = 1) -> bool:
     """Validation acc@5/10/30 and the share the matching reached, per epoch:
-    the curve ``best.pt`` is chosen on (acc@10)."""
+    the curve ``best.pt`` is chosen on (acc@5)."""
     keys = [(f"val_acc@{t:g}deg", f"acc@{t:g}", SERIES[i])
             for i, t in enumerate(ACCURACY_THRESHOLDS)]
     keys.append(("val_reached", "reached by the matching", SERIES[3]))
@@ -225,7 +225,7 @@ def plot_accuracy(history: History, writer: FigureWriter, smooth: int = 1) -> bo
         _frame(fig, f"Validation accuracy  |  {history.label}",
                "Share of scored pieces whose matched rotation is within 5, 10 and 30 deg of "
                "the truth,\nand the share the matching reached at all. best.pt has the "
-               "highest acc@10.")
+               "highest acc@5.")
         for key, name, colour in keys:
             _curve(ax, history, key, name, colour, smooth)
         _mark_best(ax, history)
@@ -296,7 +296,7 @@ def plot_category_heatmap(history: History, writer: FigureWriter, smooth: int = 
 
 COMPARE_PANELS = (
     ("geodesic", "Rotation error, mean (deg)"),
-    ("acc@10", "acc@10"),
+    ("acc@5", "acc@5"),
     ("reached", "Share reached by the matching"),
     ("embedding", "Embedding term (InfoNCE)"),
     ("match@1", "match@1"),
@@ -315,7 +315,7 @@ def plot_comparison(histories: Sequence[History], split: str, writer: FigureWrit
     with _style():
         fig, axes = plt.subplots(2, 3, figsize=(10.5, 5.8), sharex=True)
         _frame(fig, f"Runs compared, {name}",
-               "One line per run. The rotation error, acc@10, reach and position score are "
+               "One line per run. The rotation error, acc@5, reach and position score are "
                "those of the rotations\nfitted from each run's embedding matches (a run with "
                "a rotation head shows its head's).")
         for ax, (quantity, title) in zip(axes.flat, COMPARE_PANELS):
@@ -324,7 +324,7 @@ def plot_comparison(histories: Sequence[History], split: str, writer: FigureWrit
                 _curve(ax, history, key, history.label, SERIES[index], smooth)
             if quantity == "geodesic":
                 _reference(ax, CHANCE_GEODESIC_DEG, "chance", axis="y")
-            if quantity in ("match@1", "acc@10", "reached"):
+            if quantity in ("match@1", "acc@5", "reached"):
                 ax.set_ylim(0, 1)
             ax.set_title(title, loc="left", fontsize=9)
         for ax in axes[-1]:
@@ -332,7 +332,7 @@ def plot_comparison(histories: Sequence[History], split: str, writer: FigureWrit
         _figure_legend(fig, axes.flat[0], ncol=min(len(histories), 4))
         fig.subplots_adjust(hspace=0.32, wspace=0.25)
         writer.save(fig, f"training/compare_{split}",
-                    f"Every run, {name}: rotation error, acc@10, the share reached by the "
+                    f"Every run, {name}: rotation error, acc@5, the share reached by the "
                     f"matching, the embedding term, match@1 and the position score.")
     return True
 
@@ -340,8 +340,8 @@ def plot_comparison(histories: Sequence[History], split: str, writer: FigureWrit
 def _compare_key(split: str, quantity: str) -> str:
     if quantity == "geodesic":
         return "val_geodesic_deg" if split == "val" else "train_rotation_degrees"
-    if quantity == "acc@10":
-        return f"{split}_acc@10deg"
+    if quantity == "acc@5":
+        return f"{split}_acc@5deg"
     return f"{split}_{quantity}"
 
 

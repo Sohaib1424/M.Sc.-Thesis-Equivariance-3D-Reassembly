@@ -323,6 +323,40 @@ def test_a_restarted_epoch_goes_back_to_the_step_it_began_at(root):
     assert history[-1]["step"] == 4, "restarted from step 2, plus 2 batches"
 
 
+def test_a_resume_after_the_best_metric_changed_recomputes_the_best(root, capsys):
+    """
+    best.pt was chosen by acc@10 and is now chosen by acc@5. A checkpoint from
+    before stores an acc@10 value as its best-so-far, and acc@5 can never be
+    above acc@10: compared with it, best.pt would not move for a long time
+    after a better epoch. The best is recomputed from the complete epochs
+    logged, by the new metric.
+    """
+    from reassembly.training import save_checkpoint
+
+    config = _config(root, epochs=2, steps_per_epoch=1)
+    torch.manual_seed(0)
+    model = training.build_model(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    out = Path(config.out_dir)
+    history = [{"epoch": 0, "step": 1, "partial": 0, "val_acc@5deg": 0.25,
+                "val_acc@10deg": 0.9},
+               {"epoch": 0, "step": 1, "partial": 1, "val_acc@5deg": 0.75}]
+    save_checkpoint(out / "last.pt", model, optimizer, config, epoch=0, step=1,
+                    history=history, best=0.9, completed=True)
+    state = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
+    assert state["best_metric"] == "acc@5deg"
+    del state["best_metric"]                       # as the acc@10 version wrote it
+    torch.save(state, out / "last.pt")
+    capsys.readouterr()
+
+    training.train(config)
+    assert ("it is now chosen by val acc@5, so the best-so-far is the highest logged so "
+            "far (0.2500)") in capsys.readouterr().out
+    last = torch.load(out / "last.pt", map_location="cpu", weights_only=False)
+    assert last["best_metric"] == "acc@5deg"
+    assert last["best"] == pytest.approx(max(0.25, last["history"][-1]["val_acc@5deg"]))
+
+
 def test_repeat_offenders_are_named_across_epochs_and_sessions(tmp_path):
     from reassembly.training import (_record_offenders, _repeat_offenders,
                                      save_checkpoint)

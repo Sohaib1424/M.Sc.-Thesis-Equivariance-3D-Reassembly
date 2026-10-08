@@ -113,14 +113,14 @@ class History:
                                              "val_absolute_geodesic_deg"))
 
     def best_epoch(self) -> Optional[int]:
-        """The epoch ``best.pt`` holds: the highest ``val_acc@10deg`` -- or,
+        """The epoch ``best.pt`` holds: the highest ``val_acc@5deg`` -- or,
         for a run with the rotation head, the lowest ``val_geodesic_deg``."""
         if self.has_head:
             values = self.series("val_geodesic_deg")
             if not np.isfinite(values).any():
                 return None
             return int(self.epochs()[int(np.nanargmin(values))])
-        values = self.series("val_acc@10deg")
+        values = self.series("val_acc@5deg")
         if not np.isfinite(values).any():
             return None
         return int(self.epochs()[int(np.nanargmax(values))])

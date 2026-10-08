@@ -426,22 +426,22 @@ def test_the_final_verdict_refuses_to_flatter_a_run(curve, expected, capsys):
     chance and one truncated mid-descent both produce a perfectly reportable
     number that means something quite different from what it looks like.
     """
-    _final_report([{"epoch": i, "val_geodesic_deg": geodesic, "val_acc@10deg": accuracy}
+    _final_report([{"epoch": i, "val_geodesic_deg": geodesic, "val_acc@5deg": accuracy}
                    for i, (geodesic, accuracy) in enumerate(curve)])
     assert expected in capsys.readouterr().out
 
 
-def test_the_best_epoch_is_the_most_fragments_within_10_degrees(capsys):
+def test_the_best_epoch_is_the_most_fragments_within_5_degrees(capsys):
     """
-    best.pt is the epoch with the highest validation acc@10, not the lowest
+    best.pt is the epoch with the highest validation acc@5, not the lowest
     mean error. The matched rotations are a mixture -- fragments placed to a
     degree or two, and fragments left at chance -- and the mean moves with how
     far the misses miss as much as with how many fragments are recovered.
     """
-    _final_report([{"epoch": 0, "val_geodesic_deg": 30.0, "val_acc@10deg": 0.6},
-                   {"epoch": 1, "val_geodesic_deg": 25.0, "val_acc@10deg": 0.5}])
+    _final_report([{"epoch": 0, "val_geodesic_deg": 30.0, "val_acc@5deg": 0.6},
+                   {"epoch": 1, "val_geodesic_deg": 25.0, "val_acc@5deg": 0.5}])
     out = capsys.readouterr().out
-    assert "best val acc@10 0.6000 at epoch 1 (geodesic 30.00 deg" in out
+    assert "best val acc@5 0.6000 at epoch 1 (geodesic 30.00 deg" in out
     _final_report([{"epoch": 0, "train_total": 4.0}])
     assert "validation measured no rotation" in capsys.readouterr().out
 

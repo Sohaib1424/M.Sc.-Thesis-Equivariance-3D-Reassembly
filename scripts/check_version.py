@@ -233,6 +233,8 @@ MARKERS = [
      "def table(folders, out: Path) -> int:"),
     ("probe_val scores any piece range", "probe_val.py",
      'values["max_fragments"] = args.max_fragments or None'),
+    ("probe_val draws any number of break patterns", "probe_val.py",
+     'values["modes_per_scene"] = args.modes_per_scene or None'),
     ("every number per object type", "scripts/make_figures.py", "BY_TYPE_COLUMNS = ("),
     ("validation accuracy per epoch, drawn", "src/reassembly/viz/figures.py",
      "def plot_accuracy(history"),

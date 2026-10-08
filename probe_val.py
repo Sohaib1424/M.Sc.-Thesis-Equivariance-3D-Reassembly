@@ -70,7 +70,10 @@ Is the matched route using anything it should not?
     python probe_val.py --table probe/best-plain probe/best-hidden ... --out probe
 
 --max_fragments N scores break patterns of 2 to N pieces instead of the run's
-own range (0: every piece count; the run's validation used its own range).
+own range (0: every piece count; the run's validation used its own range), and
+--modes_per_scene N draws N break patterns per object instead of the run's own
+number (0: every pattern) -- still --limit scenes of them, so add --limit 0 to
+score them all.
 --split train scores training scenes the same way. --print_flags prints the
 scripts.train command that reproduces the checkpoint's run, and exits. Run from
 the repository root, or pass --repo <repository root>.
@@ -106,6 +109,9 @@ def parse_args(argv=None):
     p.add_argument("--max_fragments", type=int, default=None,
                    help="score break patterns of 2 to this many pieces; 0 = every piece count; "
                         "default: the run's own range, the scenes its validation scored")
+    p.add_argument("--modes_per_scene", type=int, default=None,
+                   help="break patterns drawn per object; 0 = every pattern; default: the "
+                        "run's own. The scenes scored are still --limit of them")
     p.add_argument("--min_contact", type=int, default=10,
                    help="shared coincident vertices for two fragments to count as touching")
     p.add_argument("--cross", default="normal", choices=("normal", "none", "swap"),
@@ -161,8 +167,9 @@ def parse_args(argv=None):
 
 
 def config_from_checkpoint(state, args):
-    """The run's own Config, with only the data location, workers, scene count and
-    (``--max_fragments``) piece range changed."""
+    """The run's own Config, with only the data location, workers, scene count,
+    piece range (``--max_fragments``) and break patterns per object
+    (``--modes_per_scene``) changed."""
     from reassembly.training import Config
 
     names = {f.name for f in dataclasses.fields(Config)}
@@ -182,7 +189,14 @@ def config_from_checkpoint(state, args):
         values[key] = values.get("limit_val")       # as many scenes as validation scores
     if args.max_fragments is not None:
         values["max_fragments"] = args.max_fragments or None     # 0: no upper limit
+    if args.modes_per_scene is not None:
+        values["modes_per_scene"] = args.modes_per_scene or None   # 0: every pattern
     return Config(**values)
+
+
+def patterns(limit) -> str:
+    """Break patterns per object as the reports print them: ``20 per object`` or ``all``."""
+    return f"{limit} per object" if limit else "all"
 
 
 def piece_range(limit) -> str:
@@ -585,6 +599,9 @@ def headline(rows, state, args, seconds, counters) -> dict:
         # The piece counts scored: the run's own range unless --max_fragments.
         "pieces": piece_range(trained if args.max_fragments is None
                               else args.max_fragments or None),
+        # Break patterns per object: the run's own unless --modes_per_scene.
+        "patterns": patterns((state.get("config") or {}).get("modes_per_scene")
+                             if args.modes_per_scene is None else args.modes_per_scene or None),
         # The folder and the file: which run, and which of its checkpoints.
         "checkpoint": "/".join(Path(str(args.checkpoint)).parts[-2:]),
         # 1-based, as the training log and --evaluate print it.
@@ -606,9 +623,9 @@ def summarise(rows, pairs, reach_counts, vertex_total, config, state, args, seco
     scored = column(rows, "anchor") == 0
     err = column(rows, "err_anchor_deg")
     top = headline(rows, state, args, seconds, counters)
-    say(f"{args.split}: {top['scenes']} scenes of {top['pieces']} pieces, {int(scored.sum())} "
-        f"scored fragments ({len(rows) - int(scored.sum())} anchors), {seconds:.0f} s, cross "
-        f"layers: {args.cross}")
+    say(f"{args.split}: {top['scenes']} scenes of {top['pieces']} pieces (break patterns: "
+        f"{top['patterns']}), {int(scored.sum())} scored fragments "
+        f"({len(rows) - int(scored.sum())} anchors), {seconds:.0f} s, cross layers: {args.cross}")
     say(f"  tests: {tests(args) or 'none -- the model and the data as trained and validated'}")
     say(f"  rotations fitted from the embedding matches, anchor-aligned: mean "
         f"{top['mean_deg']:.2f} deg, median {top['median_deg']:.2f} (chance {CHANCE_DEG})")
@@ -618,7 +635,9 @@ def summarise(rows, pairs, reach_counts, vertex_total, config, state, args, seco
     logged = [r for r in history if r.get("epoch") == state.get("epoch")] or history[-1:]
     head = bool(logged) and any(key in logged[0] for key in ("val_head_cos",
                                                              "val_absolute_geodesic_deg"))
-    own_range = top["pieces"] == piece_range((state.get("config") or {}).get("max_fragments"))
+    stored = state.get("config") or {}
+    own_range = (top["pieces"] == piece_range(stored.get("max_fragments"))
+                 and top["patterns"] == patterns(stored.get("modes_per_scene")))
     unchanged = (args.cross == "normal" and not tests(args) and own_range)
     if logged and args.split == "val" and "val_geodesic_deg" in logged[0]:
         value = logged[0]["val_geodesic_deg"]
@@ -631,10 +650,10 @@ def summarise(rows, pairs, reach_counts, vertex_total, config, state, args, seco
                 f"agree when this probe scores the run's own validation scenes (the default "
                 f"--limit)")
         else:
-            run_range = piece_range((state.get("config") or {}).get("max_fragments"))
             say(f"  the run logged val_geodesic_deg {value:.2f} at epoch {when} with the trained "
-                f"model, clean input and the cross layers working normally, on {run_range} "
-                f"pieces")
+                f"model, clean input and the cross layers working normally, on "
+                f"{piece_range(stored.get('max_fragments'))} pieces (break patterns: "
+                f"{patterns(stored.get('modes_per_scene'))})")
     if args.cross == "swap":
         say(f"  swap partners: {counters['swap_same_object']} scene(s) had to take a scene of "
             f"the same object, {counters['swap_alone']} had no partner (left with none)")
@@ -796,8 +815,9 @@ def table(folders, out: Path) -> int:
             return 2
         rows.append({"probe": Path(folder).name, **json.loads(path.read_text())})
     out.mkdir(parents=True, exist_ok=True)
-    columns = ["probe", "test", "cross", "pieces", "scenes", "scored_fragments", "mean_deg",
-               "median_deg", "acc@5", "acc@10", "acc@30", "reached", "checkpoint", "epoch"]
+    columns = ["probe", "test", "cross", "pieces", "patterns", "scenes", "scored_fragments",
+               "mean_deg", "median_deg", "acc@5", "acc@10", "acc@30", "reached", "checkpoint",
+               "epoch"]
     with open(out / "probes.csv", "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()

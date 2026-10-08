@@ -635,6 +635,10 @@ def summarise(rows, pairs, reach_counts, vertex_total, config, state, args, seco
         say(f"  by the last layer: {100 * share[min(first, HOPS)]:.0f}% of vertices carry "
             f"some cross-fragment information, {100 * share[min(last, HOPS)]:.0f}% carry the "
             f"last round")
+        if args.cross == "none":
+            say("  -- with the trained cross layers working; here (--cross none) they get no "
+                "partners, so each token's\n     update reads only itself and no vertex hears "
+                "another fragment")
     else:
         say("  no cross layer: every fragment is described on its own")
         first = last = 0

@@ -416,6 +416,22 @@ def test_evaluate_scores_the_matched_rotations_on_the_same_fragments(root, capsy
     with pytest.raises(ValueError, match="placement 'checked' places"):
         training.evaluate(config, checkpoint="last.pt", split="val", placement="checked")
 
+    # Without the shared break vertices: the model is shown the noise (its
+    # loss moves), the files say so in their names, the clean ones stay.
+    noisy = training.evaluate(config, checkpoint="last.pt", split="val",
+                              rotations="matched", jitter=0.01, drop=0.5)
+    assert noisy["noise"] == {"jitter": 0.01, "drop": 0.5}
+    assert "noise" not in checked
+    assert noisy["position"] != checked["position"]
+    out = capsys.readouterr().out
+    assert "perturbed inputs  --jitter 0.01" in out and "--drop 0.5" in out
+    assert "no longer share their vertices" in out
+    for name in ("val_metrics_matched_jitter0.01_drop0.5.json",
+                 "val_report_matched_jitter0.01_drop0.5.txt", "val_metrics_matched.json"):
+        assert (Path(config.out_dir) / name).exists(), name
+    with pytest.raises(ValueError, match="--drop"):
+        training.evaluate(config, checkpoint="last.pt", split="val", drop=1.0)
+
     summary = training.evaluate(config, checkpoint="last.pt", split="val",
                                 rotations="matched", assemble=False)
     assert "matched" in summary and "assembly" not in summary

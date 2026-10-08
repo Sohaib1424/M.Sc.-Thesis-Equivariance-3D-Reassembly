@@ -6,6 +6,7 @@ Train, resume, or evaluate the V-GAT reassembly model.
     python -m scripts.train --root_dir ... --evaluate          # score best.pt, assembled
     python -m scripts.train --root_dir ... --evaluate --rotations matched   # rotations from the matches
     python -m scripts.train --root_dir ... --evaluate --rotations matched --placement global  # v6's placement
+    python -m scripts.train --root_dir ... --evaluate --rotations matched --jitter 0.01 --drop 0.5  # no shared break vertices
     python -m scripts.train --root_dir ... --num_gpus 2        # both GPUs (the default: all)
     python -m scripts.train --root_dir ... --num_gpus 1        # one GPU
     python -m scripts.train --root_dir ... --max_fragments 20  # the benchmark's 2-20 pieces
@@ -145,6 +146,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "placement): one least-squares solve over every embedding "
                              "match. A non-default choice adds its name to the output "
                              "files: <split>_metrics_matched_global.json")
+    parser.add_argument("--jitter", type=float, default=0.0,
+                        help="with --evaluate: Gaussian noise on every input vertex before "
+                             "the network sees it, in units of the scene's largest "
+                             "fragment's radius, so the two sides of a break no longer "
+                             "coincide (0, the default: off). The assembly is scored on the "
+                             "clean fragments. As probe_val.py --jitter, for the whole "
+                             "evaluation; adds _jitter<S> to the output files")
+    parser.add_argument("--drop", type=float, default=0.0,
+                        help="with --evaluate: leave this share of the break vertices out "
+                             "of the matching, at random (0, the default: off; below 1). "
+                             "As probe_val.py --drop; adds _drop<P> to the output files")
     parser.add_argument(
         "--split", default="val", choices=["train", "val", "test"],
         help="which split to score. Defaults to val, NOT test: Breaking Bad "
@@ -166,14 +178,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if (args.jitter or args.drop) and not args.evaluate:
+        parser.error("--jitter and --drop apply to --evaluate only")
     config = config_from_args(args)
     if args.preflight:
         raise SystemExit(0 if preflight(config) else 1)
     if args.evaluate:
         from reassembly.assembly import check_placement
+        from reassembly.evaluation.noise import check_noise
 
         try:
             check_placement(args.rotations, args.placement)
+            check_noise(args.jitter, args.drop)
         except ValueError as error:
             parser.error(str(error))
         # The rest of the data definition stays the checkpoint's unless
@@ -184,7 +200,8 @@ def main() -> None:
         evaluate(config, checkpoint=args.checkpoint, split=args.split,
                  assemble=args.assemble, collision=args.collision,
                  data_from_checkpoint=not args.data_from_flags, override=override,
-                 rotations=args.rotations, placement=args.placement)
+                 rotations=args.rotations, placement=args.placement,
+                 jitter=args.jitter, drop=args.drop)
     else:
         # Not Config fields: the token must not reach a checkpoint, and the
         # checkpoints are what gets uploaded.

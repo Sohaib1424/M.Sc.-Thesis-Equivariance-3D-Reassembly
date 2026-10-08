@@ -45,6 +45,10 @@ Conventions, stated because published numbers depend on them:
   (``placement="checked"``, :mod:`reassembly.assembly.placement`; the default
   for matched rotations). The global solve contracts many-piece assemblies
   onto their centre when many matches are wrong; that module says by how much.
+* **Perturbed inputs** (``observed`` and ``drop``; ``--evaluate --jitter
+  --drop``, :mod:`reassembly.evaluation.noise`): the method reads noisy
+  coordinates and fewer break vertices, and the score still measures the
+  predicted pose on the clean geometry.
 
 Chamfer runs on an evenly strided subset of each fragment's vertices -- the
 same subset for prediction and truth, which share their vertex order -- because
@@ -52,12 +56,12 @@ a fragment can have 83,000 vertices and the distance is quadratic.
 """
 from __future__ import annotations
 
-import hashlib
 from typing import Dict, List, Optional
 
 import torch
 
 from ..evaluation.metrics import chamfer_distance, part_accuracy
+from ..evaluation.noise import check_noise, drop_candidates, scene_generator
 from ..nn.losses import euler_rmse, geodesic_angle
 from .placement import AGREEMENT_DEG, place
 from .rotation import INLIER_DISTANCE, MIN_MATCHES, RANSAC_ITERATIONS, match_rotations
@@ -87,17 +91,16 @@ def check_placement(rotations: str, placement: Optional[str]) -> str:
     return placement
 
 
-def _scene_generator(batch, scene: int, seed: int, device) -> torch.Generator:
+def _scene_generator(batch, scene: int, seed: int, device,
+                     stream: str = "") -> torch.Generator:
     """
     One RANSAC stream per scene, keyed by the scene's name: a scene draws the
     same hypotheses whatever batch it lands in, so two evaluations of one
-    checkpoint agree. (A digest, not ``hash()``, which Python salts per process.)
+    checkpoint agree. ``stream`` names another use (``"drop"``) with draws of
+    its own (:func:`reassembly.evaluation.noise.scene_generator`).
     """
     name = batch.scene_keys[scene] if batch.scene_keys else str(scene)
-    digest = hashlib.blake2b(f"{name}\x1f{seed}".encode(), digest_size=8).digest()
-    generator = torch.Generator(device=device)
-    generator.manual_seed(int.from_bytes(digest, "little") & ((1 << 63) - 1))
-    return generator
+    return scene_generator(name, seed, device, stream)
 
 
 @torch.no_grad()
@@ -109,7 +112,8 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
                 inlier_distance: float = INLIER_DISTANCE,
                 ransac_iterations: int = RANSAC_ITERATIONS,
                 seed: int = 0, placement: Optional[str] = None,
-                agreement_deg: float = AGREEMENT_DEG) -> List[Dict[str, float]]:
+                agreement_deg: float = AGREEMENT_DEG, observed=None,
+                drop: float = 0.0) -> List[Dict[str, float]]:
     """
     One dict per scene: ``geodesic_deg`` and ``euler_rmse_deg`` (the scene's
     own means), ``rmse_t``, ``chamfer``, ``part_chamfer``, ``part_accuracy``,
@@ -137,15 +141,30 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
     the rotations (:func:`default_placement`) -- and ``agreement_deg`` how far
     a pair's fit may be from the chained rotations and still place fragments
     (:mod:`reassembly.assembly.placement`).
+
+    ``observed`` is the batch the method was shown, when that is not ``batch``
+    -- ``batch`` with noise on its inputs (``--evaluate --jitter``,
+    :mod:`reassembly.evaluation.noise`). The matching, the fits and the solve
+    read the observed coordinates; the score applies the predicted pose to
+    ``batch``'s clean ones, so the noise is in what the method saw and not in
+    what it is measured against. ``drop`` leaves that share of the break
+    vertices out of the matching (``--drop``), drawn per scene from ``seed``.
     """
     from ..data.features import complete_batch
     from ..nn.anchor import anchor_alignment, anchor_fragments
     from ..nn.model import apply_rotation
 
     placement = check_placement(rotations, placement)
+    check_noise(0.0, drop)
     matched = rotations == "matched"
     checked = placement == "checked"
     batch = complete_batch(batch)
+    # What the method reads; the score reads `batch`.
+    seen = batch if observed is None else complete_batch(observed)
+    if seen.node_features.shape != batch.node_features.shape:
+        raise ValueError("observed must be the same scenes as batch: "
+                         f"{tuple(seen.node_features.shape)} against "
+                         f"{tuple(batch.node_features.shape)} input features")
     fragment = batch.vertex_fragment
     unit = batch.unit.to(batch.node_features.dtype)[fragment, None]
     rotation = prediction.rotation.to(batch.node_features.dtype)
@@ -160,8 +179,8 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
         # is its true pose under the anchor convention.
         roots = anchor_fragments(batch.log_scale, batch.fragment_scene,
                                  batch.num_scenes).tolist()
-    points = apply_rotation(batch.node_features[:, 0, :], rotation, fragment) * unit
-    normals = apply_rotation(batch.node_features[:, 1, :], rotation, fragment)
+    points = apply_rotation(seen.node_features[:, 0, :], rotation, fragment) * unit
+    normals = apply_rotation(seen.node_features[:, 1, :], rotation, fragment)
     truth_local = batch.target_vertices * unit
     embedding = prediction.vertex_embedding
 
@@ -176,6 +195,10 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
         reached = None
         pairs = []
         network_angle = None
+        candidates = None if batch.fracture is None else batch.fracture[v0:v1]
+        if drop:
+            candidates = drop_candidates(candidates, drop, _scene_generator(
+                batch, scene, seed, fragment.device, "drop"))
         if matched and count:
             # The head's own error on these fragments, kept beside the matched
             # one so a figure can show both spreads from one evaluation.
@@ -184,18 +207,18 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
             # The INPUT coordinates, in units of the scene's largest fragment
             # (the same scale under either normalisation mode).
             scale = batch.unit[f0:f1].double() / batch.unit[f0:f1].double().max()
-            raw = batch.node_features[v0:v1, 0, :].double() * scale[local, None]
+            raw = seen.node_features[v0:v1, 0, :].double() * scale[local, None]
             fitted, reached, pairs = match_rotations(
                 raw, local, embedding[v0:v1], rotation[f0:f1], roots[scene] - f0,
-                candidates=None if batch.fracture is None else batch.fracture[v0:v1],
+                candidates=candidates,
                 max_points=max_match_points, min_matches=min_matches,
                 tau=inlier_distance, iterations=ransac_iterations,
                 generator=_scene_generator(batch, scene, seed, raw.device),
             )
             rotation[f0:f1] = fitted
-            points[v0:v1] = apply_rotation(batch.node_features[v0:v1, 0, :], fitted,
+            points[v0:v1] = apply_rotation(seen.node_features[v0:v1, 0, :], fitted,
                                            local) * unit[v0:v1]
-            normals[v0:v1] = apply_rotation(batch.node_features[v0:v1, 1, :], fitted, local)
+            normals[v0:v1] = apply_rotation(seen.node_features[v0:v1, 1, :], fitted, local)
         radii = None
         if collision:
             reach = points[v0:v1].norm(dim=-1)
@@ -206,8 +229,7 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
             # solve over every match (assembly/placement.py).
             placed_scene = place(
                 points[v0:v1], normals[v0:v1], local, embedding[v0:v1], count, pairs,
-                rotation[f0:f1], reached, roots[scene] - f0,
-                candidates=None if batch.fracture is None else batch.fracture[v0:v1],
+                rotation[f0:f1], reached, roots[scene] - f0, candidates=candidates,
                 max_points=max_match_points, iterations=iterations, huber=huber,
                 min_inliers=min_matches, agreement=agreement_deg, collision_radii=radii,
             )
@@ -215,7 +237,7 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
         else:
             t_pred, matches = assemble(
                 points[v0:v1], normals[v0:v1], local, embedding[v0:v1], count,
-                candidates=None if batch.fracture is None else batch.fracture[v0:v1],
+                candidates=candidates,
                 max_points=max_match_points, iterations=iterations, huber=huber,
                 collision_radii=radii,
             )
@@ -235,7 +257,13 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
                 # The checked placement holds the root at 0; the global
                 # solve's translations are zero-mean already.
                 t_pred = t_pred - t_pred.mean(dim=0, keepdim=True)
-        placed = points[v0:v1].double() + t_pred[local]
+        if observed is None:
+            placed = points[v0:v1].double() + t_pred[local]
+        else:
+            # The predicted pose on the clean fragment: the noise was the input's.
+            shape = apply_rotation(batch.node_features[v0:v1, 0, :], rotation[f0:f1],
+                                   local) * unit[v0:v1]
+            placed = shape.double() + t_pred[local]
         truth = truth_local[v0:v1].double() + t_true[local]
 
         sample = subsample_per_fragment(local, chamfer_points)

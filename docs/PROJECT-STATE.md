@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 527 tests, clean under `-W error` |
+| Pipeline | **built** — 535 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -27,7 +27,7 @@ implementing anything from it.
 | Thesis v6 | the largest fragment as the anchor: metrics always, loss by default; re-scores My Thesis Work checkpoints — see §12 |
 | Benchmark range | `--max_fragments 20` trains and scores on GARF's 2–20 pieces; off by default — see §13 |
 | Hub mirror | optional `--hf_repo_id/--hf_local_dir/--hf_token`: files pushed every epoch, pulled into a fresh folder — see §14 |
-| Thesis v7 | matched rotations placed from the pair fits the chain agrees with, the anchor held, not one solve over every match — see §17 |
+| Thesis v7 | matched rotations placed from the pair fits the chain agrees with, the anchor held, not one solve over every match; `--evaluate --jitter/--drop` without shared break vertices — see §17 |
 
 ---
 
@@ -1042,7 +1042,7 @@ matched rotations), in the visualizer and in numbers:
   (files from before v7 read as `global`).
 - `probe_val.py` is unchanged: it measures rotations and never places.
 
-### Measured -- simulated matches on real geometry, not yet a network run
+### Measured -- simulated matches on real geometry, before the network run
 
 Replayed through `score_batch` on the dumps' meshes and the head's rotations,
 with exact break matches and then a share made wrong (pairs of break points on
@@ -1077,8 +1077,68 @@ output byte for byte over 27 configurations (head and matched rotations, both
 gauges, collisions on and off, float32 and float64, the RANSAC draws). 84
 version markers.
 
+### Measured on the network (W10, Oct 8)
+
+`last.pt`, epoch 350; Everyday val, 2-20 pieces, 728 scenes (91 objects x 8
+break patterns); `--evaluate --rotations matched`, once as is (checked) and once
+with `--placement global`. The rotations were identical in both runs -- matched
+15.18 deg mean, 0.31 median, acc@5 0.847, 89% of the scored pieces reached; the
+head 102.87 -- so the difference is the placement alone:
+
+| | global (v6) | checked (v7) |
+|---|---|---|
+| part accuracy | 0.745 | 0.940 |
+| RMSE(T) | 0.0562 | 0.0126 |
+| Chamfer, whole / per part | 0.00526 / 0.04097 | 0.00019 / 0.01447 |
+| matches/scene | 489 | 489 (301 in the verified pair fits) |
+
+- Part accuracy rose or held in all 20 categories; most where pieces are many
+  or thin: Spoon 0.265 -> 1.000, WineGlass 0.271 -> 0.975, Statue 0.231 ->
+  0.943, Ring 0.143 -> 0.819, Mirror 0.529 -> 0.969, Plate 0.540 -> 0.974,
+  ToyFigure 0.439 -> 0.860. Teapot 0.875 in both.
+- Lowest left: Ring 0.819, ToyFigure 0.860, Teapot 0.875, DrinkBottle 0.891,
+  Bottle 0.898 -- most likely the 11% of pieces the chain did not reach, which
+  keep the head's rotation; not yet checked piece by piece.
+- The embedding loss and match@1 differ slightly between the two runs (1.9594
+  against 1.9526, 0.659 against 0.660): `correspondence_loss` subsamples its
+  anchors with the unseeded global generator. Nothing to do with the placement.
+
+### Without shared break vertices (`--jitter`, `--drop`)
+
+Every number above rests on Breaking Bad's shared break vertices, and
+`probe_val.py --jitter/--drop` had measured only the rotations without them.
+`--evaluate` now takes the same two settings (`reassembly/evaluation/noise.py`):
+
+- `--jitter S`: Gaussian noise of `S` largest-fragment radii on every input
+  vertex before the network sees the scene, each edge's relative position
+  recomputed; normals and labels untouched. In largest-fragment radii under
+  either normalisation (`probe_val.py` added it to the normalised coordinates,
+  the same thing under the scene normalisation every run has used).
+- `--drop P`: that share of the break vertices left out of the matching, for
+  the rotation fits and the placement alike.
+- The method reads the noisy inputs -- network, embedding, fits, solve
+  (`run_epoch(inputs=...)`, `score_batch(observed=...)`); the assembly is scored
+  on the clean fragments, the predicted pose applied to the true geometry. The
+  loss line is the noisy inputs'.
+- Draws tied to each scene's name and `--seed` (`noise.scene_generator`, one
+  stream per perturbation; the RANSAC stream is the old one), so the two
+  placements see the same noise.
+- Both 0 by default: then `score_batch`'s output is byte-identical to before for
+  both placements (checked on the slab scenes, every combination of anchor and
+  collisions). The summary records `"noise"`; the report names it; the files
+  carry it (`val_metrics_matched_jitter0.01_drop0.5.json`). The flags without
+  `--evaluate`, a negative jitter or a drop of 1 or more stop with a message.
+- **Verified.** 535 tests (8 new in `tests/test_evaluation_noise.py`, the
+  `evaluate` test extended): off changes nothing; the noise moves positions
+  only, at the stated size, under both normalisations; it belongs to the scene,
+  not the batch; the solve reads it and the Chamfer distance does not; the drop
+  thins the matches; the model is shown the noise. Mutation checks -- no
+  per-fragment scale, stale edge features, scoring on the noisy geometry, the
+  drop ignored, one stream per batch, the clean batch shown to the model, the
+  observed batch ignored -- each fail a test. 90 version markers.
+
 ### Next
 
-On Kaggle with the W10 checkpoint: `--evaluate --rotations matched` (now
-checked) beside `--placement global` on the same rotations, per subset, and
-the Spoon and Ring dumps again.
+`--evaluate --rotations matched --jitter 0.01 --drop 0.5` on W10, with and
+without `--placement global`: the matched route's number without the shared
+break vertices, the one to put beside GARF-style tables.

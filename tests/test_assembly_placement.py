@@ -85,7 +85,7 @@ def _slab(top: np.ndarray, bottom: np.ndarray, n: int):
 THICKNESS = (0.6, 0.7, 0.8, 1.2, 0.75, 0.65, 0.7, 0.6)   # the thickest, slab 3, anchors
 
 
-def _stack(n: int = 10, seed: int = 0):
+def _stack(n: int = 10, seed: int = 0, thickness=THICKNESS):
     """
     Slabs stacked along z, each touching only the ones above and below it
     through a rough interface whose vertices both sides share -- a break, as
@@ -94,7 +94,7 @@ def _stack(n: int = 10, seed: int = 0):
     rng = np.random.default_rng(seed)
     x = np.linspace(-1.0, 1.0, n)
     gx, gy = np.meshgrid(x, x, indexing="ij")
-    levels = np.concatenate([[0.0], np.cumsum(THICKNESS)])
+    levels = np.concatenate([[0.0], np.cumsum(thickness)])
     surfaces = []
     for k, level in enumerate(levels):
         gz = np.full((n, n), level)
@@ -103,7 +103,7 @@ def _stack(n: int = 10, seed: int = 0):
             noise[0, :] = noise[-1, :] = noise[:, 0] = noise[:, -1] = 0.0
             gz = gz + noise
         surfaces.append(np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1))
-    return [_slab(surfaces[k + 1], surfaces[k], n) for k in range(len(THICKNESS))]
+    return [_slab(surfaces[k + 1], surfaces[k], n) for k in range(len(thickness))]
 
 
 def _stacked_scene():

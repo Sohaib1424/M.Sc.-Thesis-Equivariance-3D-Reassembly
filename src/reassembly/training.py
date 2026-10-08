@@ -1144,7 +1144,7 @@ def _metrics(predicted, target,
 def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
               device="cpu", step=0, total_steps=1, label="train",
               show_progress=True, deadline=None, stop_signal=None,
-              on_checkpoint=None, distributed=False, on_prediction=None):
+              on_checkpoint=None, distributed=False, on_prediction=None, inputs=None):
     """
     One pass over ``loader``. Training when ``optimizer`` is given, else eval.
 
@@ -1180,6 +1180,11 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
 
     ``on_prediction(batch, prediction)`` is called in eval mode for every batch
     that was scored -- :func:`evaluate` uses it to assemble.
+
+    ``inputs(batch) -> batch``, eval mode only, is what the model is shown in
+    place of the batch -- :func:`evaluate`'s ``jitter``. The loss and metrics
+    are then the shown batch's, and ``on_prediction`` receives the batch as
+    loaded (completed), the prediction, and the batch shown.
     """
     import torch
 
@@ -1251,12 +1256,21 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
                                    prefix, label, index)
                 else:
                     holder = {} if on_prediction is not None else None
+                    shown = batch
+                    if inputs is not None:
+                        from .data.features import complete_batch
+
+                        batch = complete_batch(batch)
+                        shown = inputs(batch)
                     report, R, outcome, detail = _eval_batch(
-                        model, batch, criterion, config, device=device, keep=holder)
+                        model, shown, criterion, config, device=device, keep=holder)
                     _count_outcome(tally, outcome, batch, names, vertices, detail,
                                    prefix, label, index)
                     if R is not None and holder:
-                        on_prediction(holder["batch"], holder["prediction"])
+                        if inputs is None:
+                            on_prediction(holder["batch"], holder["prediction"])
+                        else:
+                            on_prediction(batch, holder["prediction"], holder["batch"])
                     if R is not None:
                         # The metrics are the anchor protocol's whatever the
                         # training target: the prediction with its scene's
@@ -2841,7 +2855,8 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
              data_from_checkpoint: bool = True,
              override: Sequence[str] = (),
              rotations: str = "network",
-             placement: Optional[str] = None) -> Dict[str, float]:
+             placement: Optional[str] = None,
+             jitter: float = 0.0, drop: float = 0.0) -> Dict[str, float]:
     """
     Score a saved checkpoint on a held-out split: rotation, and -- with
     ``assemble`` -- the full assembly the benchmark scores.
@@ -2867,6 +2882,14 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     (:mod:`reassembly.assembly.placement`; matched rotations only, and their
     default). ``None`` is the default for ``rotations``.
 
+    ``jitter`` and ``drop`` take Breaking Bad's shared break vertices away
+    (:mod:`reassembly.evaluation.noise`): Gaussian noise of ``jitter``
+    largest-fragment radii on every input vertex before the network sees it,
+    and ``drop`` of the break vertices left out of the matching. Both 0 (off)
+    by default. The loss line and the rotation metrics are then the noisy
+    inputs'; the assembly scores apply the predicted poses to the clean
+    fragments. The draws are tied to each scene and ``config.seed``.
+
     The model, and by default the DATA definition, come from the checkpoint's
     own config: a model is scored on the split, labels, tokens and
     normalisation it was trained with, whatever the flags say, and every
@@ -2886,13 +2909,16 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     numbers figures need (``scripts/make_figures.py``) -- and the printed
     report as ``<split>_report.txt`` / ``<split>_report_matched.txt``. A
     placement other than the default for the rotations adds its name:
-    ``<split>_metrics_matched_global.json``.
+    ``<split>_metrics_matched_global.json``, and noise its settings:
+    ``<split>_metrics_matched_jitter0.01_drop0.5.json``.
     """
     import torch
 
     from .assembly import check_placement, default_placement, mean_over_scenes, score_batch
+    from .evaluation.noise import check_noise, jitter_inputs, noise_suffix
 
     placement = check_placement(rotations, placement)
+    check_noise(jitter, drop)
     matched = rotations == "matched"
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model, config, state, path = load_checkpoint(
@@ -2904,24 +2930,30 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
                      pairs_in_worker=not device.startswith("cuda"))
     scenes: List[Dict] = []
 
-    def collect(batch, prediction) -> None:
+    def collect(batch, prediction, shown=None) -> None:
         scores = score_batch(batch, prediction, collision=collision, rotations=rotations,
-                             seed=config.seed, placement=placement)
+                             seed=config.seed, placement=placement, observed=shown,
+                             drop=drop)
         for key, category, score in zip(batch.scene_keys, batch.categories, scores):
             score["_scene"], score["_category"] = key, category
             scenes.append(score)
 
     # The matched rotations are built by the scorer, so it runs for them even
     # under --no_assemble; only the assembly report is then left out.
+    # With --jitter the model is shown a noisy copy; the scorer gets both.
+    noisy = (lambda batch: jitter_inputs(batch, jitter, config.seed)) if jitter else None
     summary, _, _ = run_epoch(model, loader, build_criterion(config), config,
                               device=device, label=split,
-                              on_prediction=collect if (assemble or matched) else None)
+                              on_prediction=collect if (assemble or matched) else None,
+                              inputs=noisy)
 
     summary.pop("failures", None)
     summary.pop("most_repaired", None)
     summary["max_fragments"] = config.max_fragments
     summary["rotations"] = rotations
     summary["placement"] = placement
+    if jitter or drop:
+        summary["noise"] = {"jitter": jitter, "drop": drop}
     # What was scored, and with what: the report's header, kept in the file so
     # a report rebuilt from it (scripts/report_metrics.py) reads the same.
     summary["evaluation"] = {
@@ -2952,6 +2984,7 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     suffix = "_matched" if matched else ""
     if placement != default_placement(rotations):
         suffix += f"_{placement}"
+    suffix += noise_suffix(jitter, drop)
     out_dir = Path(config.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{split}_metrics{suffix}.json").write_text(dump_metrics(summary),
@@ -2983,6 +3016,8 @@ def format_evaluation(summary: Dict) -> str:
     lines = [info.get("split", "evaluation") + (f" ({', '.join(detail)})" if detail else "")]
     if info.get("fragment_line"):
         lines.append(info["fragment_line"])
+    if summary.get("noise"):
+        lines.append(_noise_line(summary["noise"]))
     if info.get("rotation_target"):
         lines.append(f"  loss on the {info['rotation_target']!r} target, the one this "
                      f"checkpoint was trained on:")
@@ -3192,10 +3227,28 @@ def _matched_lines(matched: Dict[str, float], summary: Dict) -> List[str]:
                      f"acc@30 {summary.get('acc@30deg', float('nan')):.3f}   (the rotation head)")
     lines.append(f"    the chain reached {100 * matched['reached']:.0f}% of the scored "
                  f"fragments; the rest kept the head's rotation")
-    lines.append("    Breaking Bad's fragments share their break vertices, so correct matches "
-                 "line up exactly:\n    not comparable with tables built on independently "
-                 "sampled points without saying so.")
+    if (summary.get("noise") or {}).get("jitter"):
+        lines.append("    the inputs were jittered, so the two sides of a break no longer "
+                     "share their vertices.")
+    else:
+        lines.append("    Breaking Bad's fragments share their break vertices, so correct matches "
+                     "line up exactly:\n    not comparable with tables built on independently "
+                     "sampled points without saying so.")
     return lines
+
+
+def _noise_line(noise: Dict[str, float]) -> str:
+    """The report's lines for an evaluation run on perturbed inputs."""
+    indent = "\n" + " " * 20
+    parts = []
+    if noise.get("jitter"):
+        parts.append(f"--jitter {noise['jitter']:g}: Gaussian noise on every input vertex, "
+                     f"in largest-fragment radii")
+    if noise.get("drop"):
+        parts.append(f"--drop {noise['drop']:g}: that share of the break vertices left out "
+                     f"of the matching")
+    parts.append("the assembly is scored on the clean fragments")
+    return "  perturbed inputs  " + indent.join(parts)
 
 
 _PLACEMENT_LINES = {

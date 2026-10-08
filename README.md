@@ -277,7 +277,9 @@ src/reassembly/
 │   ├── cross.py               ★   cross-fragment attention — read its docstring
 │   ├── losses.py                  the composite objective, verified chance values
 │   └── model.py                   the backbone and the rotation convention
-├── evaluation/metrics.py          reported-only: tilt/twist, head|cos|, Chamfer, PA
+├── evaluation/
+│   ├── metrics.py                 reported-only: tilt/twist, head|cos|, Chamfer, PA
+│   └── noise.py                   --jitter/--drop: evaluation without shared break vertices
 └── viz/
     ├── scene.py                   scene assembly for rendering
     ├── reassembly.py              poses and frames for animating a prediction
@@ -302,7 +304,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             527 tests
+tests/                             535 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -350,6 +352,7 @@ Thesis 1's meaning, so one set of habits drives both:
 | `--num_workers`, `--save_every`, `--time_budget_hours` | loader processes per GPU; `last.pt` every N epochs; stop cleanly after this long |
 | `--rotation_target anchor\|absolute` | Thesis v6's addition (below): score each fragment relative to its scene's largest (default), or in its object's stored frame |
 | `--placement checked\|global` | this version's (below): with `--evaluate --rotations matched`, place the pieces from the verified pair fits (default) or by v6's single solve |
+| `--jitter`, `--drop` | this version's (below): with `--evaluate`, noise on every input vertex and a share of the break vertices left out of the matching, so no two sides of a break coincide (off by default) |
 
 Settings only this project has keep their own names in the same style
 (`--tokens_per_scene`, `--modes_per_scene`, `--max_objects`, `--schedule`, ...);
@@ -373,7 +376,8 @@ embedding match, and in a many-piece scene hundreds of those join pieces that
 do not touch: the solve pulls them together and the assembly contracts onto
 its centre (to 0.10 and 0.21 of its true spread). v7 places each piece from
 the matches its rotation was fitted on instead —
-[below](#placing-the-turned-pieces---placement).
+[below](#placing-the-turned-pieces---placement) — and `--evaluate --jitter
+--drop` measures the result without the shared break vertices it leans on.
 
 ### Thesis v6: the largest fragment as the anchor
 
@@ -712,9 +716,47 @@ rotations, with exact break matches and then about a quarter of them made wrong
 | vase, bowl, plate | 3–5 | 1.000 → 1.000 | 0.002–0.005 → 0.0001–0.0002 | 100% → 100% |
 
 What checked leaves is pieces whose *rotation* is wrong. These are simulated
-wrong matches on real geometry; the network's own may cluster differently, so
-the number to report is the re-run evaluation. Like every number from the
-matched route, this one rests on Breaking Bad's shared break vertices.
+wrong matches on real geometry; the network's own may cluster differently.
+
+On the network itself (W10 `last.pt`, epoch 350; Everyday val, 2–20 pieces, 728
+scenes) with the same matched rotations in both runs — 15.18° mean, 0.31°
+median, 89% of pieces reached:
+
+| | global (v6) | checked (v7) |
+|---|---|---|
+| part accuracy | 0.745 | 0.940 |
+| RMSE(T) | 0.0562 | 0.0126 |
+| Chamfer, whole / per part | 0.00526 / 0.04097 | 0.00019 / 0.01447 |
+
+Every category rose or held (Spoon 0.27 → 1.00, Ring 0.14 → 0.82, WineGlass
+0.27 → 0.98, Statue 0.23 → 0.94, Mirror 0.53 → 0.97, Plate 0.54 → 0.97; Teapot
+0.875 in both). Like every number from the matched route, these rest on
+Breaking Bad's shared break vertices — the next section takes them away.
+
+### Without shared break vertices (`--jitter`, `--drop`)
+
+`--evaluate --jitter S --drop P` runs the whole evaluation the way
+`probe_val.py --jitter/--drop` measured the rotations: Gaussian noise of `S`
+largest-fragment radii on every input vertex before the network sees the scene
+(each edge's relative position recomputed), and a share `P` of the break
+vertices left out of the matching. The two sides of a break then no longer
+coincide, as with points sampled independently on each fragment. The network,
+the matched rotations, the fits and the placement all read the noisy inputs;
+the assembly is scored on the clean fragments, the predicted pose applied to
+the true geometry, so the noise is in what the method saw and not in what it is
+measured against (`reassembly.evaluation.noise`). The draws are tied to each
+scene and `--seed`, so two runs — of the two placements, say — see the same
+noise. Both are 0, off, by default, and then nothing changes:
+
+```bash
+python -m scripts.train --root_dir data --evaluate --checkpoint path/to/last.pt --split val --rotations matched --jitter 0.01 --drop 0.5
+python -m scripts.train --root_dir data --evaluate --checkpoint path/to/last.pt --split val --rotations matched --jitter 0.01 --drop 0.5 --placement global
+```
+
+The report names the perturbation, and the files carry it:
+`val_metrics_matched_jitter0.01_drop0.5.json`. The loss line is the noisy
+inputs' too. This, not the clean run, is the number to put beside tables built
+on independently sampled points.
 
 ### Reports and figures from saved results
 

@@ -193,6 +193,18 @@ MARKERS = [
      "placement_method=np.array(method)"),
     ("placement tests", "tests/test_assembly_placement.py",
      "def test_wrong_matches_pull_the_global_solve_together_but_not_the_checked_one"),
+    # -- Thesis v7: evaluation without shared break vertices -----------------------
+    ("--jitter: noise on the inputs, per scene", "src/reassembly/evaluation/noise.py",
+     "def jitter_inputs"),
+    ("--drop: break vertices left out of the matching", "src/reassembly/evaluation/noise.py",
+     "def drop_candidates"),
+    ("the model is shown the noisy copy", "src/reassembly/training.py",
+     'on_prediction(batch, holder["prediction"], holder["batch"])'),
+    ("the score reads the clean fragments", "src/reassembly/assembly/scoring.py",
+     "shape = apply_rotation(batch.node_features[v0:v1, 0, :], rotation[f0:f1],"),
+    ("--evaluate --jitter/--drop", "scripts/train.py", "jitter=args.jitter, drop=args.drop"),
+    ("noise tests", "tests/test_evaluation_noise.py",
+     "def test_the_method_sees_the_noise_and_the_score_does_not"),
 ]
 
 

@@ -19,10 +19,14 @@ most eight runs or datasets per figure: past that no further colour is safe.
 
 Reading the training curves
 ---------------------------
-The five terms are logged unweighted, so runs trained with different
-``--w_*`` compare term by term; the total is the weighted sum and compares
-only between runs with the same weights. ``best.pt`` is the epoch with the
-lowest validation rotation error and is marked on every single-run curve.
+Since v7 a run trains on the embedding term alone -- the total is it -- and
+rotation, position, normal and face are scores of the rotations fitted from
+its matches, on validation every epoch (on training too with
+``--score_train``). ``best.pt`` is the epoch with the highest validation
+acc@10 and is marked on every single-run curve. A run from before, with the
+rotation head, logged the five terms unweighted, their weighted sum as the
+total, and kept the epoch with the lowest validation error as ``best.pt``;
+its figures say so.
 """
 from __future__ import annotations
 
@@ -32,8 +36,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .results import (CHANCE_GEODESIC_DEG, Evaluation, History, assembly_by_type,
-                      by_piece_count, distribution, type_order)
+from .results import (ACCURACY_THRESHOLDS, CHANCE_GEODESIC_DEG, Evaluation, History,
+                      assembly_by_type, by_piece_count, distribution, type_order)
 
 SERIES = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100",
           "#e87ba4", "#008300", "#4a3aa7", "#e34948")
@@ -100,7 +104,9 @@ def plot_total_loss(history: History, writer: FigureWriter, smooth: int = 1) -> 
         fig, ax = plt.subplots(figsize=(6.4, 3.6))
         _frame(fig, f"Total loss  |  {history.label}",
                "Weighted sum of the five terms; compare runs on it only when their "
-               "--w_* are the same.")
+               "--w_* are the same." if history.has_head else
+               "The loss the step descends: the embedding term alone. The four geometric "
+               "terms\nare scores of the matched rotations and never part of it.")
         for split, name, colour in SPLITS:
             _curve(ax, history, f"{split}_total", name, colour, smooth)
         _mark_best(ax, history)
@@ -121,9 +127,14 @@ def plot_loss_terms(history: History, writer: FigureWriter, smooth: int = 1) -> 
     plt = _pyplot()
     with _style():
         fig, axes = plt.subplots(2, 2, figsize=(8.0, 5.6), sharex=True)
-        _frame(fig, f"Loss terms  |  {history.label}",
-               "Unweighted. Each term compares the predicted rotation with the truth: "
-               "angle, vertex positions, vertex normals, face normals."
+        _frame(fig, (f"Loss terms  |  {history.label}" if history.has_head else
+                     f"Geometric scores  |  {history.label}"),
+               ("Unweighted. Each term compares the predicted rotation with the truth: "
+                "angle, vertex positions, vertex normals, face normals."
+                if history.has_head else
+                "Never trained on. Each compares the rotations fitted from the embedding "
+                "matches with the truth:\nangle, vertex positions, vertex normals, face "
+                "normals (anchor protocol).")
                + _best_note(history))
         for ax, (term, title, chance) in zip(axes.flat, TERM_PANELS):
             for split, name, colour in SPLITS:
@@ -137,8 +148,9 @@ def plot_loss_terms(history: History, writer: FigureWriter, smooth: int = 1) -> 
         _figure_legend(fig, axes.flat[0], ncol=2)
         fig.subplots_adjust(hspace=0.32, wspace=0.22)
         writer.save(fig, f"training/{_slug(history.label)}/loss_terms",
-                    f"{history.label}: rotation, position, normal and face terms "
-                    f"(unweighted), training and validation.")
+                    f"{history.label}: rotation, position, normal and face "
+                    + ("terms (unweighted)" if history.has_head else
+                       "scores of the matched rotations") + ", training and validation.")
     return True
 
 
@@ -170,16 +182,18 @@ def plot_embedding(history: History, writer: FigureWriter, smooth: int = 1) -> b
 
 
 def plot_rotation_error(history: History, writer: FigureWriter, smooth: int = 1) -> bool:
-    """The rotation head's error in degrees, against chance."""
+    """The rotation error in degrees, against chance: the matched rotations' --
+    or, for a run with one, the rotation head's."""
     keys = (("train_rotation_degrees", "training, mean", SERIES[0]),
             ("val_geodesic_deg", "validation, mean", SERIES[1]),
             ("val_geodesic_median_deg", "validation, median", SERIES[2]))
     if not any(history.has(key) for key, _, _ in keys):
         return False
+    source = "the rotation head" if history.has_head else "the matched rotations"
     plt = _pyplot()
     with _style():
         fig, ax = plt.subplots(figsize=(6.4, 3.6))
-        _frame(fig, f"Rotation error of the rotation head  |  {history.label}",
+        _frame(fig, f"Rotation error of {source}  |  {history.label}",
                "Each piece relative to its object's largest piece (anchor protocol). "
                "Chance: a random rotation, 126.5°.")
         for key, name, colour in keys:
@@ -191,9 +205,37 @@ def plot_rotation_error(history: History, writer: FigureWriter, smooth: int = 1)
         ax.set_xlabel("epoch")
         ax.set_ylabel("geodesic error (deg)")
         _top_legend(ax, ncol=3)
+        owner = "the rotation head's" if history.has_head else "the matched rotations'"
         writer.save(fig, f"training/{_slug(history.label)}/rotation_error",
-                    f"{history.label}: the rotation head's mean (and validation median) "
-                    f"error per epoch.")
+                    f"{history.label}: {owner} mean (and validation median) error per epoch.")
+    return True
+
+
+def plot_accuracy(history: History, writer: FigureWriter, smooth: int = 1) -> bool:
+    """Validation acc@5/10/30 and the share the matching reached, per epoch:
+    the curve ``best.pt`` is chosen on (acc@10)."""
+    keys = [(f"val_acc@{t:g}deg", f"acc@{t:g}", SERIES[i])
+            for i, t in enumerate(ACCURACY_THRESHOLDS)]
+    keys.append(("val_reached", "reached by the matching", SERIES[3]))
+    if history.has_head or not any(history.has(key) for key, _, _ in keys):
+        return False
+    plt = _pyplot()
+    with _style():
+        fig, ax = plt.subplots(figsize=(6.4, 3.6))
+        _frame(fig, f"Validation accuracy  |  {history.label}",
+               "Share of scored pieces whose matched rotation is within 5, 10 and 30 deg of "
+               "the truth,\nand the share the matching reached at all. best.pt has the "
+               "highest acc@10.")
+        for key, name, colour in keys:
+            _curve(ax, history, key, name, colour, smooth)
+        _mark_best(ax, history)
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("share of pieces")
+        _top_legend(ax, ncol=4)
+        writer.save(fig, f"training/{_slug(history.label)}/accuracy",
+                    f"{history.label}: validation acc@5/10/30 and the share reached by the "
+                    f"matching, per epoch.")
     return True
 
 
@@ -224,7 +266,8 @@ def plot_category_heatmap(history: History, writer: FigureWriter, smooth: int = 
     with _style():
         height = 1.2 + 0.24 * len(labels)
         fig, ax = plt.subplots(figsize=(8.0, height))
-        _frame(fig, f"Validation error by category, rotation head  |  {history.label}",
+        source = "rotation head" if history.has_head else "matched rotations"
+        _frame(fig, f"Validation error by category, {source}  |  {history.label}",
                f"Mean geodesic error per epoch ({smooth}-epoch moving average), best "
                f"category at the top. The line on the scale marks chance, 126.5°.")
         cmap = LinearSegmentedColormap.from_list("sequential", SEQUENTIAL)
@@ -240,9 +283,10 @@ def plot_category_heatmap(history: History, writer: FigureWriter, smooth: int = 
         bar.outline.set_visible(False)
         if low < CHANCE_GEODESIC_DEG < high:
             bar.ax.axhline(CHANCE_GEODESIC_DEG, color=INK, lw=0.9)
+        owner = "the rotation head's" if history.has_head else "the matched rotations'"
         writer.save(fig, f"training/{_slug(history.label)}/val_by_category",
-                    f"{history.label}: the rotation head's validation error per category "
-                    f"and epoch (heatmap).")
+                    f"{history.label}: {owner} validation error per category and epoch "
+                    f"(heatmap).")
     return True
 
 
@@ -252,11 +296,11 @@ def plot_category_heatmap(history: History, writer: FigureWriter, smooth: int = 
 
 COMPARE_PANELS = (
     ("geodesic", "Rotation error, mean (deg)"),
+    ("acc@10", "acc@10"),
+    ("reached", "Share reached by the matching"),
     ("embedding", "Embedding term (InfoNCE)"),
     ("match@1", "match@1"),
-    ("position", "Position term"),
-    ("normal", "Vertex-normal term"),
-    ("face", "Face-normal term"),
+    ("position", "Position score"),
 )
 
 
@@ -271,15 +315,16 @@ def plot_comparison(histories: Sequence[History], split: str, writer: FigureWrit
     with _style():
         fig, axes = plt.subplots(2, 3, figsize=(10.5, 5.8), sharex=True)
         _frame(fig, f"Runs compared, {name}",
-               "Terms are unweighted, so runs with different --w_* compare here; a term a run "
-               "did not train on is still logged.")
+               "One line per run. The rotation error, acc@10, reach and position score are "
+               "those of the rotations\nfitted from each run's embedding matches (a run with "
+               "a rotation head shows its head's).")
         for ax, (quantity, title) in zip(axes.flat, COMPARE_PANELS):
             for index, history in enumerate(histories):
                 key = _compare_key(split, quantity)
                 _curve(ax, history, key, history.label, SERIES[index], smooth)
             if quantity == "geodesic":
                 _reference(ax, CHANCE_GEODESIC_DEG, "chance", axis="y")
-            if quantity == "match@1":
+            if quantity in ("match@1", "acc@10", "reached"):
                 ax.set_ylim(0, 1)
             ax.set_title(title, loc="left", fontsize=9)
         for ax in axes[-1]:
@@ -287,14 +332,16 @@ def plot_comparison(histories: Sequence[History], split: str, writer: FigureWrit
         _figure_legend(fig, axes.flat[0], ncol=min(len(histories), 4))
         fig.subplots_adjust(hspace=0.32, wspace=0.25)
         writer.save(fig, f"training/compare_{split}",
-                    f"Every run, {name}: rotation error, embedding term, match@1 and the "
-                    f"three geometric terms.")
+                    f"Every run, {name}: rotation error, acc@10, the share reached by the "
+                    f"matching, the embedding term, match@1 and the position score.")
     return True
 
 
 def _compare_key(split: str, quantity: str) -> str:
     if quantity == "geodesic":
         return "val_geodesic_deg" if split == "val" else "train_rotation_degrees"
+    if quantity == "acc@10":
+        return f"{split}_acc@10deg"
     return f"{split}_{quantity}"
 
 
@@ -447,9 +494,11 @@ def plot_accuracy_curves(evaluations: Sequence[Evaluation], writer: FigureWriter
     sources_drawn = []
     with _style():
         fig, ax = plt.subplots(figsize=(6.6, 4.0))
+        heads = any("network" in e.sources() for e in having)
         _frame(fig, "Pieces within an error threshold",
                "Share of scored pieces whose rotation error is at most the threshold.\n"
-               "Solid: rotations from the embedding matches; dashed: the rotation head.")
+               + ("Solid: rotations from the embedding matches; dashed: the rotation head."
+                  if heads else "Rotations fitted from the embedding matches."))
         for index, evaluation in enumerate(evaluations):
             for source in evaluation.sources():
                 values = evaluation.errors(source)

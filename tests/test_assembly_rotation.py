@@ -4,8 +4,9 @@ anchor (:mod:`reassembly.assembly.rotation`).
 
 Reference values first, as for the translation solver: with exact
 correspondences the fits must be exact, the chain must compose them the right
-way round, and a rotation head that is wrong must not matter to any fragment
-the chain reaches.
+way round, a wrong starting rotation must not matter to any fragment the chain
+reaches, and the batch-level matching must read nothing but what the method is
+given at inference.
 """
 from __future__ import annotations
 
@@ -20,13 +21,14 @@ from reassembly.assembly import (  # noqa: E402
     PairRotation,
     chain_rotations,
     kabsch,
+    match_batch,
     match_rotations,
     ransac_rotation,
     score_batch,
 )
 from reassembly.nn.losses import geodesic_angle  # noqa: E402
 
-from test_assembly import _broken_scene, _oracle  # noqa: E402
+from test_assembly import _broken_scene, _given, _oracle  # noqa: E402
 
 DTYPE = torch.float64
 
@@ -89,7 +91,7 @@ def _true_pairs(truth, edges, inliers=50):
 def test_the_chain_composes_the_fits_the_right_way_round():
     truth = _rotations(4, 7)
     pairs = _true_pairs(truth, [(0, 1), (1, 2), (2, 3)])
-    start = _rotations(4, 8)                     # the head's: wrong everywhere
+    start = _rotations(4, 8)                     # wrong everywhere
     start[2] = truth[2]                          # the root's is trusted
     chained, reached = chain_rotations(pairs, start, root=2)
     assert bool(reached.all())
@@ -130,7 +132,7 @@ def test_matched_rotations_are_exact_from_exact_matches(fractured_solid):
     batch, _ = _broken_scene(fractured_solid)
     points = batch.node_features[:, 0, :] * batch.unit[batch.vertex_fragment, None]
     points = points / batch.unit.max()
-    oracle = _oracle(batch, batch.target_rotation)
+    oracle = _oracle(batch)
     root = int(torch.argmax(batch.log_scale.flatten()))
     start = _rotations(2, 14)
     start[root] = batch.target_rotation[root]
@@ -142,55 +144,66 @@ def test_matched_rotations_are_exact_from_exact_matches(fractured_solid):
     assert float(_degrees(chained, batch.target_rotation).max()) < 1e-6
 
 
-def test_the_scorer_recovers_a_rotation_the_head_got_wrong(fractured_solid):
-    """The same wrong head that fails the network route scores perfectly once
-    the rotations come from the matches -- and the head's rotation for a
-    reached fragment does not enter the result at all."""
+def test_the_scorer_fits_what_a_given_wrong_rotation_gets_wrong(fractured_solid):
+    """A fragment tipped onto its side fails when its rotation is given; fitted
+    from the matches, the same scene scores perfectly."""
     batch, _ = _broken_scene(fractured_solid)
     turn = torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]], dtype=DTYPE)
     wrong = batch.target_rotation.clone()
     scored = 1 - int(torch.argmax(batch.log_scale.flatten()))
     wrong[scored] = turn @ wrong[scored]
 
-    network = score_batch(batch, _oracle(batch, wrong))[0]
-    matched = score_batch(batch, _oracle(batch, wrong), rotations="matched")[0]
-    assert network["part_accuracy"] < 1.0 and network["geodesic_deg"] > 80.0
+    given = score_batch(batch, _oracle(batch), matched=_given(batch, wrong),
+                        placement="global")[0]
+    matched = score_batch(batch, _oracle(batch))[0]
+    assert given["part_accuracy"] < 1.0 and given["geodesic_deg"] > 80.0
     assert matched["geodesic_deg"] < 1e-5
     assert matched["part_accuracy"] == 1.0 and matched["rmse_t"] < 1e-6
     assert matched["matched_share"] == 1.0 and matched["_reached"] == [True, True]
     assert len(matched["_scored_geodesic_deg"]) == 1
 
-    other = batch.target_rotation.clone()
-    other[scored] = _rotations(1, 15)[0]
-    again = score_batch(batch, _oracle(batch, other), rotations="matched")[0]
-    assert np.allclose(again["_rotation"], matched["_rotation"], atol=1e-9)
 
-
-def test_the_matched_route_leaves_the_prediction_untouched(fractured_solid):
+def test_the_batch_matching_reads_no_truth(fractured_solid):
+    """Every target field gone -- rotations, positions, normals, centroids,
+    clusters -- and the matched rotations are the same to the bit."""
     batch, _ = _broken_scene(fractured_solid)
-    wrong = _rotations(2, 16)
-    prediction = _oracle(batch, wrong)
-    before = prediction.rotation.clone()
-    score_batch(batch, prediction, rotations="matched", anchor=False)
-    assert torch.equal(prediction.rotation, before)
+    embedding = _oracle(batch).vertex_embedding
+    plain = match_batch(batch, embedding)
+    hidden = batch._replace(
+        **{name: torch.full_like(getattr(batch, name), float("nan"))
+           for name in ("target_rotation", "target_vertices", "target_normals",
+                        "target_edge_normals", "centroid")},
+        cluster=torch.full_like(batch.cluster, -1), num_clusters=0)
+    again = match_batch(hidden, embedding)
+    assert torch.equal(plain.rotation, again.rotation)
+    assert torch.equal(plain.reached, again.reached) and bool(plain.reached.all())
 
 
-def test_an_unknown_rotation_source_is_rejected(fractured_solid):
+def test_the_root_is_the_identity_and_an_unreached_fragment_keeps_it(fractured_solid):
+    """Truth-free: the largest fragment is its own frame's identity, and a
+    fragment no fit reaches keeps the identity too -- for the anchor protocol
+    to align, not a guess."""
     batch, _ = _broken_scene(fractured_solid)
-    with pytest.raises(ValueError, match="rotations must be one of"):
-        score_batch(batch, _oracle(batch, batch.target_rotation), rotations="head")
+    root = int(torch.argmax(batch.log_scale.flatten()))
+    lonely = match_batch(batch, _oracle(batch).vertex_embedding, min_matches=10 ** 6)
+    eye = torch.eye(3, dtype=DTYPE).expand(2, 3, 3)
+    assert torch.equal(lonely.rotation, eye)
+    assert lonely.reached.tolist() == [i == root for i in range(2)]
+    assert lonely.roots == [root] and lonely.pairs == [[]]
+    fitted = match_batch(batch, _oracle(batch).vertex_embedding)
+    assert torch.equal(fitted.rotation[root], eye[0])
 
 
 def test_the_draws_are_tied_to_the_scene_not_the_run(fractured_solid):
     """Two evaluations of one checkpoint must agree: RANSAC is seeded per scene
     by name, not by a stream that depends on what was scored before."""
     batch, _ = _broken_scene(fractured_solid)
-    noisy = _oracle(batch, batch.target_rotation)
+    noisy = _oracle(batch)
     generator = torch.Generator().manual_seed(17)
     embedding = noisy.vertex_embedding + 0.05 * torch.randn(
         noisy.vertex_embedding.shape, generator=generator, dtype=DTYPE)
     noisy = noisy._replace(vertex_embedding=embedding)
-    first = score_batch(batch, noisy, rotations="matched")[0]
-    second = score_batch(batch, noisy, rotations="matched")[0]
+    first = score_batch(batch, noisy)[0]
+    second = score_batch(batch, noisy)[0]
     assert first["_rotation"] == second["_rotation"]
     assert math.isfinite(first["geodesic_deg"])

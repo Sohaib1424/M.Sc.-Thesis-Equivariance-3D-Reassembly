@@ -9,18 +9,20 @@ What is read
 ------------
 history
     ``<checkpoint_dir>/history.json``, or the ``history`` a checkpoint carries:
-    one row per epoch with ``train_<x>`` and ``val_<x>`` for the five loss
-    terms and the metrics. The terms are logged **unweighted**, so runs trained
-    with different ``--w_*`` compare term by term; ``train_total`` and
-    ``val_total`` are the weighted sums and compare only between runs with the
-    same weights.
+    one row per epoch with ``train_<x>`` and ``val_<x>`` for the loss, the
+    scores and the metrics. Since v7 the network trains on the embedding term
+    alone (``train_total`` is it), and rotation, position, normal and face are
+    scores of the rotations fitted from its matches -- every epoch on
+    validation, on training only with ``--score_train``. A run from before
+    that (one with a rotation head, :attr:`History.has_head`) logged the five
+    terms **unweighted** and their weighted sum as the total.
 evaluation
-    ``<split>_metrics.json`` / ``<split>_metrics_matched.json`` from
-    ``python -m scripts.train --evaluate``. The per-fragment numbers come from
-    its per-scene records (``assembly_scenes``), so the evaluation must have
-    been assembled -- the default, not ``--no_assemble``. A matched evaluation
-    holds the matched rotations' errors, and from this version on the head's
-    own errors on the same fragments as well (``_network_geodesic_deg``).
+    ``<split>_metrics*.json`` from ``python -m scripts.train --evaluate``. The
+    per-fragment numbers come from its per-scene records
+    (``assembly_scenes``), so the evaluation must have been assembled -- the
+    default, not ``--no_assemble``. Since v7 every rotation in it is fitted
+    from the matches (``rotation_head: false``); a file from before holds the
+    rotation head's errors, and a matched one of those both.
 
 Object types
 ------------
@@ -103,12 +105,25 @@ class History:
     def has(self, key: str) -> bool:
         return bool(np.isfinite(self.series(key)).any())
 
+    @property
+    def has_head(self) -> bool:
+        """Whether the run had the rotation head v7 removed: it logged the
+        head's own diagnostics."""
+        return any(self.has(key) for key in ("train_head_cos", "val_head_cos",
+                                             "val_absolute_geodesic_deg"))
+
     def best_epoch(self) -> Optional[int]:
-        """The epoch ``best.pt`` holds: the lowest ``val_geodesic_deg``."""
-        values = self.series("val_geodesic_deg")
+        """The epoch ``best.pt`` holds: the highest ``val_acc@10deg`` -- or,
+        for a run with the rotation head, the lowest ``val_geodesic_deg``."""
+        if self.has_head:
+            values = self.series("val_geodesic_deg")
+            if not np.isfinite(values).any():
+                return None
+            return int(self.epochs()[int(np.nanargmin(values))])
+        values = self.series("val_acc@10deg")
         if not np.isfinite(values).any():
             return None
-        return int(self.epochs()[int(np.nanargmin(values))])
+        return int(self.epochs()[int(np.nanargmax(values))])
 
     def categories(self) -> List[str]:
         names: List[str] = []
@@ -190,7 +205,8 @@ def load_evaluation(path, label: Optional[str] = None) -> Evaluation:
                                  "part_chamfer")}
     scene_columns: Dict[str, list] = {k: [] for k in
                                       ("type", "pieces", "part_accuracy", "rmse_t", "chamfer",
-                                       "geodesic_deg", "euler_rmse_deg", "matched_share")}
+                                       "part_chamfer", "geodesic_deg", "euler_rmse_deg",
+                                       "matched_share", "matches", "verified_matches")}
     families = set()
     for index, record in enumerate(records):
         kind, family = _type_and_family(record.get("_category", ""), record.get("_scene", ""))
@@ -200,8 +216,8 @@ def load_evaluation(path, label: Optional[str] = None) -> Evaluation:
         count = int(fragments) if np.isfinite(fragments) else 0
         scene_columns["type"].append(kind)
         scene_columns["pieces"].append(count)
-        for key in ("part_accuracy", "rmse_t", "chamfer", "geodesic_deg", "euler_rmse_deg",
-                    "matched_share"):
+        for key in ("part_accuracy", "rmse_t", "chamfer", "part_chamfer", "geodesic_deg",
+                    "euler_rmse_deg", "matched_share", "matches", "verified_matches"):
             scene_columns[key].append(_number(record.get(key)))
 
         angles = list(record.get("_scored_geodesic_deg") or [])
@@ -302,6 +318,11 @@ def errors_by_type(evaluations: Sequence[Evaluation], source: str) -> List[Dict]
     return rows
 
 
+ASSEMBLY_KEYS = ("part_accuracy", "rmse_t", "chamfer", "part_chamfer", "geodesic_deg",
+                 "euler_rmse_deg", "matched_share", "matches", "verified_matches")
+"""The per-scene numbers averaged per type: the benchmark's, then the matching's."""
+
+
 def assembly_by_type(evaluations: Sequence[Evaluation], order: Sequence[str]) -> List[Dict]:
     """Per (type, evaluation): the benchmark's per-scene means and the scene count."""
     rows = []
@@ -311,8 +332,86 @@ def assembly_by_type(evaluations: Sequence[Evaluation], order: Sequence[str]) ->
             if not mask.any():
                 continue
             row = {"type": kind, "dataset": evaluation.label, "scenes": int(mask.sum())}
-            for key in ("part_accuracy", "rmse_t", "chamfer", "geodesic_deg", "euler_rmse_deg"):
+            for key in ASSEMBLY_KEYS:
                 row[key] = _nanmean(evaluation.scenes[key][mask])
+            rows.append(row)
+    return rows
+
+
+SCORE_KEYS = ("position", "normal", "face")
+"""The geometric scores besides the rotation's, kept per category by an evaluation."""
+
+
+def scores_by_type(evaluation: Evaluation) -> Dict[str, Dict[str, float]]:
+    """
+    The evaluation's per-category means (``by_category``: the scores, the share
+    the matching reached), merged per object type -- weighted by fragments, as
+    the categories' own means are -- and over every fragment as ``"(all)"``.
+    Empty for a file from before the scores were kept per category, and for
+    one with a rotation head, whose terms were the head's losses.
+    """
+    if evaluation.summary.get("rotation_head", True):
+        return {}
+    breakdown = evaluation.summary.get("by_category") or {}
+    keys = SCORE_KEYS + ("reached",)
+    merged: Dict[str, Dict[str, float]] = {}
+    for category, row in breakdown.items():
+        kind = object_type(category)
+        weight = _number(row.get("fragments"))
+        if not np.isfinite(weight) or weight <= 0:
+            continue
+        slot = merged.setdefault(kind, {"fragments": 0.0, **{f"_{k}": 0.0 for k in keys},
+                                        **{f"_{k}_n": 0.0 for k in keys}})
+        slot["fragments"] += weight
+        for key in keys:
+            value = _number(row.get(key))
+            if np.isfinite(value):
+                slot[f"_{key}"] += value * weight
+                slot[f"_{key}_n"] += weight
+    out = {}
+    for kind, slot in merged.items():
+        out[kind] = {key: (slot[f"_{key}"] / slot[f"_{key}_n"] if slot[f"_{key}_n"] else np.nan)
+                     for key in keys}
+    summary = evaluation.summary
+    if out:
+        out["(all)"] = {key: _number(summary.get(key)) for key in keys}
+    return out
+
+
+def by_type(evaluations: Sequence[Evaluation], order: Sequence[str]) -> List[Dict]:
+    """
+    Every number per (type, evaluation), one row each, and each evaluation's
+    whole set as type ``"(all)"``: the per-piece rotation error (count, mean,
+    median, quartiles, acc@5/10/30), the share of pieces the matching reached,
+    the position, normal and face scores, and the scenes' assembly scores and
+    match counts. A subset without categories (Artifact) is one type.
+    """
+    rows = []
+    for kind in list(order) + ["(all)"]:
+        for evaluation in evaluations:
+            if kind == "(all)":
+                piece_mask = np.ones(len(evaluation.pieces["type"]), dtype=bool)
+                scene_mask = np.ones(len(evaluation.scenes["type"]), dtype=bool)
+            else:
+                piece_mask = evaluation.pieces["type"] == kind
+                scene_mask = evaluation.scenes["type"] == kind
+            if not piece_mask.any() and not scene_mask.any():
+                continue
+            source = "matched" if "matched" in evaluation.sources() else "network"
+            stats = distribution(evaluation.errors(source)[piece_mask])
+            row = {"type": kind, "dataset": evaluation.label, "pieces": stats.pop("n")}
+            for key in ("mean", "median", "q1", "q3", "acc@5", "acc@10", "acc@30"):
+                row[f"error_{key}" if key in ("mean", "median", "q1", "q3") else key] = \
+                    stats.get(key, np.nan)
+            row["reached"] = _nanmean(evaluation.pieces["reached"][piece_mask])
+            scores = scores_by_type(evaluation).get(kind, {})
+            for key in SCORE_KEYS:
+                row[key] = scores.get(key, np.nan)
+            row["scenes"] = int(scene_mask.sum())
+            for key in ASSEMBLY_KEYS:
+                if key == "matched_share":
+                    continue
+                row[key] = _nanmean(evaluation.scenes[key][scene_mask])
             rows.append(row)
     return rows
 
@@ -340,7 +439,12 @@ def summary_row(evaluation: Evaluation) -> Dict:
     """The headline numbers of one evaluation, as one table row."""
     summary = evaluation.summary
     info = summary.get("evaluation") or {}
-    matched = summary.get("matched") or {}
+    # Since v7 the top-level numbers are the matched rotations' and there is no
+    # head; a file from before keeps the head's at the top level and, when
+    # matched, the matched rotations' under "matched".
+    head = summary.get("rotation_head", True)
+    matched = summary.get("matched") or ({} if head else summary)
+    network = summary if head else {}
     assembly = summary.get("assembly") or {}
     return {
         "dataset": evaluation.label,
@@ -351,9 +455,11 @@ def summary_row(evaluation: Evaluation) -> Dict:
         # A file from before v7 names no placement: the global solve was the only one.
         "placement": summary.get("placement") or "global",
         "scenes": int(len(evaluation.scenes["type"])),
+        "objects": _number(info.get("objects")),
+        "trained_shapes": _number(info.get("trained_shapes")),
         "scored_pieces": int(summary.get("geodesic_fragments", len(evaluation.pieces["type"]))),
-        "network_mean_deg": _number(summary.get("geodesic_deg")),
-        "network_median_deg": _number(summary.get("geodesic_median_deg")),
+        "network_mean_deg": _number(network.get("geodesic_deg")),
+        "network_median_deg": _number(network.get("geodesic_median_deg")),
         "matched_mean_deg": _number(matched.get("geodesic_deg")),
         "matched_median_deg": _number(matched.get("geodesic_median_deg")),
         "matched_acc@5": _number(matched.get("acc@5deg")),
@@ -365,7 +471,13 @@ def summary_row(evaluation: Evaluation) -> Dict:
         "chamfer": _number(assembly.get("chamfer")),
         "scene_geodesic_deg": _number(assembly.get("geodesic_deg")),
         "scene_euler_rmse_deg": _number(assembly.get("euler_rmse_deg")),
+        "matches": _number(assembly.get("matches")),
+        "verified_matches": _number(assembly.get("verified_matches")),
         "match@1": _number(summary.get("match@1")),
+        # The four scores (none for a file with a head: its terms were losses).
+        **{key: _number(summary.get(key))
+           for key in ("rotation", "position", "normal", "face") if not head},
+        "embedding": _number(summary.get("embedding")),
     }
 
 

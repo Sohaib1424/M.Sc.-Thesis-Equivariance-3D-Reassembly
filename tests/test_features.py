@@ -76,8 +76,10 @@ def test_the_device_path_gives_the_same_loss():
     torch.manual_seed(0)
     model = build_model(config)
     shipped, derived = _pair(3)
-    loss_a, report_a, _ = _forward(model, collate([shipped]), build_criterion(config), config)
-    loss_b, report_b, _ = _forward(model, collate([derived]), build_criterion(config), config)
+    loss_a, report_a, _ = _forward(model, collate([shipped]), build_criterion(config), config,
+                                   score=True)
+    loss_b, report_b, _ = _forward(model, collate([derived]), build_criterion(config), config,
+                                   score=True)
     assert float(loss_a.detach()) == pytest.approx(float(loss_b.detach()), rel=1e-5)
     for name in ("rotation", "position", "normal", "face"):
         assert report_a[name] == pytest.approx(report_b[name], rel=1e-5, abs=1e-6), name

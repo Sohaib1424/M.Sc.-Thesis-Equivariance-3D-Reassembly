@@ -3,12 +3,11 @@
 Figures and tables from training histories and evaluation results, into one
 folder (and a zip of it) to download.
 
-    python -m scripts.make_figures --out figures/W10 \\
-        --history W10=checkpoint/history.json \\
-        --eval "Everyday=eval/W10-full/val_metrics_matched.json" \\
-        --eval "Everyday VC=eval/W10-everyday-vc/val_metrics_matched.json" \\
-        --eval "Artifact=eval/W10-artifact/val_metrics_matched.json" \\
-        --eval "Artifact VC=eval/W10-artifact-vc/val_metrics_matched.json"
+    python -m scripts.make_figures --out figures/everyday-val \\
+        --eval "Everyday val=eval/everyday-val/val_metrics.json"
+
+    python -m scripts.make_figures --out figures/training \\
+        --history full=checkpoint/history.json --history no-cross=checkpoint-intra/history.json
 
 ``--history`` and ``--eval`` repeat, each as ``LABEL=PATH`` (or just ``PATH``:
 the label is then the folder the file is in). A history is a run's
@@ -19,26 +18,33 @@ every figure.
 
 What comes out (``<out>/README.md`` lists every file)
 ------------------------------------------------------
-training/<run>/   total loss; the four geometric terms, one panel each;
-                  the embedding term beside match@1; the rotation head's
-                  error against chance; its error per category and epoch.
+training/<run>/   the loss (the embedding term); the four geometric scores,
+                  one panel each; the embedding term beside match@1; the
+                  rotation error against chance; validation acc@5/10/30 and
+                  the share the matching reached (best.pt is the highest
+                  acc@10); the error per category and epoch.
 training/         with two or more runs: every run on one set of axes,
                   training and validation (for ablations).
 evaluation/       per-piece rotation error by object type and dataset, as
-                  box plots and as violins (matched rotations on a log
-                  scale, the rotation head's on a linear one); the share of
-                  pieces within each error threshold; part accuracy by
-                  object type; scores against pieces per scene.
-tables/           the numbers behind every figure, as CSV, and a summary
-                  of each evaluation in CSV and Markdown.
+                  box plots and as violins (log scale); the share of pieces
+                  within each error threshold; part accuracy by object type;
+                  scores against pieces per scene.
+tables/           the numbers behind every figure, as CSV; by_type.csv/.md,
+                  every number per object type (the whole subset as
+                  "(all)"): the error's distribution and acc@5/10/30, the
+                  share reached, the position/normal/face scores, the
+                  assembly scores and the match counts; and a summary of each
+                  evaluation in CSV and Markdown.
 
 Notes
 -----
-* The rotation head's per-piece spread needs ``_network_geodesic_deg`` in a
-  matched evaluation's file, written from this version on; older matched
-  files give the matched spread only (the head's means are in the tables).
+* One folder per call, zipped beside it (``<out>.zip``): call once per subset
+  for one zip each.
 * Per-piece numbers come from the scene records an evaluation writes when it
   assembles (the default); a ``--no_assemble`` file gives the summary only.
+* Files written before v7 removed the rotation head still draw: their head's
+  numbers go where the head's always went, and their per-piece spread is the
+  head's unless the file was a matched one.
 * Only numpy and matplotlib are needed, so the files can be copied off the
   training machine and drawn anywhere.
 """
@@ -57,6 +63,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 SUMMARY_COLUMNS = (
     ("dataset", "dataset", ""),
     ("placement", "placement", ""),
+    ("objects", "objects", ".0f"),
+    ("trained_shapes", "trained shapes", ".0f"),
     ("scenes", "scenes", "d"),
     ("scored_pieces", "pieces scored", "d"),
     ("network_mean_deg", "head mean (°)", ".2f"),
@@ -64,12 +72,41 @@ SUMMARY_COLUMNS = (
     ("matched_mean_deg", "matched mean (°)", ".2f"),
     ("matched_median_deg", "matched median (°)", ".2f"),
     ("matched_acc@5", "acc@5", ".3f"),
+    ("matched_acc@10", "acc@10", ".3f"),
     ("reached", "placed by matching", ".0%"),
     ("part_accuracy", "part accuracy", ".3f"),
     ("rmse_t", "RMSE(T)", ".4f"),
     ("chamfer", "CD", ".5f"),
     ("scene_euler_rmse_deg", "Euler RMSE (°)", ".2f"),
+    ("rotation", "rotation score", ".4f"),
+    ("position", "position score", ".4f"),
+    ("normal", "normal score", ".4f"),
+    ("face", "face score", ".4f"),
+    ("match@1", "match@1", ".3f"),
 )
+"""The summary table's columns; a column no evaluation fills is left out."""
+
+BY_TYPE_COLUMNS = (
+    ("type", "type", ""),
+    ("dataset", "dataset", ""),
+    ("pieces", "pieces", "d"),
+    ("error_mean", "mean (°)", ".2f"),
+    ("error_median", "median (°)", ".2f"),
+    ("acc@5", "acc@5", ".3f"),
+    ("acc@10", "acc@10", ".3f"),
+    ("acc@30", "acc@30", ".3f"),
+    ("reached", "reached", ".0%"),
+    ("position", "position", ".4f"),
+    ("normal", "normal", ".4f"),
+    ("face", "face", ".4f"),
+    ("scenes", "scenes", "d"),
+    ("part_accuracy", "PA", ".3f"),
+    ("rmse_t", "RMSE(T)", ".4f"),
+    ("chamfer", "CD", ".5f"),
+    ("matches", "matches", ".0f"),
+    ("verified_matches", "verified", ".0f"),
+)
+"""tables/by_type.md: every number per object type; a column no row fills is left out."""
 
 
 def labelled(text: str) -> Tuple[Optional[str], str]:
@@ -113,8 +150,9 @@ def main(argv=None) -> int:
 
     from reassembly.viz import figures as fg
     from reassembly.viz.results import (ROTATION_SOURCES, assembly_by_type, by_piece_count,
-                                        errors_by_type, load_evaluation, load_history,
-                                        markdown_table, summary_row, type_order, write_csv)
+                                        by_type, errors_by_type, load_evaluation,
+                                        load_history, markdown_table, summary_row,
+                                        type_order, write_csv)
 
     histories = []
     for text in args.history:
@@ -152,6 +190,7 @@ def main(argv=None) -> int:
         fg.plot_loss_terms(history, writer, args.smooth)
         fg.plot_embedding(history, writer, args.smooth)
         fg.plot_rotation_error(history, writer, args.smooth)
+        fg.plot_accuracy(history, writer, args.smooth)
         fg.plot_category_heatmap(history, writer, smooth=max(args.smooth, 5))
     if len(histories) > 1:
         for split in ("val", "train"):
@@ -160,10 +199,11 @@ def main(argv=None) -> int:
     if evaluations:
         for source in ROTATION_SOURCES:
             if not any(source in e.sources() for e in evaluations):
-                if source == "network" and any(e.rotations == "matched" for e in evaluations):
+                if source == "network" and any(e.rotations == "matched"
+                                               and e.summary.get("rotation_head", True)
+                                               for e in evaluations):
                     skipped.append("the rotation head's per-piece spread: these matched "
-                                   "files predate _network_geodesic_deg (re-run --evaluate "
-                                   "with this version to get it)")
+                                   "files predate _network_geodesic_deg")
                 continue
             for kind in ("box", "violin"):
                 fg.plot_errors_by_type(evaluations, source, writer, kind=kind)
@@ -181,8 +221,18 @@ def main(argv=None) -> int:
         order = type_order(evaluations, source)
         write_csv(out / "tables" / "assembly_by_type.csv", assembly_by_type(evaluations, order))
         writer.note("tables/assembly_by_type.csv",
-                    "Per type and dataset: scenes, part accuracy, RMSE(T), Chamfer, per-scene "
-                    "geodesic and Euler RMSE.")
+                    "Per type and dataset: scenes, part accuracy, RMSE(T), Chamfer (whole and "
+                    "per part), per-scene geodesic and Euler RMSE, the share reached, matches "
+                    "and verified matches per scene.")
+        rows = by_type(evaluations, order)
+        write_csv(out / "tables" / "by_type.csv", rows)
+        (out / "tables" / "by_type.md").write_text(
+            markdown_table(rows, _filled(rows, BY_TYPE_COLUMNS)) + "\n", encoding="utf-8")
+        writer.note("tables/by_type.csv, tables/by_type.md",
+                    "Every number per object type and dataset, the whole set as (all): the "
+                    "per-piece error (mean, median, quartiles, acc@5/10/30), the share "
+                    "reached, the position/normal/face scores, and the assembly scores and "
+                    "match counts.")
         write_csv(out / "tables" / "by_piece_count.csv",
                   [row for e in evaluations for row in by_piece_count(e)])
         writer.note("tables/by_piece_count.csv",
@@ -191,7 +241,7 @@ def main(argv=None) -> int:
         rows = [summary_row(e) for e in evaluations]
         write_csv(out / "tables" / "summary.csv", rows)
         (out / "tables" / "summary.md").write_text(
-            markdown_table(rows, SUMMARY_COLUMNS) + "\n", encoding="utf-8")
+            markdown_table(rows, _filled(rows, SUMMARY_COLUMNS)) + "\n", encoding="utf-8")
         writer.note("tables/summary.csv, tables/summary.md",
                     "The headline numbers of every evaluation, one row each.")
 
@@ -204,6 +254,15 @@ def main(argv=None) -> int:
                                       base_dir=out.name)
         print(f"  zipped to {archive}")
     return 0
+
+
+def _filled(rows, columns):
+    """``columns`` without those no row has a value for (missing, empty or NaN)."""
+    def has(row, key):
+        value = row.get(key)
+        return value not in (None, "") and not (isinstance(value, float) and value != value)
+
+    return [column for column in columns if any(has(row, column[0]) for row in rows)]
 
 
 def _write_index(out: Path, args, histories, evaluations, writer, skipped) -> None:

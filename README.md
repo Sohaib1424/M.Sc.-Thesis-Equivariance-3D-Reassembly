@@ -128,7 +128,7 @@ tests still pass and the network tests skip.
 git clone <this-repo> && cd <this-repo>
 python -m venv .venv && source .venv/bin/activate      # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-python -m pytest                                        # 445 passed
+python -m pytest                                        # 523 passed
 ```
 
 Installing is optional — `pytest.ini` sets `pythonpath = src .` and each script
@@ -267,18 +267,19 @@ src/reassembly/
 ├── distributed.py                 1, 2 or N GPUs: one all-reduce per optimizer step
 ├── assembly/
 │   ├── translation.py             stage two: match in embedding space, solve for t
-│   ├── rotation.py                rotations from those matches (--rotations matched)
+│   ├── rotation.py                every rotation: fitted from those matches, chained
 │   ├── placement.py               placement from the pair fits the chain agrees with
-│   └── scoring.py                 RMSE(T), Chamfer, part accuracy, in world units
+│   ├── scoring.py                 RMSE(T), Chamfer, part accuracy, in world units
+│   └── dump.py                    one scored scene as the viewers' .npz
 ├── nn/
-│   ├── vn.py                  ★   Vector Neuron primitives, Gram-Schmidt head
+│   ├── vn.py                  ★   Vector Neuron primitives
 │   ├── segment.py                 scatter reductions (no torch_scatter)
 │   ├── gat.py                     intra-fragment attention along mesh edges
 │   ├── cross.py               ★   cross-fragment attention — read its docstring
-│   ├── losses.py                  the composite objective, verified chance values
+│   ├── losses.py                  the contrastive objective; the four scores, verified chance values
 │   └── model.py                   the backbone and the rotation convention
 ├── evaluation/
-│   ├── metrics.py                 reported-only: tilt/twist, head|cos|, Chamfer, PA
+│   ├── metrics.py                 reported-only: tilt/twist, Chamfer, PA
 │   └── noise.py                   --jitter/--drop: evaluation without shared break vertices
 └── viz/
     ├── scene.py                   scene assembly for rendering
@@ -304,7 +305,7 @@ scripts/
 ├── tune_sharp_threshold.py        pick --sharp-threshold by F1
 └── visualize.py                   render or describe one scene
 
-tests/                             535 tests
+tests/                             523 tests
 ```
 
 Only `reassembly` is packaged; `scripts/` and `tests/` are entry points and
@@ -316,18 +317,21 @@ checks, run from the repository root.
 mesh topology, fracture-surface extraction (both methods), cross-fragment
 correspondence, SE(3) perturbation, visualisation, the exhaustive extraction
 pass — and the network: Vector Neuron primitives, intra-fragment graph
-attention, cross-fragment attention, the composite loss, feature construction
+attention, cross-fragment attention, the contrastive loss, feature construction
 and the batch collate.
 
 Equivariance is checked numerically in float64, not asserted in prose. Every
-primitive satisfies `L(xRᵀ) = L(x)Rᵀ` to ≤1e-15; the whole model is equivariant
-to a fragment's own pose and *invariant* to every other fragment's, which is
-the property that makes a per-fragment rotation label learnable at all.
+primitive satisfies `L(xRᵀ) = L(x)Rᵀ` to ≤1e-15; the whole model's features are
+equivariant to a fragment's own pose and *invariant* to every other fragment's,
+and the embedding read from them is invariant to every pose — which is what
+lets a vertex on one fragment be matched to its partner on another.
 
 **Training** is in `reassembly.training` — one module holding the config, the
-dataset, the loops, checkpointing, the schedule and the metrics. It prints every
-loss term separately each epoch alongside the total, with chance in the banner
-so a number can be read against something:
+dataset, the loops, checkpointing, the schedule and the metrics. Each epoch it
+prints the trained term (the contrastive embedding term, with match@1) and,
+from validation, the four scores and the error of the rotations fitted from
+the matches, with chance in the banner so a number can be read against
+something:
 
 ```bash
 python -m scripts.train --root_dir /path/to/breaking_bad --epochs 40
@@ -350,9 +354,11 @@ Thesis 1's meaning, so one set of habits drives both:
 | `--hidden_channels`, `--heads`, `--embed_dim` | the width, attention heads, embedding size |
 | `--grad_checkpointing True` | recompute every layer in the backward pass (below) |
 | `--num_workers`, `--save_every`, `--time_budget_hours` | loader processes per GPU; `last.pt` every N epochs; stop cleanly after this long |
-| `--rotation_target anchor\|absolute` | Thesis v6's addition (below): score each fragment relative to its scene's largest (default), or in its object's stored frame |
-| `--placement checked\|global` | this version's (below): with `--evaluate --rotations matched`, place the pieces from the verified pair fits (default) or by v6's single solve |
+| `--schedule` | the layers in order; default `intra intra cross intra cross intra cross intra`, and `intra intra intra intra intra` is the ablation without a cross layer |
+| `--score_train True` | this version's (below): fit and score the rotations on the training batches too (validation always does; off because it costs time) |
+| `--placement checked\|global` | this version's (below): with `--evaluate`, place the pieces from the verified pair fits (default) or by v6's single solve |
 | `--jitter`, `--drop` | this version's (below): with `--evaluate`, noise on every input vertex and a share of the break vertices left out of the matching, so no two sides of a break coincide (off by default) |
+| `--split all`, `--predictions DIR` | this version's (below): with `--evaluate`, every object of the subsets whatever its split; and every scene's prediction, zipped |
 
 Settings only this project has keep their own names in the same style
 (`--tokens_per_scene`, `--modes_per_scene`, `--max_objects`, `--schedule`, ...);
@@ -360,16 +366,34 @@ Settings only this project has keep their own names in the same style
 (`--amp False`). A Thesis 1 flag with no counterpart here (`--num_vn_slots`,
 `--num_layers`, `--max_scenes`, `--config`, ...) stops with what to use instead.
 
-It refuses to print a verdict a run did not earn: a result at chance, one
-parked at the ~90° axis-only landmark, and one still descending at its cutoff
-are each flagged for what they are.
+It refuses to print a verdict a run did not earn: a result at chance and one
+still descending at its cutoff are each flagged for what they are.
 
-### This version (Thesis v7): placing the pieces the matched rotations turned
+### This version (Thesis v7): every rotation from the matches, and placed from the fits
 
-Thesis v7 is Thesis v6 with one change, in stage two only: how the fragments
-are placed once `--rotations matched` has turned them. The network, the
-training and the data are untouched, so every v6 checkpoint is re-scored as it
-is. On W10's Spoon (50 pieces) and Ring (23) about three pieces in four came
+Thesis v7 is Thesis v6 with two changes, both in where a fragment's pose comes
+from.
+
+**No rotation head.** The network ends in its per-vertex embedding and is
+trained on the contrastive embedding term alone. Every rotation is fitted from
+the embedding matches and chained from each scene's largest fragment
+([below](#rotations-from-the-matches)). The four geometric terms — rotation,
+position, normal, face — are computed from those rotations under `no_grad`, as
+scores: every validation epoch, in `--evaluate` and in `probe_val.py` (on the
+training batches too with `--score_train True`). Nothing they say reaches a
+gradient. `best.pt` is the epoch with the highest validation acc@10 of the
+matched rotations — a mean over them mixes pieces placed to a degree or two
+with pieces left at chance. Why: on W10 the head's rotations stayed 102° off
+(anchor-aligned) on Everyday's validation scenes while the rotations fitted
+from its own embedding's matches were 15° off, and a run trained on the
+embedding term alone (nrhl) beat W10 on the same split — 10.2° against 15.2°,
+acc@5 0.905 against 0.847 — so training the head bought nothing.
+`--w_rot`, `--w_pos`, `--w_normal`, `--w_face` and `--rotation_target` are
+refused with that reason. A checkpoint with the head still evaluates and
+probes (its head's weights are left behind, said out loud) but does not
+resume.
+
+**Placement from the verified pair fits.** On W10's Spoon (50 pieces) and Ring (23) about three pieces in four came
 out turned within 5° of the truth, yet part accuracy was 0.04 and 0.00 —
 because the translation solver was one least-squares solve over *every*
 embedding match, and in a many-piece scene hundreds of those join pieces that
@@ -378,6 +402,11 @@ its centre (to 0.10 and 0.21 of its true spread). v7 places each piece from
 the matches its rotation was fitted on instead —
 [below](#placing-the-turned-pieces---placement) — and `--evaluate --jitter
 --drop` measures the result without the shared break vertices it leans on.
+
+Train it with the run's usual command, in a fresh `--checkpoint_dir` (and
+without `--w_face`): the default `--schedule` is `intra intra cross intra
+cross intra cross intra`, the schedule nrhl was trained with; `--schedule
+intra intra intra intra intra` is the ablation without a cross layer.
 
 ### Thesis v6: the largest fragment as the anchor
 
@@ -391,28 +420,13 @@ something else: GARF and PuzzleFusion++ fix each scene's largest fragment at
 its true pose and score the others relative to it. This version does the same
 (`reassembly/nn/anchor.py`):
 
-* **Metrics, always.** Each scene's prediction is rotated so its largest
-  fragment is exact; the other fragments are scored. The model's own absolute
-  error is printed beside it (`absolute geo`). Chance is 126.5° under both.
-  Stage two measures translations from the anchor's too.
-* **Loss, by default** (`--rotation_target anchor`). The four rotation-dependent
-  terms compare the anchor-aligned prediction, over every fragment but the
-  anchors. `--rotation_target absolute` is My Thesis Work's loss.
-* **Unchanged:** the network, its cross-fragment rule, the embedding term, the
-  data and every other flag.
-
-Re-score a checkpoint trained by My Thesis Work (no retraining; the loss line is
-reported on the absolute target it was trained on, so it matches that run's own
-log, and the two rotation errors follow in two rows):
-
-```bash
-python -m scripts.train --root_dir data --evaluate --checkpoint path/to/best.pt --split val
-```
-
-Train on the anchor target: the same command as before, in this folder, with a
-fresh `--checkpoint_dir`. It fits more slowly — measured on the six-scene
-memorisation test, 19–30° after 80 epochs against 23–36° after 45 for the
-absolute target — because its targets move with the anchor's own prediction.
+* **Metrics, always.** Each scene's rotations are turned so its largest
+  fragment is exact; the other fragments are scored. Chance is 126.5°. Stage
+  two measures translations from the anchor's too.
+* **Loss** (v6 only). v6 trained the rotation head on the anchor-aligned
+  rotations (`--rotation_target anchor`). v7 removed the head: the anchor
+  protocol now scores the rotations fitted from the matches, and
+  `--rotation_target` is refused.
 
 ### The benchmark's 2–20 pieces
 
@@ -623,10 +637,10 @@ python -m scripts.train ... --checkpoint_dir ./checkpoint \
 
 ### Stage two and the benchmark numbers
 
-`--evaluate` assembles as well as rotates: the translation solver
+`--evaluate` assembles as well as rotates: stage two
 (`reassembly.assembly`) matches fracture vertices across fragments in the
-network's invariant embedding, weights each match by how opposed its normals
-are, and solves the translations by weighted least squares with a Huber
+network's invariant embedding, fits each fragment's rotation from those
+matches, and places the turned fragments by least squares with a Huber
 reweighting. Scores are Breaking Bad's — RMSE(T), Chamfer distance, part
 accuracy (per-fragment Chamfer below 0.01) — in world units, per scene then
 over scenes, with a per-category table. `--no_assemble` reports rotation only,
@@ -644,21 +658,23 @@ python -m scripts.render_gif --dump pred.npz --out reassembly.gif
 A dump is a small `.npz` with plain arrays, so it can be copied off Kaggle and
 watched on any machine with a clone and trimesh (no torch).
 
-### Rotations from the matches (`--rotations matched`)
+### Rotations from the matches
 
-The same embedding matches also determine the rotations. `--rotations matched`
-fits, for every pair of fragments with enough matches, the rotation that lines
-up their matched points (Kabsch with RANSAC, on the network's *input*
-coordinates), chains those fits outward from the anchor along the pairs with
-the most agreeing matches, and scores and assembles with the result
-(`reassembly.assembly.rotation`). A fragment the chain cannot reach keeps the
-rotation head's rotation; the share reached is printed. The head's own numbers
-are printed beside the matched ones, over the same fragments, and the matched
-results go to `<split>_metrics_matched.json`.
+The embedding matches determine the rotations. For every pair of fragments
+with enough matches, stage two fits the rotation that lines up their matched
+points (Kabsch with RANSAC, on the network's *input* coordinates), chains
+those fits outward from the scene's largest fragment along the pairs with the
+most agreeing matches, and scores and assembles with the result
+(`reassembly.assembly.rotation`). It reads nothing the method would not have
+at inference: the largest fragment is held at the identity, and the anchor
+protocol sets it to its true pose only to score. A fragment the chain cannot
+reach keeps the identity too — a rotation unrelated to its true one, so it
+scores at chance; the share reached is printed. Since v7 these are the only
+rotations (`--rotations matched` is still accepted, so earlier commands run).
 
 ```bash
-python -m scripts.train --root_dir data --evaluate --checkpoint path/to/best.pt --split val --rotations matched
-python -m scripts.dump_prediction --root_dir data --checkpoint path/to/best.pt --scene <object>/<mode> --rotations matched --out pred.npz
+python -m scripts.train --root_dir data --evaluate --checkpoint path/to/best.pt --split val
+python -m scripts.dump_prediction --root_dir data --checkpoint path/to/best.pt --scene <object>/<mode> --out pred.npz
 ```
 
 Why it exists: on W10 (epoch 334, 1,023 validation scenes) the head's relative
@@ -676,8 +692,8 @@ mean, 68% of fragments reached) against the head's 105.4° -- report both.
 
 ### Placing the turned pieces (`--placement`)
 
-With matched rotations, v7 places the fragments from the pair fits the
-rotations came from (`reassembly.assembly.placement`), not from every match:
+v7 places the fragments from the pair fits the rotations came from
+(`reassembly.assembly.placement`), not from every match:
 
 1. **Verify.** A fitted pair counts when the chain reached both fragments, it
    has at least 6 RANSAC inliers, and its relative rotation is within 5° of the
@@ -686,19 +702,18 @@ rotations came from (`reassembly.assembly.placement`), not from every match:
    dropped with all its matches.
 2. **Place the reached fragments** by least squares over those pairs' inliers
    alone, the anchor held at its true position (Huber reweighting as before).
-3. **Place the rest** — the fragments the chain did not reach, which keep the
-   head's rotation — from every match that touches them, the reached ones held,
-   so a wrong rotation misplaces only its own fragment.
+3. **Place the rest** — the fragments the chain did not reach, whose rotation
+   is unrelated to their true one — from every match that touches them, the
+   reached ones held, so a wrong rotation misplaces only its own fragment.
 
 `--placement global` is v6's single solve over every match, kept for the
-before/after; it is the default (and the only choice) with the head's
-rotations, and gives v6's numbers to the bit. A non-default placement adds its
-name to the output files:
+before/after; on the same rotations it gives v6's numbers to the bit. A
+non-default placement adds its name to the output files:
 
 ```bash
-python -m scripts.train --root_dir data --evaluate --checkpoint path/to/best.pt --split val --rotations matched                      # checked
-python -m scripts.train --root_dir data --evaluate --checkpoint path/to/best.pt --split val --rotations matched --placement global   # v6's, to val_metrics_matched_global.json
-python -m scripts.dump_prediction --root_dir data --checkpoint path/to/best.pt --scene <object>/<mode> --rotations matched --out pred.npz
+python -m scripts.train --root_dir data --evaluate --checkpoint path/to/best.pt --split val                      # checked
+python -m scripts.train --root_dir data --evaluate --checkpoint path/to/best.pt --split val --placement global   # v6's, to val_metrics_global.json
+python -m scripts.dump_prediction --root_dir data --checkpoint path/to/best.pt --scene <object>/<mode> --out pred.npz
 ```
 
 The report names the placement and, with `checked`, how many matches the
@@ -749,20 +764,47 @@ scene and `--seed`, so two runs — of the two placements, say — see the same
 noise. Both are 0, off, by default, and then nothing changes:
 
 ```bash
-python -m scripts.train --root_dir data --evaluate --checkpoint path/to/last.pt --split val --rotations matched --jitter 0.01 --drop 0.5
-python -m scripts.train --root_dir data --evaluate --checkpoint path/to/last.pt --split val --rotations matched --jitter 0.01 --drop 0.5 --placement global
+python -m scripts.train --root_dir data --evaluate --checkpoint path/to/last.pt --split val --jitter 0.01 --drop 0.5
+python -m scripts.train --root_dir data --evaluate --checkpoint path/to/last.pt --split val --jitter 0.01 --drop 0.5 --placement global
 ```
 
 The report names the perturbation, and the files carry it:
-`val_metrics_matched_jitter0.01_drop0.5.json`. The loss line is the noisy
+`val_metrics_jitter0.01_drop0.5.json`. The loss line is the noisy
 inputs' too. This, not the clean run, is the number to put beside tables built
 on independently sampled points.
 
+### Other subsets, and every prediction (`--split all`, `--predictions`)
+
+`--evaluate --split all` scores every object of the `--data_subsets` given,
+whatever its split — for a checkpoint scored on subsets it was not trained on.
+An explicit `--data_subsets` (and `--max_fragments`) wins over the checkpoint's
+own; its labels, tokens and normalisation stay the checkpoint's.
+`--modes_per_scene 0` takes every break pattern:
+
+```bash
+python -m scripts.train --root_dir data --evaluate --checkpoint path/to/best.pt --data_subsets artifact_compressed --split all --modes_per_scene 0 --max_fragments 20 --checkpoint_dir eval/artifact
+```
+
+The report counts the objects that are shapes the checkpoint was trained on:
+a `volume_constrained-*` copy holds its base subset's shapes, broken
+differently, so those numbers are partly on seen shapes. It writes
+`all_metrics.json` and `all_report.txt`.
+
+`--predictions DIR` also writes every scored scene's prediction — the dump
+`dump_prediction` writes, the matched rotations and the placement — into one
+zip, `DIR/<subsets>-<split>.zip`, laid out as the data is:
+`<DIR name>/<subset>/<category>/<object>/fractured_<k>.npz`, with
+`<subsets>-<split>.csv` (one row per scene: its file, category, error, share
+reached, part accuracy, RMSE(T), Chamfer, matches). The zip is written as it
+goes (`.zip.part` until it is complete), and each scene's meshes are rebuilt
+to be written, which adds to the evaluation's time.
+
 ### Reports and figures from saved results
 
-`--evaluate` writes the report it prints as `<split>_report.txt` (matched:
-`<split>_report_matched.txt`; `--placement global` with matched rotations:
-`<split>_report_matched_global.txt`) beside its metrics, a few kilobytes to share. The
+`--evaluate` writes the report it prints as `<split>_report.txt`
+(`--placement global`: `<split>_report_global.txt`) beside its metrics, a few
+kilobytes to share: the scores, the error, accuracy and share reached overall
+and per category, and the assembly per category. The
 report is built from the metrics alone, so it can be printed again from any
 metrics file, including ones written before the report was saved:
 
@@ -774,20 +816,21 @@ python -m scripts.report_metrics eval/W10-artifact eval/W10-artifact-vc
 PDF), the CSV tables behind them, an index and a zip:
 
 ```bash
-python -m scripts.make_figures --out figures/W10 \
-    --history W10=checkpoint/history.json \
-    --eval "Everyday=eval/W10-full/val_metrics_matched.json" \
-    --eval "Artifact=eval/W10-artifact/val_metrics_matched.json"
+python -m scripts.make_figures --out figures/everyday-val \
+    --history full=checkpoint/history.json --history no-cross=checkpoint-intra/history.json \
+    --eval "Everyday val=eval/everyday-val/val_metrics.json"
 ```
 
-Per run: the total loss; the four geometric terms one panel each; the
-embedding term beside match@1; the head's error against chance; its error per
-category and epoch. With several runs, every run on one set of axes (the terms
-are logged unweighted, so ablations with different `--w_*` compare). Per
-evaluation: the per-fragment error by object type and dataset as box plots and
-violins, the share of fragments within each error threshold, part accuracy by
-object type, and the scores against pieces per scene. Only numpy and
-matplotlib are needed.
+Per run: the loss (the embedding term); the four geometric scores one panel
+each; the embedding term beside match@1; the matched rotations' error against
+chance; validation acc@5/10/30 and the share reached (best.pt marked); the
+error per category and epoch. With several runs, every run on one set of axes,
+for ablations. Per evaluation: the per-fragment error by object type and
+dataset as box plots and violins, the share of fragments within each error
+threshold, part accuracy by object type, the scores against pieces per scene,
+and `tables/by_type.csv`/`.md` — every number per object type and for the
+whole subset. One folder per call, zipped beside it: call it once per subset
+for one zip each. Only numpy and matplotlib are needed.
 
 ### Tools
 
@@ -824,8 +867,8 @@ Reference values used throughout, worth checking any number against:
 | chance Euler RMSE, **random** prediction | 83.25° |
 | chance Euler RMSE, **identity** prediction | 83.18° |
 | "axis correct, azimuth random" geodesic | 90.0° |
-| untrained `L_normal`, `L_face` | 1.0, 2.0 |
-| `L_position` on the unit sphere | 4/3 |
+| normal and face scores at chance | 1.0, 2.0 |
+| position score at chance, on the unit sphere | 4/3 |
 
 All measured by Monte Carlo in `tests/test_losses.py`.
 

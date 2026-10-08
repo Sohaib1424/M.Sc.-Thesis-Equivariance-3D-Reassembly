@@ -66,18 +66,35 @@ def _sample(seed: int, fragments: int):
 
 
 class _Oracle(torch.nn.Module):
-    """Answers every scene with one rotation `G[scene]` applied to the truth."""
+    """Answers with a fixed per-vertex embedding."""
 
-    def __init__(self, batch, global_rotation):
+    def __init__(self, embedding):
         super().__init__()
-        self.rotation = global_rotation[batch.fragment_scene] @ batch.target_rotation
-        self.embedding = torch.nn.Parameter(
-            torch.randn(batch.vertex_fragment.numel(), 4,
-                        dtype=batch.target_rotation.dtype))
+        self.embedding = torch.nn.Parameter(embedding)
 
     def forward(self, *args, **kwargs):
-        return Prediction(rotation=self.rotation, frame=self.rotation.transpose(-1, -2),
-                          vertex_embedding=self.embedding, vertex_features=None)
+        return Prediction(vertex_embedding=self.embedding, vertex_features=None)
+
+
+def _world(batch):
+    """Each vertex where it sits in the assembled object: as an embedding, the
+    truly coincident break vertices are each other's nearest neighbours, so
+    stage two's fits are exact."""
+    return (batch.target_vertices * batch.unit[batch.vertex_fragment, None]
+            + batch.centroid[batch.vertex_fragment])
+
+
+def _solid_batch(fractured_solid, seeds=(3, 4)):
+    """The fractured solid twice, each scene scattered by its own rotations."""
+    from reassembly.mesh.fracture import fracture_vertex_masks
+
+    meshes = list(fractured_solid)
+    vertices = [np.asarray(m.vertices, dtype=np.float64) for m in meshes]
+    faces = [np.asarray(m.faces) for m in meshes]
+    masks = fracture_vertex_masks(meshes)
+    return collate([build_scene(vertices, faces, masks, tokens_per_scene=64,
+                                rotations=random_rotations(2, np.random.default_rng(seed)))
+                    for seed in seeds], dtype=DTYPE)
 
 
 # --------------------------------------------------------------------------
@@ -157,79 +174,45 @@ def test_chance_is_unchanged_on_the_fragments_that_are_scored():
 
 
 # --------------------------------------------------------------------------
-# The loss under the anchor target
+# The scores of the matched rotations
 # --------------------------------------------------------------------------
 
-def _loss_terms(target: str, global_rotation):
-    batch = collate([_sample(0, 3), _sample(1, 4)], dtype=DTYPE)
-    config = Config(rotation_target=target)
-    model = _Oracle(batch, global_rotation)
-    _, report, _ = _forward(model, batch, build_criterion(config), config)
-    return report
-
-
-def test_the_anchor_loss_vanishes_under_any_rotation_of_each_scene():
+def test_the_scores_vanish_for_exact_matches_in_any_frame(fractured_solid):
     """
-    Right answer, wrong global frame: every rotation-dependent term is zero
-    under the anchor target and large under the absolute one. This is the
-    whole point of the target, and a correction applied on the wrong side of
-    the prediction fails it.
+    Right answer, wrong global frame: the matching holds each scene's root at
+    the identity, not at its true pose, and every score of the rotations it
+    fits from exact correspondences is zero once the anchor protocol has
+    aligned them -- and large before. An alignment applied on the wrong side
+    of the rotations fails it.
     """
-    shared = _rotations(2, 7)
-    anchored = _loss_terms("anchor", shared)
-    absolute = _loss_terms("absolute", shared)
+    batch = _solid_batch(fractured_solid)
+    config = Config()
+    criterion = build_criterion(config)
+    _, report, R = _forward(_Oracle(_world(batch)), batch, criterion, config, score=True)
     for term in ("rotation", "position", "normal", "face"):
-        assert anchored[term] < 1e-6, (term, anchored[term])
-        assert absolute[term] > 0.1, (term, absolute[term])
-    # And the truth itself scores zero under both.
-    identity = torch.eye(3, dtype=DTYPE).expand(2, 3, 3)
-    for target in ("anchor", "absolute"):
-        report = _loss_terms(target, identity)
-        assert report["rotation"] < 1e-6 and report["normal"] < 1e-6
+        assert report[term] < 1e-6, (term, report[term])
+    _, unaligned = criterion(R, batch.target_rotation)
+    assert unaligned["rotation"] > 0.1
 
 
-def test_the_anchor_is_trained_through_the_fragments_scored_against_it():
-    """
-    The anchor is left out of the average, but it is the reference its scene is
-    scored against, so its prediction must still receive gradient -- from every
-    other fragment. Without it the anchor would never be trained at all.
-    """
-    batch = collate([_sample(2, 3)], dtype=DTYPE)
-    rotation = _rotations(3, 8).requires_grad_(True)
-    anchor = anchor_fragments(batch.log_scale, batch.fragment_scene, 1)
-    aligned, scored = align_to_anchor(rotation, batch.target_rotation,
-                                      batch.fragment_scene, anchor)
-    loss = geodesic_angle(aligned, batch.target_rotation)[scored].mean()
-    loss.backward()
-    assert float(rotation.grad[int(anchor)].norm()) > 1e-3
-
-
-def test_the_step_is_weighted_by_the_fragments_the_loss_scores():
+def test_the_step_is_weighted_by_the_fragments_the_scores_count():
     batch = collate([_sample(0, 3), _sample(1, 4)], dtype=DTYPE)
-    assert _loss_fragments(batch, Config(rotation_target="anchor")) == 5
-    assert _loss_fragments(batch, Config(rotation_target="absolute")) == 7
-    with pytest.raises(ValueError, match="rotation_target"):
-        Config(rotation_target="relative")
+    assert _loss_fragments(batch, Config()) == 5
 
 
-def test_validation_scores_both_protocols_from_the_same_predictions():
-    """The metrics are the anchor protocol's whatever the target, with the
-    absolute error beside them; and the loss agrees with the metric it is
-    meant to be -- same predictions, same fragments, same number."""
+def test_validation_metrics_and_the_rotation_score_are_one_number():
+    """The metrics are the anchor protocol's, and so is the rotation score:
+    same matched rotations, same fragments, same number. Random embeddings,
+    so that number is not zero."""
     from reassembly.training import run_epoch
 
-    samples = [_sample(3, 3), _sample(4, 4)]
-    batch = collate(samples, dtype=torch.float32)
-    shared = _rotations(2, 9).float()
-    for target in ("anchor", "absolute"):
-        config = Config(rotation_target=target, workers=0)
-        model = _Oracle(batch, shared)
-        loader = [(batch, [])]
-        summary, _, _ = run_epoch(model, loader, build_criterion(config), config,
-                                  label="val", show_progress=False)
-        assert summary["geodesic_deg"] < 1e-3              # anchor protocol
-        assert summary["absolute_geodesic_deg"] > 10.0
-        assert summary["geodesic_fragments"] == 7 - 2
-        assert summary["fragments"] == 7
-        loss_frame = "geodesic_deg" if target == "anchor" else "absolute_geodesic_deg"
-        assert summary["rotation_degrees"] == pytest.approx(summary[loss_frame], abs=1e-3)
+    batch = collate([_sample(3, 3), _sample(4, 4)], dtype=torch.float32)
+    embedding = torch.randn(batch.vertex_fragment.numel(), 4,
+                            generator=torch.Generator().manual_seed(9))
+    config = Config(workers=0)
+    summary, _, _ = run_epoch(_Oracle(embedding), [(batch, [])], build_criterion(config),
+                              config, label="val", show_progress=False)
+    assert summary["geodesic_deg"] > 10.0
+    assert summary["geodesic_fragments"] == 7 - 2
+    assert summary["fragments"] == 7
+    assert summary["rotation_degrees"] == pytest.approx(summary["geodesic_deg"], abs=1e-3)

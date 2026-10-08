@@ -1,59 +1,47 @@
 """
-The backbone: intra-fragment attention, cross-fragment attention, rotation head.
+The backbone: intra-fragment attention, cross-fragment attention, and the
+per-vertex embedding the fragments are matched by.
 
 Shape of the network
 --------------------
 Layers alternate. Intra-fragment attention moves information along real mesh
 edges; cross-fragment attention lets a fragment's interface tokens hear what
 the other fragments in its scene look like; then more intra-fragment layers
-carry that back through the mesh. The last part is easy to leave out and
-important: a cross layer only updates the *token* vertices, so without intra
-layers after it, the rest of the fragment never learns anything about its
-neighbours, and the pooled rotation prediction is dominated by vertices that
-never heard from anyone.
+carry that back through the mesh. A cross layer only updates the *token*
+vertices, so an intra layer after it is what spreads what they heard to their
+neighbours.
 
-The default schedule is ``intra x5, cross x3`` -- an encoder-then-fusion shape:
-build the per-vertex description of each fragment first, then let the fragments
-talk. It is the arrangement the thesis is testing.
+The default schedule is ``intra, intra, cross, intra, cross, intra, cross,
+intra`` -- three rounds of "describe the fragment, then let the fragments
+talk", each followed by one hop along the mesh. ``intra`` alone, five times, is
+the ablation without any cross-fragment layer.
 
-**It accepts the cost named above, and the cost is measurable.** With no intra
-layer after the last cross layer, only *token* vertices carry any cross-fragment
-information into the pool, and the pool is a mean over every vertex. At the
-defaults that is 2,048 tokens against a median 9,149 vertices per scene, so
-roughly **78% of the pooled rotation signal comes from vertices that never heard
-from another fragment**.
+What comes out
+--------------
+An invariant embedding per vertex (``readout`` + ``embedding``), trained by the
+contrastive term in ``nn/losses.py`` to make the two sides of a break look the
+same, and the equivariant features it is read from. Nothing else: the rotation
+head this network used to end in -- a pooled frame per fragment, made
+orthonormal by Gram-Schmidt -- was removed in v7. Trained, its rotations stayed
+far from usable on shapes it had not seen: 102 deg anchor-aligned on Everyday's
+validation scenes (W10, epoch 334), where the rotations fitted from these
+embeddings' matches were 15 deg off. A run trained on the embedding term alone
+(nrhl) did better than W10 on Everyday's validation split -- 10.2 deg against
+15.2, acc@5 0.905 against 0.847 -- so training the head bought nothing.
+Each fragment's rotation now comes from stage two (``assembly/rotation.py``);
+``docs/PROJECT-STATE.md`` has the measurements.
 
-That is a dilution, not a wall: the network can learn to give token vertices a
-larger magnitude and dominate the mean, since VN layers scale features freely.
-But it starts at a disadvantage the interleaved form does not have, and the
-cross layers are the whole mechanism for beating the ~90 deg axis-only
-landmark (a landmark, not a floor -- see `evaluation/metrics.swing_twist_error`).
-If the floor turns out to be where this parks, ``intra x5, cross x3, intra`` --
-one extra layer -- is the first thing to try, and
-``("intra",) * 2 + ("cross", "intra") * 3`` the second.
-
-The rotation convention, derived rather than guessed
-----------------------------------------------------
-Centred, the perturbation is ``v_pert = v_gt Q^T``. Vector features inherit
-that rotation, so the head's frame satisfies ``M_pert = Q M_gt``. The label is
-the rotation that undoes the perturbation, ``R_gt = Q^T``, so the head returns
-
-    R_pred = M^T                    (M's rows, not its columns)
-
-which makes ``R_pred = M_gt^T Q^T`` -- correct exactly when the network learns
-to map an already-assembled fragment to the identity frame, ``M_gt = I``. That
-is a fixed, learnable target, because Breaking Bad's assembled pose is a
-convention shared by every scene in the dataset.
-
-Applying it: ``v_pert @ R_pred.T`` returns the fragment to its assembled pose.
-The transpose here is the single easiest thing to get backwards, and getting it
-backwards is invisible at initialisation -- chance is chance either way -- so
-``tests/test_model.py`` asserts the round trip on a fragment whose perturbation
-is known.
+The rotation convention
+-----------------------
+A rotation here maps the perturbed fragment back to its assembled pose,
+applied to row vectors: ``v_pert @ R.T == v_assembled`` (``nn/losses.py`` and
+:func:`apply_rotation`). Centred, the perturbation is ``v_pert = v_gt Q^T``, so
+the label is ``R_gt = Q^T``. The fitted rotations of stage two use the same
+convention.
 """
 from __future__ import annotations
 
-from typing import List, NamedTuple, Optional, Sequence
+from typing import NamedTuple, Optional, Sequence
 
 import torch
 import torch.utils.checkpoint
@@ -61,39 +49,22 @@ from torch import Tensor, nn
 
 from .cross import VNCrossFragmentAttention
 from .gat import VNGraphAttentionBlock
-from .segment import segment_mean
-from .vn import VNInvariant, VNLinear, VNScaleGate, gram_schmidt
+from .vn import VNInvariant, VNLinear, VNScaleGate
 
-DEFAULT_SCHEDULE = ("intra",) * 5 + ("cross",) * 3 + ("intra",)
+DEFAULT_SCHEDULE = ("intra", "intra", "cross", "intra", "cross", "intra", "cross", "intra")
 
 
 class Prediction(NamedTuple):
     """What one forward pass produces."""
-    rotation: Tensor            # (F, 3, 3) maps perturbed -> assembled
-    frame: Tensor               # (F, 3, 3) the equivariant frame, rotation's transpose
-    vertex_embedding: Tensor    # (N, D) invariant, for correspondence and the
-    #                             embedding-consistency loss
+    vertex_embedding: Tensor    # (N, D) invariant: what stage two matches, and
+    #                             what the contrastive loss trains
     vertex_features: Tensor     # (N, C, 3) equivariant, the backbone's output
-    head_axes: Optional[Tensor] = None
-    """
-    ``(F, 2, 3)`` -- the two vectors the head produces *before* Gram-Schmidt.
-
-    Exposed for one diagnostic. When the two become collinear the frame's
-    second column is decided by whatever is left of the second vector after
-    projecting out the first, which near-parallel means numerical noise: the
-    prediction degenerates to one direction plus a random roll. That state is
-    invisible in the rotation loss -- the output is still a proper rotation --
-    and it is the cheapest thing to measure that separates a bad basin from
-    slow progress. See :func:`reassembly.evaluation.metrics.head_collinearity`.
-
-    Last field and optional so that constructing a ``Prediction`` positionally,
-    as the tests do, keeps working.
-    """
 
 
 class ReassemblyNet(nn.Module):
     """
-    SO(3)-equivariant rotation prediction for fractured fragments.
+    SO(3)-equivariant per-vertex features for fractured fragments, read out as
+    an invariant embedding for matching the fragments' break surfaces.
 
     Every fragment is already a graph -- its mesh -- so nothing is constructed
     inside one. The only built connections are between fragments, among the
@@ -147,9 +118,6 @@ class ReassemblyNet(nn.Module):
         the out-of-memory retry can switch it on for one batch.
         """
 
-        # Pool to a fragment, then two equivariant 3-vectors -> a rotation.
-        self.pool_proj = VNLinear(channels, channels)
-        self.head = VNLinear(channels, 2)
         # Invariant per-vertex embedding for matching interface points across
         # fragments. Invariant, not equivariant: the vertices being matched sit
         # in differently-perturbed fragments, so equivariant features would be
@@ -161,7 +129,7 @@ class ReassemblyNet(nn.Module):
             nn.GELU(),
             # No bias on the last layer, and this is provable rather than
             # stylistic. The embedding is supervised only by the
-            # centroid-variance loss, and a constant added to every embedding
+            # contrastive loss, and a constant added to every embedding
             # shifts them all equally -- the scatter about each cluster centroid
             # does not move. It is unidentifiable for stage two as well, since a
             # global shift leaves every pairwise distance untouched. Keeping it
@@ -190,7 +158,9 @@ class ReassemblyNet(nn.Module):
         source vertex. ``token_index`` selects which vertices
         take part in cross-fragment attention; ``token_query`` and ``token_key``
         are the pair lists from :func:`~reassembly.nn.cross.cross_fragment_index`,
-        built once per batch.
+        built once per batch. ``num_fragments`` is no longer used -- it sized
+        the removed rotation head's pooling -- and is kept so every caller's
+        signature stays the same.
         """
         x = self.embed(node_features)
         if log_scale is not None:
@@ -221,22 +191,16 @@ class ReassemblyNet(nn.Module):
                 # their features and token vertices keep theirs too.
                 x = x.index_add(0, token_index, tokens - x[token_index])
 
-        pooled = segment_mean(self.pool_proj(x), vertex_fragment, num_fragments)
-        axes = self.head(pooled)                           # (F, 2, 3)
-        frame = gram_schmidt(axes)                         # (F, 3, 3), columns
         return Prediction(
-            rotation=frame.transpose(-1, -2),
-            frame=frame,
             vertex_embedding=self.embedding(self.readout(x)),
             vertex_features=x,
-            head_axes=axes,
         )
 
 
 def apply_rotation(vertices: Tensor, rotation: Tensor,
                    vertex_fragment: Tensor) -> Tensor:
     """
-    ``v @ R.T`` per fragment -- the operation the position and normal losses
-    compare against the ground truth.
+    ``v @ R.T`` per fragment -- the operation the position and normal scores
+    compare against the ground truth, and stage two places fragments with.
     """
     return torch.einsum("nij,nj->ni", rotation[vertex_fragment], vertices)

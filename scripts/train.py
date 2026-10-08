@@ -4,9 +4,10 @@ Train, resume, or evaluate the V-GAT reassembly model.
     python -m scripts.train --root_dir D:\\path\\to\\breaking_bad --preflight
     python -m scripts.train --root_dir D:\\path\\to\\breaking_bad --epochs 40
     python -m scripts.train --root_dir ... --evaluate          # score best.pt, assembled
-    python -m scripts.train --root_dir ... --evaluate --rotations matched   # rotations from the matches
-    python -m scripts.train --root_dir ... --evaluate --rotations matched --placement global  # v6's placement
-    python -m scripts.train --root_dir ... --evaluate --rotations matched --jitter 0.01 --drop 0.5  # no shared break vertices
+    python -m scripts.train --root_dir ... --evaluate --placement global   # v6's placement
+    python -m scripts.train --root_dir ... --evaluate --jitter 0.01 --drop 0.5   # no shared break vertices
+    python -m scripts.train --root_dir ... --evaluate --data_subsets artifact_compressed --split all \\
+        --modes_per_scene 0 --predictions predictions   # a whole unseen subset, every prediction zipped
     python -m scripts.train --root_dir ... --num_gpus 2        # both GPUs (the default: all)
     python -m scripts.train --root_dir ... --num_gpus 1        # one GPU
     python -m scripts.train --root_dir ... --max_fragments 20  # the benchmark's 2-20 pieces
@@ -43,7 +44,7 @@ Run both from the same checkpoint budget and read the pair, not either alone:
   per-shape canonical orientations and no transferable rule. More data or more
   epochs will not fix that; the input representation or the loss has to change.
 * **both at chance** -- generalisation is not the problem yet. Look upstream:
-  labels, conventions, the head (watch ``head|cos|``).
+  labels, conventions, the embedding (watch ``match@1``).
 * **both improving together** -- it is learning the intended thing.
 
 ``--split_by fracture`` draws only from the official *training* shapes, so the
@@ -131,21 +132,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="with --evaluate: use the flags' data settings "
                              "instead of the checkpoint's (split, labels, "
                              "tokens, normalisation)")
-    parser.add_argument("--rotations", default="network", choices=["network", "matched"],
-                        help="with --evaluate: score and assemble with the rotation "
-                             "head's rotations (network), or with rotations fitted "
-                             "from the embedding matches and chained from the anchor "
-                             "(matched, reassembly/assembly/rotation.py). Matched "
-                             "results go to <split>_metrics_matched.json")
+    parser.add_argument("--rotations", default="matched", choices=["matched"],
+                        help="kept so earlier commands still run: since v7 every rotation "
+                             "is fitted from the embedding matches and chained from the "
+                             "anchor (reassembly/assembly/rotation.py) -- there is no "
+                             "rotation head to take it from")
     parser.add_argument("--placement", default=None, choices=["checked", "global"],
                         help="with --evaluate: how the turned fragments are placed. "
-                             "checked (the default with --rotations matched, and only "
-                             "with it): from the pair fits the chain agrees with, the "
-                             "anchor held (reassembly/assembly/placement.py). global "
-                             "(the default with --rotations network; v6's only "
-                             "placement): one least-squares solve over every embedding "
-                             "match. A non-default choice adds its name to the output "
-                             "files: <split>_metrics_matched_global.json")
+                             "checked (the default): from the pair fits the chain agrees "
+                             "with, the anchor held (reassembly/assembly/placement.py). "
+                             "global (v6's only placement): one least-squares solve over "
+                             "every embedding match; adds _global to the output files")
     parser.add_argument("--jitter", type=float, default=0.0,
                         help="with --evaluate: Gaussian noise on every input vertex before "
                              "the network sees it, in units of the scene's largest "
@@ -158,12 +155,23 @@ def build_parser() -> argparse.ArgumentParser:
                              "of the matching, at random (0, the default: off; below 1). "
                              "As probe_val.py --drop; adds _drop<P> to the output files")
     parser.add_argument(
-        "--split", default="val", choices=["train", "val", "test"],
+        "--split", default="val", choices=["train", "val", "test", "all"],
         help="which split to score. Defaults to val, NOT test: Breaking Bad "
              "ships train and val lists only, so under --split_by object there "
              "is no official test partition and asking for one falls back to a "
              "hashed split that is comparable with nothing. --split_by fracture "
-             "does define a test partition, of held-out break patterns.")
+             "does define a test partition, of held-out break patterns. all: "
+             "every object of --data_subsets whatever its split, for a subset "
+             "the checkpoint was not trained on; the report counts the objects "
+             "that are shapes it was trained on. With --evaluate an explicit "
+             "--data_subsets (and --max_fragments) wins over the checkpoint's; "
+             "--modes_per_scene 0 scores every break pattern.")
+    parser.add_argument("--predictions", default="", metavar="FOLDER",
+                        help="with --evaluate: also write every scored scene's prediction "
+                             "(the dump_prediction format) into one zip in FOLDER: "
+                             "<FOLDER>/<subsets>-<split>.zip, holding "
+                             "<FOLDER name>/<subset>/<category>/<object>/<mode>.npz -- the "
+                             "data directory's layout -- and a CSV of every scene")
     hub = parser.add_argument_group(
         "Hugging Face Hub mirror", "optional; on only when all three are given")
     hub.add_argument("--hf_repo_id", default="",
@@ -180,28 +188,35 @@ def main() -> None:
     args = parser.parse_args()
     if (args.jitter or args.drop) and not args.evaluate:
         parser.error("--jitter and --drop apply to --evaluate only")
+    if args.predictions and not args.evaluate:
+        parser.error("--predictions applies to --evaluate only")
+    if args.split == "all" and not args.evaluate:
+        parser.error("--split all applies to --evaluate only")
     config = config_from_args(args)
     if args.preflight:
         raise SystemExit(0 if preflight(config) else 1)
     if args.evaluate:
-        from reassembly.assembly import check_placement
         from reassembly.evaluation.noise import check_noise
 
+        if args.predictions and not args.assemble:
+            parser.error("--predictions writes placed scenes: not with --no_assemble")
         try:
-            check_placement(args.rotations, args.placement)
             check_noise(args.jitter, args.drop)
         except ValueError as error:
             parser.error(str(error))
         # The rest of the data definition stays the checkpoint's unless
-        # --data_from_flags, but an explicit --max_fragments wins: how a model
+        # --data_from_flags, but an explicit --max_fragments wins -- how a model
         # does on the benchmark's 2-20 pieces is a fair question whatever range
-        # it was trained on.
-        override = ("max_fragments",) if args.max_fragments is not None else ()
+        # it was trained on -- and so does an explicit --data_subsets: scoring
+        # on another subset keeps the labels, tokens and normalisation the
+        # model was trained with.
+        override = tuple(name for name in ("max_fragments", "subsets")
+                         if getattr(args, name) is not None)
         evaluate(config, checkpoint=args.checkpoint, split=args.split,
                  assemble=args.assemble, collision=args.collision,
                  data_from_checkpoint=not args.data_from_flags, override=override,
-                 rotations=args.rotations, placement=args.placement,
-                 jitter=args.jitter, drop=args.drop)
+                 placement=args.placement, jitter=args.jitter, drop=args.drop,
+                 predictions=args.predictions or None)
     else:
         # Not Config fields: the token must not reach a checkpoint, and the
         # checkpoints are what gets uploaded.

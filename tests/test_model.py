@@ -1,15 +1,14 @@
 """
-The whole pipeline, from meshes to a loss with gradients.
+The whole pipeline, from meshes to an embedding with gradients.
 
 The unit tests prove each layer is equivariant. These prove the *assembly* is:
-that the rotation label matches the perturbation, that the head's transpose
-points the right way, that every parameter receives gradient, and that a batch
-of two scenes gives each scene exactly what it would have got alone.
+that the rotation label matches the perturbation, that each fragment's features
+turn with it and its embedding -- what stage two matches by -- does not move at
+all, that every parameter receives gradient, and that a batch of two scenes
+gives each scene exactly what it would have got alone.
 
-The transpose test is the one worth reading. `R_pred = frame.T` is the single
-easiest thing in this codebase to get backwards, and getting it backwards is
-invisible at initialisation -- chance is chance in either direction -- so it
-would surface only as a model that never converges, weeks later.
+(Until v7 the network also ended in a rotation head; it was removed, and each
+fragment's rotation now comes from stage two, ``assembly/rotation.py``.)
 """
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ torch = pytest.importorskip("torch")
 from reassembly.data.features import build_scene, clustered_vertices, collate
 from reassembly.data.transforms import random_rotations
 from reassembly.nn.losses import ReassemblyLoss, geodesic_angle
-from reassembly.nn.model import ReassemblyNet, apply_rotation
+from reassembly.nn.model import Prediction, ReassemblyNet, apply_rotation
 
 DTYPE = torch.float64
 
@@ -88,13 +87,13 @@ def test_the_label_is_the_transpose_of_the_applied_rotation():
     assert torch.allclose(batch.target_rotation, expected, atol=1e-12)
 
 
-def test_the_head_returns_a_rotation_that_points_the_right_way():
+def test_the_features_turn_with_the_fragment_and_the_embedding_does_not():
     """
-    The frame is equivariant, `M(x Q^T) = Q M(x)`, so the rotation that undoes
-    the perturbation is `M^T` -- and the network's job reduces to mapping an
-    already-assembled fragment to the identity frame. Applying the head's
-    output to a perturbed fragment must therefore land it at `v M_assembled`,
-    which is the assembled pose exactly when the network has learned that.
+    Tumbling every fragment by its own `Q` turns its features by the same `Q`
+    -- `x Q^T`, rows as everywhere here -- and leaves the embedding exactly
+    where it was. The second half is what lets stage two match a vertex on one
+    fragment to its partner on another, tumbled independently; the first is
+    what the rotations are fitted in.
     """
     net = _net()
     rotations = random_rotations(3, np.random.default_rng(9))
@@ -104,27 +103,19 @@ def test_the_head_returns_a_rotation_that_points_the_right_way():
     perturbed = collate([_sample(3, rotations=rotations)], dtype=DTYPE)
 
     Q = torch.as_tensor(rotations, dtype=DTYPE)
-    frame_assembled = _forward(net, assembled).frame
-    prediction = _forward(net, perturbed)
-
-    # The frame co-rotates with the input.
-    assert torch.allclose(prediction.frame, Q @ frame_assembled, atol=1e-9)
-
-    # And the predicted rotation carries the perturbed coordinates onto the
-    # assembled ones, up to the learned frame.
-    landed = apply_rotation(perturbed.node_features[:, 0, :],
-                            prediction.rotation, perturbed.vertex_fragment)
-    target = apply_rotation(assembled.node_features[:, 0, :],
-                            frame_assembled.transpose(-1, -2), assembled.vertex_fragment)
-    assert torch.allclose(landed, target, atol=1e-9)
+    still = _forward(net, assembled)
+    turned = _forward(net, perturbed)
+    expected = torch.einsum("nij,nkj->nki", Q[assembled.vertex_fragment],
+                            still.vertex_features)
+    assert torch.allclose(turned.vertex_features, expected, atol=1e-9)
+    assert torch.allclose(turned.vertex_embedding, still.vertex_embedding, atol=1e-9)
 
 
-def test_a_perfect_frame_gives_zero_rotation_loss():
-    """Closing the loop: if the network output the identity frame on assembled
-    fragments, the geodesic loss on perturbed ones would be exactly zero."""
+def test_a_perfect_rotation_scores_zero():
+    """Closing the loop: a stage two that recovered each fragment's rotation
+    exactly -- `Q^T` -- would score a geodesic error of exactly zero."""
     rotations = random_rotations(4, np.random.default_rng(11))
     batch = collate([_sample(4, count=4, rotations=rotations)], dtype=DTYPE)
-    # A hypothetical perfect model: frame = Q, so rotation = Q^T.
     perfect = torch.as_tensor(rotations.transpose(0, 2, 1), dtype=DTYPE)
     assert geodesic_angle(perfect, batch.target_rotation).max().item() < 1e-12
 
@@ -133,25 +124,25 @@ def test_a_perfect_frame_gives_zero_rotation_loss():
 # Forward pass
 # --------------------------------------------------------------------------
 
-def test_forward_produces_proper_rotations():
+def test_forward_produces_an_embedding_and_features_per_vertex():
+    """And nothing else: no rotation comes out of the network any more."""
     batch = collate([_sample(1), _sample(2)], dtype=DTYPE)
     prediction = _forward(_net(), batch)
 
-    assert prediction.rotation.shape == (batch.num_fragments, 3, 3)
-    identity = torch.eye(3, dtype=DTYPE).expand_as(prediction.rotation)
-    R = prediction.rotation
-    assert torch.allclose(R.transpose(-1, -2) @ R, identity, atol=1e-10)
-    assert torch.allclose(torch.det(R), torch.ones(batch.num_fragments, dtype=DTYPE),
-                          atol=1e-10)
+    vertices = batch.vertex_fragment.numel()
+    assert Prediction._fields == ("vertex_embedding", "vertex_features")
+    assert prediction.vertex_embedding.shape == (vertices, 32)
+    assert prediction.vertex_features.shape == (vertices, 16, 3)
     assert torch.isfinite(prediction.vertex_embedding).all()
+    assert torch.isfinite(prediction.vertex_features).all()
 
 
 def test_the_whole_model_is_equivariant_per_fragment():
     """
-    The end-to-end claim. Re-posing one fragment rotates its own prediction and
-    leaves the others alone -- which is what makes the per-fragment label
-    learnable at all. Anything that sends a *vector* between fragments breaks
-    the second half while still training.
+    The end-to-end claim. Re-posing one fragment rotates its own features and
+    leaves the others' alone, and no embedding moves -- which is what makes the
+    fragments matchable at all. Anything that sends a *vector* between
+    fragments breaks the second half while still training.
     """
     net = _net()
     base_rotations = random_rotations(3, np.random.default_rng(21))
@@ -164,8 +155,11 @@ def test_the_whole_model_is_equivariant_per_fragment():
     b = _forward(net, collate([_sample(6, rotations=changed)], dtype=DTYPE))
 
     E = torch.as_tensor(extra, dtype=DTYPE)
-    assert torch.allclose(b.frame[0], E @ a.frame[0], atol=1e-9)
-    assert torch.allclose(b.frame[1:], a.frame[1:], atol=1e-9)
+    first = collate([_sample(6, rotations=base_rotations)]).vertex_fragment == 0
+    assert torch.allclose(b.vertex_features[first], a.vertex_features[first] @ E.T,
+                          atol=1e-9)
+    assert torch.allclose(b.vertex_features[~first], a.vertex_features[~first], atol=1e-9)
+    assert torch.allclose(b.vertex_embedding, a.vertex_embedding, atol=1e-9)
 
 
 def test_batching_does_not_change_a_scene():
@@ -177,7 +171,9 @@ def test_batching_does_not_change_a_scene():
     net = _net()
     alone = _forward(net, collate([_sample(7)], dtype=DTYPE))
     together = _forward(net, collate([_sample(7), _sample(8)], dtype=DTYPE))
-    assert torch.allclose(together.frame[:3], alone.frame, atol=1e-9)
+    n = alone.vertex_embedding.shape[0]
+    assert torch.allclose(together.vertex_features[:n], alone.vertex_features, atol=1e-9)
+    assert torch.allclose(together.vertex_embedding[:n], alone.vertex_embedding, atol=1e-9)
 
 
 def test_a_scene_with_no_tokens_still_predicts():
@@ -193,7 +189,8 @@ def test_a_scene_with_no_tokens_still_predicts():
                                  rng=np.random.default_rng(0))], dtype=DTYPE)
     assert batch.token_index.numel() == 0
     prediction = _forward(_net(), batch)
-    assert torch.isfinite(prediction.rotation).all()
+    assert torch.isfinite(prediction.vertex_features).all()
+    assert torch.isfinite(prediction.vertex_embedding).all()
 
 
 # --------------------------------------------------------------------------
@@ -206,24 +203,16 @@ def test_every_parameter_receives_gradient():
     no gradient into anything upstream of it. That silently disabled the entire
     cross-fragment pathway -- the architecture's whole contribution -- for the
     first optimiser steps, and nothing about the loss curve would have shown it.
+    The embedding term is the only one trained, so it alone must reach every
+    weight.
     """
     net = _net()
     batch = collate([_sample(1), _sample(2)], dtype=DTYPE)
     prediction = _forward(net, batch)
 
     keep, cluster, count = clustered_vertices(batch.vertex_fragment)  # stand-in clusters
-    total, _ = ReassemblyLoss()(
-        prediction.rotation, batch.target_rotation,
-        vertices=apply_rotation(batch.node_features[:, 0, :], prediction.rotation,
-                                batch.vertex_fragment),
-        target_vertices=batch.target_vertices,
-        normals=apply_rotation(batch.node_features[:, 1, :], prediction.rotation,
-                               batch.vertex_fragment),
-        target_normals=batch.target_normals,
-        vertex_batch=batch.vertex_fragment,
-        embeddings=prediction.vertex_embedding[keep], cluster=cluster,
-        num_clusters=count,
-    )
+    total, _ = ReassemblyLoss()(embeddings=prediction.vertex_embedding[keep],
+                                cluster=cluster, num_clusters=count)
     total.backward()
 
     dead = [name for name, p in net.named_parameters()
@@ -232,22 +221,28 @@ def test_every_parameter_receives_gradient():
     assert all(torch.isfinite(p.grad).all() for p in net.parameters())
 
 
-def test_loss_at_initialisation_is_near_chance():
+def test_the_scores_at_initialisation_are_near_chance():
     """
-    An untrained model should read chance, and a term that does not is
-    measuring something other than what its name says. The tolerance is wide
-    because a handful of fragments is a small sample -- this catches a term
-    that is wrong by a factor, not one that is off by noise.
+    An untrained embedding matches next to nothing, so stage two leaves almost
+    every fragment at a rotation unrelated to its true one, and the scores
+    should read chance; a term that does not is measuring something other than
+    what its name says. The tolerance is wide because a handful of fragments
+    is a small sample -- this catches a term that is wrong by a factor, not
+    one that is off by noise.
     """
+    from reassembly.assembly import match_batch
+    from reassembly.nn.anchor import anchor_alignment
+
     net = _net()
     batch = collate([_sample(s, count=4) for s in range(12)], dtype=DTYPE)
-    prediction = _forward(net, batch)
+    with torch.no_grad():
+        matched = match_batch(batch, _forward(net, batch).vertex_embedding)
+    aligned, scored = anchor_alignment(batch, matched.rotation)
     _, report = ReassemblyLoss()(
-        prediction.rotation, batch.target_rotation,
-        normals=apply_rotation(batch.node_features[:, 1, :], prediction.rotation,
-                               batch.vertex_fragment),
+        aligned, batch.target_rotation,
+        normals=apply_rotation(batch.node_features[:, 1, :], aligned, batch.vertex_fragment),
         target_normals=batch.target_normals,
-        vertex_batch=batch.vertex_fragment,
+        vertex_batch=batch.vertex_fragment, keep=scored,
     )
     assert 90.0 < report["rotation_degrees"] < 160.0     # chance 126.5
     assert 0.6 < report["normal"] < 1.4                  # chance 1.0
@@ -466,7 +461,7 @@ def test_a_cross_fragment_mesh_edge_would_break_equivariance():
     """
     Why the guard above is not paranoia -- the failure demonstrated rather than
     asserted. One edge joining two fragments is enough to make fragment 1's
-    prediction depend on fragment 0's pose.
+    features depend on fragment 0's pose.
     """
     net = _net(schedule=("intra",))
     n, fragment = 24, torch.tensor([0] * 8 + [1] * 8 + [2] * 8)
@@ -485,7 +480,7 @@ def test_a_cross_fragment_mesh_edge_would_break_equivariance():
         turned = torch.einsum("nij,nkj->nki", spin[fragment], x)
         rotated = net(turned, edge_index, attr, fragment, 3, token_index=empty,
                       token_query=empty, token_key=empty)
-        return (rotated.frame[1:] - plain.frame[1:]).abs().max().item()
+        return (rotated.vertex_features[8:] - plain.vertex_features[8:]).abs().max().item()
 
     assert frames(within) < 1e-9, "fragment-local edges keep the others fixed"
     assert frames(within + [[0, 8]]) > 1e-3, (
@@ -569,9 +564,9 @@ def test_checkpointing_does_not_change_the_model():
             calls.append(0)
             with mock.patch.object(checkpoint, "checkpoint", counted):
                 prediction = _forward(net, batch)
-            (prediction.frame.square().sum()
+            (prediction.vertex_features.square().sum()
              + prediction.vertex_embedding.square().sum()).backward()
-            outputs.append((prediction.rotation.detach(), prediction.frame.detach(),
+            outputs.append((prediction.vertex_features.detach(),
                             prediction.vertex_embedding.detach()))
             grads.append({n: None if p.grad is None else p.grad.clone()
                           for n, p in net.named_parameters()})
@@ -589,54 +584,34 @@ def test_checkpointing_does_not_change_the_model():
             f"gradient differs: {name}"
 
 
-def test_the_error_at_initialisation_does_not_depend_on_the_perturbation():
+def test_the_embedding_does_not_depend_on_the_perturbation():
     """
-    A consequence of equivariance that changes how preflight's number is read.
+    A sharp end-to-end check, and it covers the data pipeline as well as the
+    network: tumble the fragments three different ways and the embedding stage
+    two matches by must not move -- if standardisation, token sampling or edge
+    construction leaked any dependence on the pose, it would show up here and
+    nowhere else. (Until v7 this was read off the rotation head's error, which
+    the perturbation cancelled out of exactly.)
 
-    The head returns `R_pred = frame^T`, and the frame co-rotates with the
-    input, so on a fragment perturbed by `Q` the prediction is
-    `frame(assembled)^T Q^T` while the label is `Q^T`. The error rotation is
-    therefore
-
-        R_pred · R_label^T = frame(assembled)^T Q^T Q = frame(assembled)^T
-
-    -- the perturbation cancels exactly. An untrained model's rotation error is
-    the geodesic angle of its own frame on the *assembled* fragment, and nothing
-    to do with how the fragment was tumbled.
-
-    Two things follow. First, "chance = 126.5 deg" is not what an untrained
-    equivariant model must score: it scores the mean angle of its own frames,
-    which equals chance only if those frames are Haar-diffuse. A preflight
-    reading a few degrees off chance is measuring the initialisation, not a bug.
-
-    Second, it is a sharp end-to-end check, and it covers the data pipeline as
-    well as the network: if standardisation, token sampling or edge construction
-    leaked any dependence on the pose, it would show up here and nowhere else.
-
-    The cancellation is algebraically exact but not bitwise -- rotating the
-    input changes the floating-point path through six layers. Measured drift is
-    ~3e-13 rad, which is 2e-11 degrees against errors of order 100 degrees, so
-    the tolerance below is thirteen orders of magnitude tighter than any real
-    leak could hide under.
+    Invariance is algebraically exact but not bitwise -- rotating the input
+    changes the floating-point path through every layer. The tolerance is
+    round-off's, far tighter than any real leak could hide under.
     """
     net = _net()
     rotations = [np.repeat(np.eye(3)[None], 3, axis=0)]
     for seed in (31, 32, 33):
         rotations.append(random_rotations(3, np.random.default_rng(seed)))
 
-    errors = []
+    embeddings = []
     with torch.no_grad():
         for rotation in rotations:
             batch = collate([_sample(7, rotations=rotation)], dtype=DTYPE)
-            prediction = _forward(net, batch)
-            errors.append(geodesic_angle(prediction.rotation, batch.target_rotation))
+            embeddings.append(_forward(net, batch).vertex_embedding)
 
-    # The assembled case (identity perturbation) is the reference: there the
-    # label is the identity, so the error *is* the frame's own angle.
-    for index, other in enumerate(errors[1:], 1):
-        drift = (errors[0] - other).abs().max().item()
+    for index, other in enumerate(embeddings[1:], 1):
+        drift = (embeddings[0] - other).abs().max().item()
         assert drift < 1e-10, (
-            f"re-posing the fragments moved the initial error by {drift:.2e} rad "
+            f"re-posing the fragments moved the embedding by {drift:.2e} "
             f"(perturbation {index}), which is far above round-off -- something "
             f"in the model or the pipeline sees the pose"
         )

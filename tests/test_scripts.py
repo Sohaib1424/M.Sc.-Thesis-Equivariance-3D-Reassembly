@@ -81,15 +81,15 @@ def test_the_dump_can_place_the_fragments_with_the_matched_rotations(trained, tm
     root, config, checkpoint = trained
     out = tmp_path / "matched.npz"
     assert main(_flags(root, config) + ["--checkpoint", str(checkpoint), "--scene",
-                                        _val_key(root, config), "--rotations", "matched",
-                                        "--out", str(out)]) == 0
+                                        _val_key(root, config), "--out", str(out)]) == 0
     data = np.load(out, allow_pickle=False)
     assert str(data["rotations"]) == "matched"
     assert str(data["placement_method"]) == "checked"
     assert np.isfinite(data["geodesic_deg"]).all()
 
-    # v6's placement on request, with the same rotations; the head's
-    # rotations cannot be placed the checked way.
+    # v6's placement on request, with the same rotations (`--rotations
+    # matched` still accepted, as earlier commands pass it); the head's
+    # rotations are gone, and asking for them is refused.
     old = tmp_path / "matched-global.npz"
     assert main(_flags(root, config) + ["--checkpoint", str(checkpoint), "--scene",
                                         _val_key(root, config), "--rotations", "matched",
@@ -99,7 +99,7 @@ def test_the_dump_can_place_the_fragments_with_the_matched_rotations(trained, tm
     assert np.array_equal(old_data["R_pred"], data["R_pred"])
     with pytest.raises(SystemExit):
         main(_flags(root, config) + ["--checkpoint", str(checkpoint), "--scene",
-                                     _val_key(root, config), "--placement", "checked",
+                                     _val_key(root, config), "--rotations", "network",
                                      "--out", str(tmp_path / "never.npz")])
     assert not (tmp_path / "never.npz").exists()
 
@@ -156,7 +156,7 @@ def test_check_scene_finds_the_module_that_goes_non_finite(trained, tmp_path, ca
 
     root, config, checkpoint = trained
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    state["model"]["pool_proj.weight"][0, 0] = float("inf")
+    state["model"]["embed.weight"][0, 0] = float("inf")
     poisoned = tmp_path / "poisoned.pt"
     torch.save(state, poisoned)
     flags = _flags(root, config) + ["--scene", _val_key(root, config),
@@ -164,7 +164,7 @@ def test_check_scene_finds_the_module_that_goes_non_finite(trained, tmp_path, ca
     assert main(flags) == 1
     assert "MODEL in float32" in capsys.readouterr().out
     assert main(flags + ["--locate"]) == 1
-    assert "first module: pool_proj" in capsys.readouterr().out
+    assert "first module: embed" in capsys.readouterr().out
 
 
 def test_benchmark_data_runs_every_measurement(trained, capsys):
@@ -225,7 +225,7 @@ def test_the_report_is_saved_and_rebuilt_from_the_metrics_file(trained, tmp_path
     --evaluate saves the report it prints beside its metrics, and
     report_metrics rebuilds the same text from the metrics file alone -- for
     evaluations from before the report was saved. The per-scene records sit
-    one to a line, and keep the head's own angles beside the matched ones.
+    one to a line, and hold the matched rotations' angles the summary averages.
     """
     import dataclasses
 
@@ -236,38 +236,37 @@ def test_the_report_is_saved_and_rebuilt_from_the_metrics_file(trained, tmp_path
     folder = tmp_path / "eval"
     capsys.readouterr()
     summary = training.evaluate(dataclasses.replace(config, out_dir=str(folder)),
-                                checkpoint=str(checkpoint), split="val", rotations="matched")
+                                checkpoint=str(checkpoint), split="val")
     printed = capsys.readouterr().out
-    report = (folder / "val_report_matched.txt").read_text(encoding="utf-8")
+    report = (folder / "val_report.txt").read_text(encoding="utf-8")
     assert report.rstrip("\n") in printed
     assert report.startswith(f"val ({summary['evaluation']['samples']} samples, checkpoint "
                              f"{checkpoint.name} from epoch 1)")
 
-    metrics = folder / "val_metrics_matched.json"
+    metrics = folder / "val_metrics.json"
     text = metrics.read_text(encoding="utf-8")
     saved = json.loads(text)
     assert len(text.splitlines()) < 150 + len(saved["assembly_scenes"])
     assert (json.dumps(json.loads(dump_metrics(saved)), sort_keys=True)
             == json.dumps(saved, sort_keys=True))
     assert format_evaluation(saved) == report.rstrip("\n")
-    for scene in saved["assembly_scenes"]:
-        assert len(scene["_network_geodesic_deg"]) == len(scene["_scored_geodesic_deg"])
-    head = [a for scene in saved["assembly_scenes"] for a in scene["_network_geodesic_deg"]]
-    assert abs(np.mean(head) - saved["geodesic_deg"]) < 1e-3, "the head's own errors"
+    angles = [a for scene in saved["assembly_scenes"] for a in scene["_scored_geodesic_deg"]]
+    assert len(angles) == saved["geodesic_fragments"]
+    assert abs(np.mean(angles) - saved["geodesic_deg"]) < 1e-3, "the same rotations"
 
-    (folder / "val_report_matched.txt").unlink()
+    (folder / "val_report.txt").unlink()
     assert main([str(folder)]) == 0
-    assert (folder / "val_report_matched.txt").read_text(encoding="utf-8") == report
+    assert (folder / "val_report.txt").read_text(encoding="utf-8") == report
 
     del saved["evaluation"]                 # as written before the header was kept
-    old = tmp_path / "old" / "val_metrics_matched.json"
+    old = tmp_path / "old" / "val_metrics.json"
     old.parent.mkdir()
     old.write_text(json.dumps(saved), encoding="utf-8")
     capsys.readouterr()
     assert main([str(tmp_path / "old" / "*.json"), "--no_save"]) == 0
     text = capsys.readouterr().out
-    assert "rotations from the embedding matches" in text and "part accuracy" in text
-    assert not (old.parent / "val_report_matched.txt").exists()
+    assert "rotations: fitted from the embedding matches" in text and "part accuracy" in text
+    assert not (old.parent / "val_report.txt").exists()
     assert main([str(tmp_path / "nothing-here.json")]) == 1
 
 
@@ -280,22 +279,24 @@ def test_figures_and_tables_come_out_of_a_history_and_an_evaluation(trained, tmp
     root, config, checkpoint = trained
     folder = tmp_path / "eval"
     training.evaluate(dataclasses.replace(config, out_dir=str(folder)),
-                      checkpoint=str(checkpoint), split="val", rotations="matched")
+                      checkpoint=str(checkpoint), split="val")
     history = Path(config.out_dir) / "history.json"
     figures = tmp_path / "figures"
-    metrics = str(folder / "val_metrics_matched.json")
+    metrics = str(folder / "val_metrics.json")
     assert main(["--history", f"run={history}", "--history", str(history),
                  "--eval", f"Everyday={metrics}", "--eval", metrics, "--eval", metrics,
                  "--out", str(figures), "--formats", "png", "--dpi", "60"]) == 0
     for name in ("training/run/loss_total.png", "training/run/loss_terms.png",
                  "training/run/embedding.png", "training/run/rotation_error.png",
+                 "training/run/accuracy.png",
                  "training/compare_val.png", "training/compare_train.png",
                  "evaluation/rotation_error_by_type_matched_box.png",
-                 "evaluation/rotation_error_by_type_network_violin.png",
+                 "evaluation/rotation_error_by_type_matched_violin.png",
                  "evaluation/accuracy_curve.png", "evaluation/part_accuracy_by_type.png",
                  "tables/summary.csv", "tables/summary.md", "tables/errors_by_type_matched.csv",
-                 "README.md"):
+                 "tables/by_type.csv", "tables/by_type.md", "README.md"):
         assert (figures / name).is_file(), name
+    assert not list(figures.rglob("*network*")), "no head, so no head figures"
     index = (figures / "README.md").read_text(encoding="utf-8")
     assert "dataset **eval (2)**" in index, "a repeated label is told apart"
     assert (tmp_path / "figures.zip").is_file()

@@ -14,38 +14,21 @@ small ``.npz`` that can be copied off Kaggle and animated anywhere.
     python -m scripts.visualize_reassembly --dump pred.npz
     python -m scripts.render_gif --dump pred.npz --out reassembly.gif
 
+For every scene of a split at once, ``python -m scripts.train --evaluate
+--predictions FOLDER`` writes the same dumps into one zip as it scores them.
+
 Deterministic given ``--scatter-seed``: the same command rebuilds the same
 scatter, so a dump can be regenerated or compared across checkpoints.
 ``--scatter-seed -1`` uses the scene's own validation draw -- the perturbation
-the model is scored on every epoch.
+the model is scored on every epoch, and the one ``--evaluate`` scores.
 
-Contents (plain arrays with offsets, so ``np.load`` needs no ``allow_pickle``)::
-
-    vertices        (sum V, 3)  every fragment, assembled, world units
-    faces           (sum F, 3)  indices local to each fragment
-    vertex_offsets  (F+1,)      fragment f is vertices[o[f]:o[f+1]]
-    face_offsets    (F+1,)
-    centroids       (F, 3)      each fragment's true centroid
-    A               (F, 3, 3)   the rotation the model was shown (the scatter)
-    shift           (F, 3)      a display-only scatter offset
-    R_pred, R_gt    (F, 3, 3)   predicted rotation, and the truth A^T
-                                (R_pred with the scene's largest fragment set to
-                                its true pose -- reassembly.nn.anchor)
-    placement       (F, 3)      the solver's predicted centroid, world units,
-                                measured from the anchor's true centroid
-    geodesic_deg, tilt_deg, twist_deg, part_chamfer   (F,)
-    rmse_t, chamfer, part_accuracy, matches           scalars for the scene
-    scene, checkpoint, seed, epoch, rotations   (rotations: network or matched)
-    placement_method            checked or global (--placement; from v7)
-
-``--placement`` picks the solve that places the turned fragments: ``checked``
-(the default with ``--rotations matched``, and only with it) uses the pair fits
-the chain agrees with and holds the anchor (reassembly/assembly/placement.py);
-``global`` (the default with ``--rotations network``, and v6's only placement)
-is one least-squares solve over every embedding match.
-
-A fragment's vertex ``v`` with centroid ``c`` is shown scattered at
-``A (v - c) + c + shift``, and reassembled at ``R_pred A (v - c) + placement``.
+The rotations are fitted from the embedding matches and chained from the
+anchor (reassembly/assembly/rotation.py; the network has had no rotation head
+since v7), and placed by ``--placement``: ``checked`` (the default) uses the
+pair fits the chain agrees with and holds the anchor
+(reassembly/assembly/placement.py); ``global`` (v6's only placement) is one
+least-squares solve over every embedding match. The file's contents are listed
+in ``reassembly/assembly/dump.py``.
 """
 from __future__ import annotations
 
@@ -62,22 +45,25 @@ from scripts.config_flags import add_config_arguments, config_from_args  # noqa:
 
 
 def dump(dataset, index, model, config, device, seed: int, out: Path,
-         checkpoint: str = "", epoch: int = -1, rotations: str = "network",
+         checkpoint: str = "", epoch: int = -1, rotations: str = "matched",
          placement=None) -> dict:
-    """Build the scene, predict, assemble, score, and write the dump. ``rotations``
-    is the rotation head's (network) or fitted from the matches (matched);
-    ``placement`` the solve that places them (``None``: the default for the
-    rotations, reassembly.assembly.scoring.default_placement)."""
+    """Build the scene, predict, fit the rotations from the matches, place,
+    score, and write the dump. ``placement`` is the solve that places the
+    turned fragments (``None``: checked). ``rotations`` is accepted only as
+    ``"matched"``, so a call written before v7 removed the head fails rather
+    than quietly scoring something else."""
     import torch
 
     from reassembly.assembly import check_placement, score_batch
+    from reassembly.assembly.dump import dump_arrays, write_dump
     from reassembly.data.features import collate, complete_batch
     from reassembly.data.transforms import random_rotations
-    from reassembly.evaluation.metrics import swing_twist_error
-    from reassembly.nn.losses import geodesic_angle
     from reassembly.training import Skipped, _forward, _to_device, build_criterion
 
-    method = check_placement(rotations, placement)
+    if rotations != "matched":
+        raise ValueError(f"rotations {rotations!r}: since v7 every rotation is fitted from "
+                         f"the embedding matches, so only 'matched' exists")
+    method = check_placement(placement)
     meshes = dataset.meshes(index)
     count = len(meshes)
     if seed >= 0:
@@ -90,56 +76,20 @@ def dump(dataset, index, model, config, device, seed: int, out: Path,
     batch = complete_batch(_to_device(collate([sample]), device))
     keep = {}
     with torch.no_grad():
-        _forward(model, batch, build_criterion(config), config, keep=keep)
-    prediction = keep["prediction"]
-    scene = score_batch(batch, prediction, rotations=rotations, seed=config.seed,
-                        placement=method)[0]
+        _forward(model, batch, build_criterion(config), config, keep=keep, score=True)
+    scene = score_batch(batch, keep["prediction"], seed=config.seed, placement=method,
+                        matched=keep["matched"])[0]
 
     # Placed the way the scorer placed them: with the largest fragment set to
     # its true pose (reassembly.nn.anchor), so the anchor's error is 0 and the
     # other rows are errors relative to it.
-    R_pred = torch.as_tensor(scene["_rotation"], dtype=torch.float64)
-    R_gt = batch.target_rotation.double().cpu()
-    A = R_gt.transpose(-1, -2)                     # the label is A^T
-    geodesic = torch.rad2deg(geodesic_angle(R_pred, R_gt)).numpy()
-    tilt, twist = swing_twist_error(R_pred, R_gt, axis=config.symmetry_axis)
-
-    centroids = np.stack([np.asarray(m.vertices, dtype=np.float64).mean(0) for m in meshes])
-    # The solver's translations are relative to the anchor's, which sits at
-    # its true centroid; without an anchor (one fragment) they are zero-mean
-    # about the mean centroid.
-    reference = int(scene["_anchor"])
-    origin = centroids[reference] if reference >= 0 else centroids.mean(0)
-    placement = origin + np.asarray(scene["_translation"])
-    part_chamfer = scene["_part_chamfer"]
-
-    rng = np.random.default_rng(max(seed, 0) + 1)
-    extent = float(max(np.ptp(np.asarray(m.vertices), axis=0).max() for m in meshes))
-    shift = rng.standard_normal((count, 3)) * extent * 0.9
-
-    vertices = [np.asarray(m.vertices, np.float32) for m in meshes]
-    faces = [np.asarray(m.faces, np.int32) for m in meshes]
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out,
-        vertices=np.concatenate(vertices), faces=np.concatenate(faces),
-        vertex_offsets=np.cumsum([0] + [len(v) for v in vertices]).astype(np.int64),
-        face_offsets=np.cumsum([0] + [len(f) for f in faces]).astype(np.int64),
-        centroids=centroids.astype(np.float32), A=A.numpy().astype(np.float32),
-        shift=shift.astype(np.float32),
-        R_pred=R_pred.numpy().astype(np.float32), R_gt=R_gt.numpy().astype(np.float32),
-        placement=placement.astype(np.float32),
-        geodesic_deg=geodesic.astype(np.float32),
-        tilt_deg=tilt.numpy().astype(np.float32), twist_deg=twist.numpy().astype(np.float32),
-        part_chamfer=np.asarray(part_chamfer, np.float32),
-        rmse_t=np.float32(scene["rmse_t"]), chamfer=np.float32(scene["chamfer"]),
-        part_accuracy=np.float32(scene["part_accuracy"]), matches=np.float32(scene["matches"]),
-        scene=np.array(dataset.key(index)), checkpoint=np.array(checkpoint),
-        seed=np.array(seed), epoch=np.array(epoch), rotations=np.array(rotations),
-        placement_method=np.array(method),
-    )
-    return {"geodesic": geodesic, "tilt": tilt.numpy(), "twist": twist.numpy(),
-            "scene": scene, "part_chamfer": part_chamfer, "placement": method}
+    arrays = dump_arrays(meshes, scene, batch.target_rotation, axis=config.symmetry_axis,
+                         key=dataset.key(index), checkpoint=checkpoint, epoch=epoch,
+                         seed=seed, placement=method)
+    write_dump(out, arrays)
+    return {"geodesic": arrays["geodesic_deg"], "tilt": arrays["tilt_deg"],
+            "twist": arrays["twist_deg"], "scene": scene,
+            "part_chamfer": scene["_part_chamfer"], "placement": method}
 
 
 def main(argv=None) -> int:
@@ -154,15 +104,14 @@ def main(argv=None) -> int:
     parser.add_argument("--list", action="store_true", help="list the scenes of --split")
     parser.add_argument("--split", default="val", choices=["train", "val", "test"])
     parser.add_argument("--device", default=None)
-    parser.add_argument("--rotations", default="network", choices=["network", "matched"],
-                        help="the rotation head's rotations, or ones fitted from the "
-                             "embedding matches (reassembly/assembly/rotation.py)")
+    parser.add_argument("--rotations", default="matched", choices=["matched"],
+                        help="kept so earlier commands still run: the rotations are always "
+                             "fitted from the embedding matches (assembly/rotation.py)")
     parser.add_argument("--placement", default=None, choices=["checked", "global"],
-                        help="checked (the default with --rotations matched, and only "
-                             "with it): place from the pair fits the chain agrees with, "
-                             "the anchor held (reassembly/assembly/placement.py); global "
-                             "(the default with --rotations network; v6's only "
-                             "placement): one solve over every embedding match")
+                        help="checked (the default): place from the pair fits the chain "
+                             "agrees with, the anchor held (reassembly/assembly/placement.py); "
+                             "global (v6's only placement): one solve over every embedding "
+                             "match")
     add_config_arguments(parser)
     args = parser.parse_args(argv)
     config = config_from_args(args)
@@ -172,10 +121,7 @@ def main(argv=None) -> int:
     from reassembly.assembly import check_placement
     from reassembly.training import BreakingBadScenes, find_scene, load_checkpoint
 
-    try:
-        placement = check_placement(args.rotations, args.placement)
-    except ValueError as error:
-        parser.error(str(error))
+    placement = check_placement(args.placement)
 
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     state = None
@@ -203,10 +149,10 @@ def main(argv=None) -> int:
     out = Path(args.out)
     result = dump(dataset, index, model, config, device, args.scatter_seed, out,
                   checkpoint=str(args.checkpoint), epoch=int(state.get("epoch", -1)),
-                  rotations=args.rotations, placement=placement)
+                  placement=placement)
 
     print(f"scene {args.scene}   ({split} split, scatter seed {args.scatter_seed}, "
-          f"{args.rotations} rotations, {placement} placement)")
+          f"rotations from the matches, {placement} placement)")
     print(f"  {'fragment':>8} {'geodesic':>9} {'tilt':>7} {'twist':>7} {'chamfer':>10}")
     for f, (g, t, w, c) in enumerate(zip(result["geodesic"], result["tilt"], result["twist"],
                                          result["part_chamfer"])):
@@ -219,6 +165,11 @@ def main(argv=None) -> int:
               f"so its error is 0 by construction")
     print(f"  {'mean':>8} {np.mean(others) if others else float('nan'):9.2f}   "
           f"(the other fragments; chance 126.47)")
+    reached = scene.get("_reached") or []
+    unplaced = [f for f, hit in enumerate(reached) if not hit]
+    if unplaced:
+        print(f"  not reached by the matching (rotation at chance): fragment(s) "
+              f"{', '.join(map(str, unplaced))}")
     verified = (f", {scene['verified_matches']:.0f} in the verified pair fits"
                 if "verified_matches" in scene else "")
     print(f"  assembly: RMSE(T) {scene['rmse_t']:.4f}   Chamfer {scene['chamfer']:.5f}   "

@@ -1,11 +1,17 @@
 """
-Losses, and the reference values every one of them is checked against.
+The training loss, the four geometric scores, and the reference values every
+one of them is checked against.
 
-A geometric loss that is silently wrong still descends. The defence is to know
-what each term reads at initialisation, when the prediction is a random
-rotation, and to compare: a term that starts far from its chance value is
-measuring something other than what its name says.
-``tests/test_losses.py`` asserts these by Monte Carlo.
+Since v7 the network is trained on one term: the contrastive embedding term
+(:func:`correspondence_loss`). The four geometric terms -- rotation, position,
+normal, face -- are *scores*: they measure the rotations stage two fits from
+the embedding matches (``assembly/rotation.py``), are computed without a
+gradient, and never enter the total. :class:`ReassemblyLoss` returns both.
+
+A geometric term that is silently wrong still reads like a number. The defence
+is to know what each reads at chance, when the rotation is random, and to
+compare: a term far from its chance value is measuring something other than
+what its name says. ``tests/test_losses.py`` asserts these by Monte Carlo.
 
     L_rotation (geodesic)      126.48 deg = pi/2 + 2/pi rad
     Euler RMSE, random guess    83.25 deg
@@ -31,7 +37,7 @@ either direction -- and shows up only as a model that will not converge.
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -168,6 +174,23 @@ def _euler_xyz(R: Tensor) -> Tensor:
     return torch.stack([roll, pitch, yaw], dim=-1)
 
 
+def _cosine_items(predicted: Tensor, target: Tensor) -> Tensor:
+    """``1 - cos`` per item, averaged over any axes between the first and the last."""
+    a = predicted / safe_norm(predicted, dim=-1, keepdim=True)
+    b = target / safe_norm(target, dim=-1, keepdim=True)
+    per_item = 1.0 - torch.sum(a * b, dim=-1)
+    if per_item.dim() > 1:
+        per_item = per_item.mean(dim=tuple(range(1, per_item.dim())))
+    return per_item
+
+
+def cosine_per_fragment(predicted: Tensor, target: Tensor, batch: Tensor,
+                        num_segments: Optional[int] = None) -> Tensor:
+    """:func:`cosine_loss` for each segment (fragment) on its own: ``(F,)``."""
+    per_item = _cosine_items(predicted, target)
+    return segment_mean(per_item.unsqueeze(-1), batch, num_segments).squeeze(-1)
+
+
 def cosine_loss(predicted: Tensor, target: Tensor,
                 batch: Optional[Tensor] = None,
                 num_segments: Optional[int] = None,
@@ -181,17 +204,18 @@ def cosine_loss(predicted: Tensor, target: Tensor,
     so a 83,039-vertex fragment does not outweigh a 4-vertex one; ``keep``
     then selects which segments (fragments) count.
     """
-    a = predicted / safe_norm(predicted, dim=-1, keepdim=True)
-    b = target / safe_norm(target, dim=-1, keepdim=True)
-    per_item = 1.0 - torch.sum(a * b, dim=-1)
-    if per_item.dim() > 1:
-        per_item = per_item.mean(dim=tuple(range(1, per_item.dim())))
     if batch is None:
         if keep is not None:
             raise ValueError("keep selects fragments, so it needs batch")
-        return per_item.mean()
-    per_fragment = segment_mean(per_item.unsqueeze(-1), batch, num_segments)
-    return _fragment_mean(per_fragment.squeeze(-1), keep)
+        return _cosine_items(predicted, target).mean()
+    return _fragment_mean(cosine_per_fragment(predicted, target, batch, num_segments), keep)
+
+
+def position_per_fragment(predicted: Tensor, target: Tensor, batch: Tensor,
+                          num_segments: Optional[int] = None) -> Tensor:
+    """:func:`position_loss` for each segment (fragment) on its own: ``(F,)``."""
+    distance = safe_norm(predicted - target, dim=-1)
+    return segment_mean(distance.unsqueeze(-1), batch, num_segments).squeeze(-1)
 
 
 def position_loss(predicted: Tensor, target: Tensor,
@@ -207,13 +231,11 @@ def position_loss(predicted: Tensor, target: Tensor,
     but the default here is per-*scene* normalisation, where a small fragment
     sits well inside the unit ball and reads lower.
     """
-    distance = safe_norm(predicted - target, dim=-1)
     if batch is None:
         if keep is not None:
             raise ValueError("keep selects fragments, so it needs batch")
-        return distance.mean()
-    per_fragment = segment_mean(distance.unsqueeze(-1), batch, num_segments)
-    return _fragment_mean(per_fragment.squeeze(-1), keep)
+        return safe_norm(predicted - target, dim=-1).mean()
+    return _fragment_mean(position_per_fragment(predicted, target, batch, num_segments), keep)
 
 
 def embedding_consistency_loss(
@@ -366,33 +388,38 @@ def correspondence_loss(
     return loss, accuracy
 
 
+SCORE_TERMS = ("rotation", "position", "normal", "face")
+"""The four geometric terms: scores of a rotation, never trained on (since v7)."""
+
+
 class ReassemblyLoss(torch.nn.Module):
     """
-    The composite objective, with every weight at 1.0 and untuned.
+    The training loss -- the contrastive embedding term, alone -- and the four
+    geometric terms beside it as scores.
 
-    Deliberately untuned: the terms have very different natural scales
-    (radians, a cosine in [0, 2], a distance in normalised units) and choosing
-    weights before seeing how each one moves is guesswork dressed as a
-    decision. The per-term values are returned alongside the total so the first
-    training run *measures* the relative scales instead of assuming them.
+    Until v7 the four were weighted into the total, and trained the rotation
+    head this network no longer has. They now score the rotations stage two
+    fits from the embedding matches (``assembly/rotation.py``): computed under
+    ``no_grad``, reported, never part of the total, so nothing they say can
+    reach a gradient. Their chance values are unchanged -- 126.48 deg, 1.0 and
+    2.0 -- because a fragment the matching cannot reach is left at a rotation
+    that is random relative to its true one.
+
+    ``embedding`` scales the one term that is trained; it is 1.0 and there is
+    nothing to balance it against.
     """
 
-    def __init__(self, rotation: float = 1.0, position: float = 1.0,
-                 normal: float = 1.0, face: float = 1.0,
-                 embedding: float = 1.0, temperature: float = 0.1,
+    def __init__(self, embedding: float = 1.0, temperature: float = 0.1,
                  max_anchors: int = 1024) -> None:
         super().__init__()
-        self.weights = {
-            "rotation": rotation, "position": position, "normal": normal,
-            "face": face, "embedding": embedding,
-        }
+        self.weights = {"embedding": embedding}
         self.temperature = temperature
         self.max_anchors = max_anchors
 
     def forward(
         self,
-        predicted_rotation: Tensor,
-        target_rotation: Tensor,
+        predicted_rotation: Optional[Tensor] = None,
+        target_rotation: Optional[Tensor] = None,
         *,
         vertices: Optional[Tensor] = None,
         target_vertices: Optional[Tensor] = None,
@@ -406,51 +433,91 @@ class ReassemblyLoss(torch.nn.Module):
         cluster: Optional[Tensor] = None,
         num_clusters: int = 0,
         keep: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, dict]:
+        return_fragments: bool = False,
+    ):
         """
-        ``keep`` (``(F,)`` bool) is which fragments the four rotation-dependent
-        terms average over -- all of them by default; under the anchor target,
-        all but each scene's anchor, whose aligned prediction is exact by
-        construction (``nn/anchor.py``). The embedding term is unaffected: it
-        is invariant, so there is no frame for an anchor to fix.
-        """
-        n = predicted_rotation.shape[0]
-        terms = {"rotation": rotation_loss(predicted_rotation, target_rotation, keep)}
+        ``(total, report)``: the trained total -- the embedding term times its
+        weight, or a constant 0 with no gradient when the batch has no
+        coincidence cluster to train on -- and every term as a float, the
+        scores included.
 
-        if vertices is not None and target_vertices is not None:
-            terms["position"] = position_loss(vertices, target_vertices, vertex_batch, n,
-                                              keep=keep)
-        if normals is not None and target_normals is not None:
-            terms["normal"] = cosine_loss(normals, target_normals, vertex_batch, n,
-                                          keep=keep)
-        if face_normals is not None and target_face_normals is not None:
-            # Edges carry three channels -- (n1, n2, relative position) -- but
-            # only the two normals are directions to be matched. Sliced here
-            # rather than left to the caller: passing the whole `edge_attr` is
-            # the obvious thing to do, and it would silently normalise a vector
-            # whose *length* is its content and move chance from 2.0 to 3.0.
-            predicted_faces = face_normals[..., :2, :]
-            target_faces = target_face_normals[..., :2, :]
-            # Both adjacent normals, so chance is 2.0 not 1.0.
-            terms["face"] = 2.0 * cosine_loss(
-                predicted_faces, target_faces, edge_batch, n, keep=keep
-            )
+        The scores need ``predicted_rotation`` and ``target_rotation``, and
+        each of the other three its own pair of inputs; a term whose inputs
+        are not given is not reported. ``keep`` (``(F,)`` bool) is which
+        fragments they average over -- under the anchor protocol all but each
+        scene's anchor, whose rotation is its true pose by construction
+        (``nn/anchor.py``). The embedding term is unaffected: it is invariant,
+        so there is no frame for an anchor to fix.
+
+        ``return_fragments`` adds a third value: each score per fragment,
+        ``(F,)`` tensors (every fragment; ``keep`` is not applied), for
+        breakdowns by category. Per fragment needs the segment index of the
+        term (``vertex_batch``, ``edge_batch``); without it the term is left
+        out of the per-fragment values.
+        """
+        terms, fragments = {}, {}
+        with torch.no_grad():
+            if predicted_rotation is not None and target_rotation is not None:
+                n = predicted_rotation.shape[0]
+                fragments["rotation"] = geodesic_angle(predicted_rotation, target_rotation)
+                terms["rotation"] = _fragment_mean(fragments["rotation"], keep)
+                if vertices is not None and target_vertices is not None:
+                    if vertex_batch is None:
+                        terms["position"] = position_loss(vertices, target_vertices, keep=keep)
+                    else:
+                        fragments["position"] = position_per_fragment(
+                            vertices, target_vertices, vertex_batch, n)
+                        terms["position"] = _fragment_mean(fragments["position"], keep)
+                if normals is not None and target_normals is not None:
+                    if vertex_batch is None:
+                        terms["normal"] = cosine_loss(normals, target_normals, keep=keep)
+                    else:
+                        fragments["normal"] = cosine_per_fragment(
+                            normals, target_normals, vertex_batch, n)
+                        terms["normal"] = _fragment_mean(fragments["normal"], keep)
+                if face_normals is not None and target_face_normals is not None:
+                    # Edges carry three channels -- (n1, n2, relative position) --
+                    # but only the two normals are directions to be matched.
+                    # Sliced here rather than left to the caller: passing the
+                    # whole `edge_attr` is the obvious thing to do, and it would
+                    # silently normalise a vector whose *length* is its content
+                    # and move chance from 2.0 to 3.0.
+                    predicted_faces = face_normals[..., :2, :]
+                    target_faces = target_face_normals[..., :2, :]
+                    # Both adjacent normals, so chance is 2.0 not 1.0.
+                    if edge_batch is None:
+                        terms["face"] = 2.0 * cosine_loss(predicted_faces, target_faces,
+                                                          keep=keep)
+                    else:
+                        fragments["face"] = 2.0 * cosine_per_fragment(
+                            predicted_faces, target_faces, edge_batch, n)
+                        terms["face"] = _fragment_mean(fragments["face"], keep)
+
         match_top1 = None
+        total = None
         if embeddings is not None and cluster is not None:
-            terms["embedding"], match_top1 = correspondence_loss(
+            embedding, match_top1 = correspondence_loss(
                 embeddings, cluster, num_clusters,
                 temperature=self.temperature, max_anchors=self.max_anchors,
                 return_accuracy=True,
             )
-
-        total = sum(self.weights[k] * v for k, v in terms.items())
+            terms["embedding"] = embedding
+            total = self.weights["embedding"] * embedding
+        if total is None:
+            # Nothing to train on: a constant, so `requires_grad` says so.
+            like = next((t for t in terms.values()), None)
+            total = (like.new_zeros(()) if like is not None
+                     else torch.zeros((), device=getattr(embeddings, "device", None)))
         report = {k: float(v.detach()) for k, v in terms.items()}
         report["total"] = float(total.detach())
-        report["rotation_degrees"] = report["rotation"] * 180.0 / 3.141592653589793
+        if "rotation" in report:
+            report["rotation_degrees"] = report["rotation"] * 180.0 / 3.141592653589793
         if match_top1 is not None:
             # The embedding loss needs a per-batch reference to interpret; this
             # does not. It is stage two's own operation -- is a vertex's true
             # coincidence partner its nearest neighbour -- so it reads straight
             # from ~0 at chance to 1.0, and a collapsed embedding cannot fake it.
             report["match@1"] = float(match_top1.detach())
+        if return_fragments:
+            return total, report, fragments
         return total, report

@@ -1,10 +1,11 @@
 """
 Score a predicted assembly the way Breaking Bad's tables do.
 
-Rotation metrics need only the network. Translation RMSE, Chamfer distance and
-part accuracy need an *assembly*, which is what :func:`score_batch` builds: it
-applies the predicted rotations, runs the translation solver
-(:mod:`reassembly.assembly.translation`) scene by scene, and compares the result
+Translation RMSE, Chamfer distance and part accuracy need an *assembly*, which
+is what :func:`score_batch` builds: it takes each fragment's rotation from the
+embedding matches (:mod:`reassembly.assembly.rotation`), places the turned
+fragments (:mod:`reassembly.assembly.placement`, or the global solve of
+:mod:`reassembly.assembly.translation`) scene by scene, and compares the result
 with the ground-truth assembly -- all in **world units**, which is where the
 0.01 part-accuracy threshold is defined. (The network sees per-scene normalised
 coordinates; the batch carries the divisor and centroids that undo that.)
@@ -34,17 +35,15 @@ Conventions, stated because published numbers depend on them:
 * Scenes are averaged **per scene, then over scenes** by the caller, as the
   benchmark does. Training logs are fragment-weighted instead; the two differ
   when scenes differ in fragment count.
-* **Rotations** are the rotation head's (``rotations="network"``, the default)
-  or fitted from the embedding matches and chained from the anchor
-  (``rotations="matched"``, :mod:`reassembly.assembly.rotation`). Either way the
-  translation solver and every score below use the rotations chosen.
-* **Placement** is one least-squares solve over every embedding match
-  (``placement="global"``, :mod:`reassembly.assembly.translation`; the only
-  one before v7, and the default for the head's rotations), or, with matched
-  rotations, from the pair fits the chain agrees with, the anchor held
-  (``placement="checked"``, :mod:`reassembly.assembly.placement`; the default
-  for matched rotations). The global solve contracts many-piece assemblies
-  onto their centre when many matches are wrong; that module says by how much.
+* **Rotations** are fitted from the embedding matches and chained from the
+  anchor (:func:`reassembly.assembly.rotation.match_batch`); the network has
+  had no rotation head since v7. The placement and every score below use them.
+* **Placement** is, by default, from the pair fits the chain agrees with, the
+  anchor held (``placement="checked"``, :mod:`reassembly.assembly.placement`),
+  or one least-squares solve over every embedding match (``placement="global"``,
+  :mod:`reassembly.assembly.translation`; the only placement before v7). The
+  global solve contracts many-piece assemblies onto their centre when many
+  matches are wrong; that module says by how much.
 * **Perturbed inputs** (``observed`` and ``drop``; ``--evaluate --jitter
   --drop``, :mod:`reassembly.evaluation.noise`): the method reads noisy
   coordinates and fewer break vertices, and the score still measures the
@@ -61,46 +60,23 @@ from typing import Dict, List, Optional
 import torch
 
 from ..evaluation.metrics import chamfer_distance, part_accuracy
-from ..evaluation.noise import check_noise, drop_candidates, scene_generator
+from ..evaluation.noise import check_noise
 from ..nn.losses import euler_rmse, geodesic_angle
 from .placement import AGREEMENT_DEG, place
-from .rotation import INLIER_DISTANCE, MIN_MATCHES, RANSAC_ITERATIONS, match_rotations
+from .rotation import (INLIER_DISTANCE, MIN_MATCHES, RANSAC_ITERATIONS, MatchedRotations,
+                       match_batch)
 from .translation import assemble, subsample_per_fragment
 
-ROTATION_SOURCES = ("network", "matched")
 PLACEMENTS = ("checked", "global")
 
 
-def default_placement(rotations: str) -> str:
-    """``"checked"`` for matched rotations, ``"global"`` for the head's."""
-    return "checked" if rotations == "matched" else "global"
-
-
-def check_placement(rotations: str, placement: Optional[str]) -> str:
-    """The placement to use -- the default for ``rotations`` when ``None`` --
-    or a ``ValueError`` saying why it cannot be used."""
-    if rotations not in ROTATION_SOURCES:
-        raise ValueError(f"rotations must be one of {ROTATION_SOURCES}, got {rotations!r}")
-    placement = default_placement(rotations) if placement is None else placement
+def check_placement(placement: Optional[str]) -> str:
+    """The placement to use -- ``"checked"`` when ``None`` -- or a
+    ``ValueError`` naming the choices."""
+    placement = "checked" if placement is None else placement
     if placement not in PLACEMENTS:
         raise ValueError(f"placement must be one of {PLACEMENTS}, got {placement!r}")
-    if placement == "checked" and rotations != "matched":
-        raise ValueError("placement 'checked' places the fragments from the pair fits the "
-                         "matched rotations come from: use it with rotations 'matched', or "
-                         "placement 'global' with the head's rotations")
     return placement
-
-
-def _scene_generator(batch, scene: int, seed: int, device,
-                     stream: str = "") -> torch.Generator:
-    """
-    One RANSAC stream per scene, keyed by the scene's name: a scene draws the
-    same hypotheses whatever batch it lands in, so two evaluations of one
-    checkpoint agree. ``stream`` names another use (``"drop"``) with draws of
-    its own (:func:`reassembly.evaluation.noise.scene_generator`).
-    """
-    name = batch.scene_keys[scene] if batch.scene_keys else str(scene)
-    return scene_generator(name, seed, device, stream)
 
 
 @torch.no_grad()
@@ -108,39 +84,39 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
                 max_match_points: int = 2048, chamfer_points: int = 2048,
                 iterations: int = 5, huber: float = 0.05,
                 collision: bool = False, anchor: bool = True,
-                rotations: str = "network", min_matches: int = MIN_MATCHES,
+                min_matches: int = MIN_MATCHES,
                 inlier_distance: float = INLIER_DISTANCE,
                 ransac_iterations: int = RANSAC_ITERATIONS,
                 seed: int = 0, placement: Optional[str] = None,
                 agreement_deg: float = AGREEMENT_DEG, observed=None,
-                drop: float = 0.0) -> List[Dict[str, float]]:
+                drop: float = 0.0,
+                matched: Optional[MatchedRotations] = None) -> List[Dict[str, float]]:
     """
     One dict per scene: ``geodesic_deg`` and ``euler_rmse_deg`` (the scene's
     own means), ``rmse_t``, ``chamfer``, ``part_chamfer``, ``part_accuracy``,
-    ``matches`` and ``fragments`` -- plus, skipped by averaging,
-    ``_part_chamfer`` (per fragment), ``_translation`` (the solved ``(F, 3)``
-    translations in world units: relative to the anchor's with ``anchor``,
-    zero-mean without), ``_rotation`` (the ``(F, 3, 3)`` rotations the
-    fragments were placed with), ``_scored_geodesic_deg`` (the scored
-    fragments' angles, for fragment-weighted means) and ``_anchor`` (the
-    anchor's index within the scene, or -1). With ``rotations="matched"``,
-    also ``matched_share`` (the scored fragments the chain reached; the rest
-    keep the head's rotation), ``_reached`` (per fragment) and
-    ``_network_geodesic_deg`` (the head's own angles on the same scored
-    fragments, so one evaluation holds both distributions). With
-    ``placement="checked"``, also ``verified_matches``: the inliers of the
-    verified pairs the reached fragments were placed by (``matches`` stays the
-    count of every embedding match, as under the global solve).
+    ``matches``, ``fragments`` and ``matched_share`` (the scored fragments the
+    chain reached; the rest keep a rotation unrelated to their true one) --
+    plus, skipped by averaging, ``_part_chamfer`` (per fragment),
+    ``_translation`` (the solved ``(F, 3)`` translations in world units:
+    relative to the anchor's with ``anchor``, zero-mean without),
+    ``_rotation`` (the ``(F, 3, 3)`` rotations the fragments were placed
+    with), ``_scored_geodesic_deg`` (the scored fragments' angles, for
+    fragment-weighted means), ``_reached`` (per fragment) and ``_anchor`` (the
+    anchor's index within the scene, or -1). With ``placement="checked"``, also
+    ``verified_matches``: the inliers of the verified pairs the reached
+    fragments were placed by (``matches`` stays the count of every embedding
+    match, as under the global solve).
 
     ``batch`` is a :class:`~reassembly.data.features.Batch` on any device and
-    ``prediction`` the model's output for it. ``anchor`` picks the convention
-    (module docstring); ``rotations`` picks where the rotations come from, and
-    ``min_matches``, ``inlier_distance``, ``ransac_iterations`` and ``seed``
-    tune the matched route (:mod:`reassembly.assembly.rotation`).
-    ``placement`` picks the translation solve -- ``None`` is the default for
-    the rotations (:func:`default_placement`) -- and ``agreement_deg`` how far
-    a pair's fit may be from the chained rotations and still place fragments
-    (:mod:`reassembly.assembly.placement`).
+    ``prediction`` the model's output for it. The rotations are ``matched`` --
+    :func:`~reassembly.assembly.rotation.match_batch` on what the method was
+    shown, as ``training._forward`` has already computed them -- or, when
+    ``None``, matched here from ``prediction.vertex_embedding`` with
+    ``min_matches``, ``inlier_distance``, ``ransac_iterations`` and ``seed``.
+    ``anchor`` picks the convention (module docstring). ``placement`` picks
+    the translation solve -- ``None`` is ``"checked"`` -- and ``agreement_deg``
+    how far a pair's fit may be from the chained rotations and still place
+    fragments (:mod:`reassembly.assembly.placement`).
 
     ``observed`` is the batch the method was shown, when that is not ``batch``
     -- ``batch`` with noise on its inputs (``--evaluate --jitter``,
@@ -148,15 +124,15 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
     read the observed coordinates; the score applies the predicted pose to
     ``batch``'s clean ones, so the noise is in what the method saw and not in
     what it is measured against. ``drop`` leaves that share of the break
-    vertices out of the matching (``--drop``), drawn per scene from ``seed``.
+    vertices out of the matching (``--drop``), drawn per scene from ``seed``;
+    it is ``matched``'s own when that is given.
     """
     from ..data.features import complete_batch
-    from ..nn.anchor import anchor_alignment, anchor_fragments
+    from ..nn.anchor import anchor_alignment
     from ..nn.model import apply_rotation
 
-    placement = check_placement(rotations, placement)
+    placement = check_placement(placement)
     check_noise(0.0, drop)
-    matched = rotations == "matched"
     checked = placement == "checked"
     batch = complete_batch(batch)
     # What the method reads; the score reads `batch`.
@@ -165,20 +141,19 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
         raise ValueError("observed must be the same scenes as batch: "
                          f"{tuple(seen.node_features.shape)} against "
                          f"{tuple(batch.node_features.shape)} input features")
+    if matched is None:
+        matched = match_batch(seen, prediction.vertex_embedding, seed=seed, drop=drop,
+                              max_points=max_match_points, min_matches=min_matches,
+                              tau=inlier_distance, iterations=ransac_iterations)
     fragment = batch.vertex_fragment
     unit = batch.unit.to(batch.node_features.dtype)[fragment, None]
-    rotation = prediction.rotation.to(batch.node_features.dtype)
+    rotation = matched.rotation.to(batch.node_features.dtype)
     if anchor:
+        # The root is its own frame's identity; the anchor protocol sets it to
+        # its true pose, and every fragment chained from it moves with it.
         rotation, scored = anchor_alignment(batch, rotation)
     else:
         scored = torch.ones(rotation.shape[0], dtype=torch.bool, device=rotation.device)
-    if matched:
-        # Replaced scene by scene below; a copy, so the prediction is untouched.
-        rotation = rotation.clone()
-        # The chain's root: the largest fragment -- the anchor, whose rotation
-        # is its true pose under the anchor convention.
-        roots = anchor_fragments(batch.log_scale, batch.fragment_scene,
-                                 batch.num_scenes).tolist()
     points = apply_rotation(seen.node_features[:, 0, :], rotation, fragment) * unit
     normals = apply_rotation(seen.node_features[:, 1, :], rotation, fragment)
     truth_local = batch.target_vertices * unit
@@ -192,33 +167,9 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
         v0, v1 = vertex_ptr[f0], vertex_ptr[f1]
         count = f1 - f0
         local = fragment[v0:v1] - f0
-        reached = None
-        pairs = []
-        network_angle = None
-        candidates = None if batch.fracture is None else batch.fracture[v0:v1]
-        if drop:
-            candidates = drop_candidates(candidates, drop, _scene_generator(
-                batch, scene, seed, fragment.device, "drop"))
-        if matched and count:
-            # The head's own error on these fragments, kept beside the matched
-            # one so a figure can show both spreads from one evaluation.
-            network_angle = torch.rad2deg(geodesic_angle(
-                rotation[f0:f1].double(), batch.target_rotation[f0:f1].double()))
-            # The INPUT coordinates, in units of the scene's largest fragment
-            # (the same scale under either normalisation mode).
-            scale = batch.unit[f0:f1].double() / batch.unit[f0:f1].double().max()
-            raw = seen.node_features[v0:v1, 0, :].double() * scale[local, None]
-            fitted, reached, pairs = match_rotations(
-                raw, local, embedding[v0:v1], rotation[f0:f1], roots[scene] - f0,
-                candidates=candidates,
-                max_points=max_match_points, min_matches=min_matches,
-                tau=inlier_distance, iterations=ransac_iterations,
-                generator=_scene_generator(batch, scene, seed, raw.device),
-            )
-            rotation[f0:f1] = fitted
-            points[v0:v1] = apply_rotation(seen.node_features[v0:v1, 0, :], fitted,
-                                           local) * unit[v0:v1]
-            normals[v0:v1] = apply_rotation(seen.node_features[v0:v1, 1, :], fitted, local)
+        reached = matched.reached[f0:f1]
+        pairs = matched.pairs[scene]
+        candidates = matched.candidates[scene]
         radii = None
         if collision:
             reach = points[v0:v1].norm(dim=-1)
@@ -229,7 +180,7 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
             # solve over every match (assembly/placement.py).
             placed_scene = place(
                 points[v0:v1], normals[v0:v1], local, embedding[v0:v1], count, pairs,
-                rotation[f0:f1], reached, roots[scene] - f0, candidates=candidates,
+                rotation[f0:f1], reached, matched.roots[scene], candidates=candidates,
                 max_points=max_match_points, iterations=iterations, huber=huber,
                 min_inliers=min_matches, agreement=agreement_deg, collision_radii=radii,
             )
@@ -299,15 +250,12 @@ def score_batch(batch, prediction, *, threshold: float = 0.01,
             "_rotation": predicted.tolist(),
             "_scored_geodesic_deg": angle[own].tolist(),
             "_anchor": reference,
+            "matched_share": (float(reached[own].double().mean()) if scored_any
+                              else nothing),
+            "_reached": reached.tolist(),
         }
-        if reached is not None:
-            entry["matched_share"] = (float(reached[own].double().mean()) if scored_any
-                                      else nothing)
-            entry["_reached"] = reached.tolist()
         if links is not None:
             entry["verified_matches"] = float(links.source.numel())
-        if network_angle is not None:
-            entry["_network_geodesic_deg"] = network_angle[own].tolist()
         scenes.append(entry)
     return scenes
 

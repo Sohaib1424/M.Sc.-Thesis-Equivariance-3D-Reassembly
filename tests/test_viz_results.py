@@ -123,10 +123,10 @@ def test_tables_order_types_by_error_with_the_families_last(tmp_path):
 
 
 def test_a_rerun_epoch_keeps_its_last_row(tmp_path):
-    rows = [{"epoch": 0, "val_geodesic_deg": 120.0, "train_total": 9.0},
-            {"epoch": 1, "val_geodesic_deg": 115.0, "partial": 1},
-            {"epoch": 1, "val_geodesic_deg": 110.0, "train_total": 7.0},
-            {"epoch": 2, "val_geodesic_deg": 112.0,
+    rows = [{"epoch": 0, "val_geodesic_deg": 120.0, "val_acc@10deg": 0.2, "train_total": 9.0},
+            {"epoch": 1, "val_geodesic_deg": 115.0, "val_acc@10deg": 0.9, "partial": 1},
+            {"epoch": 1, "val_geodesic_deg": 110.0, "val_acc@10deg": 0.5, "train_total": 7.0},
+            {"epoch": 2, "val_geodesic_deg": 112.0, "val_acc@10deg": 0.7,
              "val_by_category": {"everyday_compressed/Mug": {"geodesic_deg": 100.0}}}]
     path = tmp_path / "run" / "history.json"
     path.parent.mkdir()
@@ -135,9 +135,14 @@ def test_a_rerun_epoch_keeps_its_last_row(tmp_path):
     assert history.label == "run"
     assert history.epochs().tolist() == [1, 2, 3]
     assert history.series("val_geodesic_deg").tolist() == [120.0, 110.0, 112.0]
-    assert history.best_epoch() == 2
+    assert history.best_epoch() == 3            # best.pt: the highest acc@10
     assert np.isnan(history.series("train_total")[2])
     assert history.categories() == ["everyday_compressed/Mug"]
+
+    # A run with the rotation head kept best.pt by the lowest geodesic.
+    rows[0]["val_head_cos"] = 0.5
+    path.write_text(json.dumps(rows))
+    assert load_history(path).has_head and load_history(path).best_epoch() == 2
 
 
 def test_every_figure_draws_from_these_results(tmp_path):

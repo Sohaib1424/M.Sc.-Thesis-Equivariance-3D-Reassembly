@@ -39,8 +39,10 @@ oscillate, so the last epoch is a poor estimate of what a run reached.
   orientation once the object is unknown.
 
 This reads TRAINING error on purpose: the question is capacity, not
-generalisation. Validation is kept to ``--val_steps`` x ``--batch_size`` scenes
-(8 by default) to stay cheap.
+generalisation. Since v7 that is the error of the rotations fitted from the
+embedding matches, so every run scores its training batches
+(``--score_train True``). Validation is kept to ``--val_steps`` x
+``--batch_size`` scenes (8 by default) to stay cheap.
 """
 from __future__ import annotations
 
@@ -87,6 +89,9 @@ def run_one(count: int, seed: int, args, passthrough) -> dict:
         "--epochs", str(epochs), "--seed", str(seed), "--checkpoint_dir", str(out_dir),
         "--resume", "none", "--val_steps", str(args.val_steps),
         "--lr_warmup_epochs", repr(warmup),
+        # The training error is the rotations fitted from the matches on the
+        # training batches, which only --score_train measures (since v7).
+        "--score_train", "True",
     ]
     if args.max_hours:
         command += ["--time_budget_hours", str(args.max_hours)]

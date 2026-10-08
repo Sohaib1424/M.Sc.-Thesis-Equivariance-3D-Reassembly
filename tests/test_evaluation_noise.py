@@ -61,11 +61,11 @@ def test_no_noise_is_no_change(fractured_solid):
     mask = batch.fracture.clone()
     assert drop_candidates(mask, 0.0, torch.Generator()) is mask
     assert noise_suffix(0.0, 0.0) == ""
-    oracle = _oracle(batch, batch.target_rotation)
-    for rotations in ("network", "matched"):
-        plain = score_batch(batch, oracle, rotations=rotations)[0]
-        assert score_batch(batch, oracle, rotations=rotations, drop=0.0)[0] == plain
-        seen = score_batch(batch, oracle, rotations=rotations, observed=batch)[0]
+    oracle = _oracle(batch)
+    for placement in ("checked", "global"):
+        plain = score_batch(batch, oracle, placement=placement)[0]
+        assert score_batch(batch, oracle, placement=placement, drop=0.0)[0] == plain
+        seen = score_batch(batch, oracle, placement=placement, observed=batch)[0]
         for key in ("rmse_t", "chamfer", "part_chamfer", "geodesic_deg", "matches"):
             assert seen[key] == pytest.approx(plain[key], abs=1e-12), key
 
@@ -113,7 +113,7 @@ def test_the_method_sees_the_noise_and_the_score_does_not(fractured_solid):
     batch, _ = _broken_scene(fractured_solid)
     batch = complete_batch(batch)
     noisy = jitter_inputs(batch, 0.02, seed=1)
-    oracle = _oracle(batch, batch.target_rotation)
+    oracle = _oracle(batch)
     scored = score_batch(batch, oracle, observed=noisy)[0]
     on_noise = score_batch(noisy, oracle)[0]
     clean = score_batch(batch, oracle)[0]
@@ -129,11 +129,11 @@ def test_the_method_sees_the_noise_and_the_score_does_not(fractured_solid):
 
 def test_drop_leaves_break_vertices_out_of_the_matching(fractured_solid):
     batch, _ = _broken_scene(fractured_solid)
-    oracle = _oracle(batch, batch.target_rotation)
-    full = score_batch(batch, oracle, rotations="matched")[0]
-    half = score_batch(batch, oracle, rotations="matched", drop=0.5)[0]
+    oracle = _oracle(batch)
+    full = score_batch(batch, oracle)[0]
+    half = score_batch(batch, oracle, drop=0.5)[0]
     assert half["matches"] < 0.5 * full["matches"]
-    assert half == score_batch(batch, oracle, rotations="matched", drop=0.5)[0]
+    assert half == score_batch(batch, oracle, drop=0.5)[0]
     assert half["part_accuracy"] == 1.0
 
 
@@ -146,7 +146,7 @@ def test_settings_that_cannot_be_used_are_refused(fractured_solid):
     assert noise_suffix(0.0, 0.25) == "_drop0.25"
     batch, _ = _broken_scene(fractured_solid)
     with pytest.raises(ValueError, match="--drop"):
-        score_batch(batch, _oracle(batch, batch.target_rotation), drop=1.0)
+        score_batch(batch, _oracle(batch), drop=1.0)
 
 
 def test_the_flags_belong_to_evaluate(monkeypatch, capsys):

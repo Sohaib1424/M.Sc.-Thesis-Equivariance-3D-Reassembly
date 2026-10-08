@@ -16,7 +16,6 @@ from reassembly.evaluation.metrics import (
     chamfer_distance,
     format_group_table,
     group_means,
-    head_collinearity,
     matrix_to_quaternion,
     part_accuracy,
     swing_twist_error,
@@ -162,34 +161,6 @@ def test_a_perfect_prediction_has_no_residual_to_decompose():
 def test_an_unknown_axis_is_rejected():
     with pytest.raises(ValueError, match="axis must be one of"):
         swing_twist_error(_identity(), _identity(), axis="w")
-
-
-# --------------------------------------------------------------------- head --
-
-def test_collinearity_is_one_for_parallel_channels_and_zero_for_orthogonal():
-    parallel = torch.tensor([[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]])
-    orthogonal = torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]])
-    assert float(head_collinearity(parallel)) == pytest.approx(1.0)
-    assert float(head_collinearity(orthogonal)) == pytest.approx(0.0, abs=1e-12)
-
-
-def test_collinearity_ignores_sign_and_magnitude():
-    """Gram-Schmidt cares about the angle between the channels, not their
-    lengths or which way round they point."""
-    a = torch.tensor([[[1.0, 0.0, 0.0], [-5.0, 0.0, 0.0]]])
-    assert float(head_collinearity(a)) == pytest.approx(1.0)
-
-
-def test_collinearity_survives_a_zero_channel():
-    """An untrained head can emit an exactly zero vector; a plain normalise
-    would return NaN and take the whole epoch's diagnostic with it."""
-    a = torch.tensor([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]])
-    assert torch.isfinite(head_collinearity(a))
-
-
-def test_collinearity_rejects_the_wrong_shape():
-    with pytest.raises(ValueError, match=r"\(F, 2, 3\)"):
-        head_collinearity(torch.zeros(4, 3, 3))
 
 
 # ----------------------------------------------------------------- assembly --

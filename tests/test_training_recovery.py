@@ -380,98 +380,97 @@ def test_evaluate_assembles_the_prediction_and_scores_it(root, capsys):
 
 def test_evaluate_scores_the_matched_rotations_on_the_same_fragments(root, capsys):
     """
-    ``--rotations matched``: the rotations fitted from the embedding matches
-    are scored over exactly the fragments the head's error is, written to their
-    own file, and assembled with -- and still reported under --no_assemble.
+    The rotations fitted from the embedding matches are scored over every
+    fragment but the anchors, the scores beside them, and assembled with --
+    the same rotations, scene by scene -- placed from the checked pair fits by
+    default, or by v6's global solve to files of their own; and still
+    reported under --no_assemble.
     """
     config = _config(root, epochs=1, steps_per_epoch=2)
     training.train(config)
     capsys.readouterr()
-    summary = training.evaluate(config, checkpoint="last.pt", split="val",
-                                rotations="matched")
-    matched = summary["matched"]
-    assert matched["fragments"] == summary["geodesic_fragments"]
-    assert 0.0 <= matched["reached"] <= 1.0
-    for key in ("geodesic_deg", "geodesic_median_deg", "acc@5deg", "acc@30deg"):
-        assert np.isfinite(matched[key]), key
-    assert np.isfinite(summary["assembly"]["part_accuracy"])
-    assert summary["rotations"] == "matched"
-    assert summary["placement"] == "checked"            # the default with matched rotations
-    assert np.isfinite(summary["assembly"]["verified_matches"])
+    checked = training.evaluate(config, checkpoint="last.pt", split="val")
+    assert 0 < checked["geodesic_fragments"] < checked["fragments"]
+    assert 0.0 <= checked["reached"] <= 1.0
+    for key in ("geodesic_deg", "geodesic_median_deg", "acc@5deg", "acc@30deg",
+                "position", "normal", "face"):
+        assert np.isfinite(checked[key]), key
+    assert checked["rotations"] == "matched" and checked["rotation_head"] is False
+    assert checked["placement"] == "checked"
+    assert np.isfinite(checked["assembly"]["part_accuracy"])
+    assert np.isfinite(checked["assembly"]["verified_matches"])
+    # One measurement: the rotation score, the metrics and the assembly's
+    # per-scene records all read the same rotations on the same fragments.
+    assert checked["rotation_degrees"] == pytest.approx(checked["geodesic_deg"], abs=1e-3)
+    angles = [a for scene in checked["assembly_scenes"] for a in scene["_scored_geodesic_deg"]]
+    assert len(angles) == checked["geodesic_fragments"]
+    assert np.mean(angles) == pytest.approx(checked["geodesic_deg"], abs=1e-3)
     out = capsys.readouterr().out
-    assert "rotations from the embedding matches" in out
-    assert "translation solver on rotations fitted from the embedding matches" in out
+    assert "rotations: fitted from the embedding matches" in out
     assert "placement      checked" in out
-    assert (Path(config.out_dir) / "val_metrics_matched.json").exists()
+    for name in ("val_metrics.json", "val_report.txt"):
+        assert (Path(config.out_dir) / name).exists(), name
 
     # v6's placement, with the same rotations, to its own files.
-    checked = summary
-    summary = training.evaluate(config, checkpoint="last.pt", split="val",
-                                rotations="matched", placement="global")
-    assert summary["placement"] == "global" and summary["matched"] == checked["matched"]
+    summary = training.evaluate(config, checkpoint="last.pt", split="val", placement="global")
+    assert summary["placement"] == "global"
+    assert summary["geodesic_deg"] == checked["geodesic_deg"]
+    assert summary["by_category"] == checked["by_category"]
     assert "verified_matches" not in summary["assembly"]
     assert "placement      global" in capsys.readouterr().out
-    for name in ("val_metrics_matched_global.json", "val_report_matched_global.txt"):
+    for name in ("val_metrics_global.json", "val_report_global.txt"):
         assert (Path(config.out_dir) / name).exists(), name
-    with pytest.raises(ValueError, match="placement 'checked' places"):
-        training.evaluate(config, checkpoint="last.pt", split="val", placement="checked")
+    with pytest.raises(ValueError, match="placement must be one of"):
+        training.evaluate(config, checkpoint="last.pt", split="val", placement="network")
 
     # Without the shared break vertices: the model is shown the noise (its
-    # loss moves), the files say so in their names, the clean ones stay.
-    noisy = training.evaluate(config, checkpoint="last.pt", split="val",
-                              rotations="matched", jitter=0.01, drop=0.5)
+    # scores move), the files say so in their names, the clean ones stay.
+    noisy = training.evaluate(config, checkpoint="last.pt", split="val", jitter=0.01, drop=0.5)
     assert noisy["noise"] == {"jitter": 0.01, "drop": 0.5}
     assert "noise" not in checked
     assert noisy["position"] != checked["position"]
     out = capsys.readouterr().out
     assert "perturbed inputs  --jitter 0.01" in out and "--drop 0.5" in out
     assert "no longer share their vertices" in out
-    for name in ("val_metrics_matched_jitter0.01_drop0.5.json",
-                 "val_report_matched_jitter0.01_drop0.5.txt", "val_metrics_matched.json"):
+    for name in ("val_metrics_jitter0.01_drop0.5.json", "val_report_jitter0.01_drop0.5.txt",
+                 "val_metrics.json"):
         assert (Path(config.out_dir) / name).exists(), name
     with pytest.raises(ValueError, match="--drop"):
         training.evaluate(config, checkpoint="last.pt", split="val", drop=1.0)
 
-    summary = training.evaluate(config, checkpoint="last.pt", split="val",
-                                rotations="matched", assemble=False)
-    assert "matched" in summary and "assembly" not in summary
+    summary = training.evaluate(config, checkpoint="last.pt", split="val", assemble=False)
+    assert "assembly" not in summary and summary["geodesic_deg"] == checked["geodesic_deg"]
     out = capsys.readouterr().out
-    assert "rotations from the embedding matches" in out and "rotation only" in out
+    assert "rotations: fitted from the embedding matches" in out and "rotation only" in out
 
 
-def test_a_checkpoint_from_before_the_anchor_is_rescored_on_both_protocols(root, capsys):
+def test_a_checkpoint_with_the_rotation_head_is_evaluated_without_it(root, capsys):
     """
-    My Thesis Work's checkpoints carry no ``rotation_target``: they were
-    trained on the absolute target. ``evaluate`` must read them that way --
-    report the loss on the target the model was trained on, so the numbers
-    match its own log -- and give the absolute and anchor errors side by side.
-    Resuming one under the anchor target is allowed, and said out loud.
+    A checkpoint from before v7 removed the head -- W10's, say -- still
+    scores: its backbone and embedding are all the matching uses, so the
+    head's weights are left behind, out loud, and the settings this version no
+    longer has are ignored. Resuming one is refused: the run's objective no
+    longer exists.
     """
     import dataclasses
 
-    config = _config(root, epochs=1, steps_per_epoch=2, rotation_target="absolute")
+    config = _config(root, epochs=1, steps_per_epoch=2)
     training.train(config)
+    clean = training.evaluate(config, checkpoint="last.pt", split="val", assemble=False)
     path = Path(config.out_dir) / "last.pt"
     state = torch.load(path, map_location="cpu", weights_only=False)
-    del state["config"]["rotation_target"]            # as My Thesis Work wrote it
+    state["model"]["pool_proj.weight"] = torch.zeros(4, 4)
+    state["model"]["head.0.weight"] = torch.zeros(4, 4)
+    state["config"].update(rotation_target="anchor", w_rot=1.0, w_face=1.0)  # as v6 wrote it
     torch.save(state, path)
     capsys.readouterr()
 
-    anchored = dataclasses.replace(config, rotation_target="anchor")
-    summary = training.evaluate(anchored, checkpoint="last.pt", split="val")
-    out = capsys.readouterr().out
-    assert "using the checkpoint's --rotation_target 'absolute'" in out
-    assert "loss on the 'absolute' target" in out
-    assert "absolute" in out and "largest fragment set to its true pose" in out
-    # The loss is the absolute error of the very predictions the absolute row
-    # reports; the anchor row is scored on every fragment but the anchors.
-    assert summary["rotation_degrees"] == pytest.approx(
-        summary["absolute_geodesic_deg"], abs=1e-3)
-    assert 0 < summary["geodesic_fragments"] < summary["fragments"]
-    assert np.isfinite(summary["assembly"]["part_accuracy"])
-
-    training.train(dataclasses.replace(anchored, epochs=2))
-    assert "the rotation target changed" in capsys.readouterr().out
+    summary = training.evaluate(config, checkpoint="last.pt", split="val", assemble=False)
+    assert "carries the rotation head this version removed (2 tensors)" in capsys.readouterr().out
+    assert summary["geodesic_deg"] == clean["geodesic_deg"]
+    assert summary["rotation_head"] is False
+    with pytest.raises(ValueError, match="trained with the rotation head"):
+        training.train(dataclasses.replace(config, epochs=2))
 
 
 def test_the_time_budget_finishes_the_epoch_it_runs_out_in(root, capsys):

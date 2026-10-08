@@ -2,16 +2,16 @@
 Stage two, rotations: each fragment's rotation from the embedding matches, by
 geometry alone.
 
-The network answers "how is this fragment turned?" twice: once with its
+The network used to answer "how is this fragment turned?" twice: once with a
 rotation head, and once, implicitly, with the per-vertex embedding that the
 translation solver already matches across fragments. On unseen shapes only the
-second answer works. Measured on a trained run (W10, epoch 334, 1023
+second answer worked. Measured on a trained run (W10, epoch 334, 1023
 validation scenes, ``probe_val.py --procrustes``): between fragments that
 touch, the head's relative rotation was 98.7 deg off at the median -- near
 chance -- while the rotation that lines up the two fragments' *matched* points
 was 0.1 deg off, and chaining those from the anchor took the validation error
-from 102.0 to 14.8 deg (median 0.3). The embedding generalises; the head does
-not. This module is the second answer, made explicit.
+from 102.0 to 14.8 deg (median 0.3). The embedding generalises; the head did
+not, and v7 removed it. This module is the only answer now.
 
 Pipeline, for one scene
 -----------------------
@@ -22,11 +22,18 @@ Pipeline, for one scene
    matches, the rotation that carries one fragment's matched points onto the
    other's (Kabsch), with RANSAC against the wrong matches. The points are the
    network's *input* coordinates, so the fit is a relative rotation between
-   the two input frames and does not involve the rotation head at all.
-3. **Chain.** Outward from a root fragment whose rotation is known -- under the
-   benchmark protocol the anchor, set to its true pose -- along a maximum
-   spanning tree whose edge weights are the RANSAC inlier counts. A fragment
-   the tree does not reach keeps the rotation it was given (the head's).
+   the two input frames, read off the matches and nothing else.
+3. **Chain.** Outward from a root fragment -- the scene's largest, the anchor
+   of the benchmark protocol -- along a maximum spanning tree whose edge
+   weights are the RANSAC inlier counts. A fragment the tree does not reach
+   keeps the rotation it was given.
+
+:func:`match_batch` runs this for every scene of a batch without the truth:
+the root is held at the identity (its own input frame), and a fragment the
+tree does not reach keeps the identity too -- a rotation unrelated to its true
+one, so it scores at chance. The anchor protocol then sets the root to its true
+pose for scoring (``nn/anchor.py``), which carries every chained fragment with
+it.
 
 The inlier count is a safe edge weight. On the run above, fragment pairs that
 really touch had a median of 38 inliers (10th percentile 9) and pairs that do
@@ -244,3 +251,85 @@ def match_rotations(points: Tensor, point_fragment: Tensor, embeddings: Tensor,
                                generator=generator)
     chained, reached = chain_rotations(pairs, rotations, root, min_matches)
     return chained, reached, pairs
+
+
+class MatchedRotations(NamedTuple):
+    """Stage two's rotations for every scene of one batch (:func:`match_batch`)."""
+    rotation: Tensor
+    """``(F, 3, 3)``: each fragment's input frame onto its root's, the root at
+    the identity; the identity too for a fragment the chain did not reach."""
+    reached: Tensor
+    """``(F,)`` bool: placed by the chain, each root included."""
+    roots: List[int]
+    """Per scene, the root's index within the scene -- its largest fragment, the
+    anchor -- or -1 for a scene with no fragment."""
+    pairs: List[List[PairRotation]]
+    """Per scene, every fitted pair, in the scene's local indices."""
+    candidates: List[Optional[Tensor]]
+    """Per scene, the vertices the matching could use: the fracture surface,
+    less the share ``drop`` left out; ``None`` without a fracture mask."""
+
+
+def match_batch(batch, embedding: Tensor, *, seed: int = 0, drop: float = 0.0,
+                max_points: int = 2048, min_matches: int = MIN_MATCHES,
+                tau: float = INLIER_DISTANCE,
+                iterations: int = RANSAC_ITERATIONS) -> MatchedRotations:
+    """
+    Every scene's rotations from the embedding matches -- reading only what the
+    method is given at inference.
+
+    That is: the input coordinates (``batch.node_features``), which fragment
+    each vertex belongs to, the fracture mask, the normalisation divisors and
+    radii, the scene's name (to seed its draws) and ``embedding`` -- the
+    network's output for that input. No target field is read; ``probe_val.py
+    --hide_truth`` checks it.
+
+    Per scene, the points are put in units of the scene's largest fragment
+    (the same scale under either normalisation mode), ``drop`` of the break
+    vertices is left out of the matching (``--drop``; a stream of draws per
+    scene), and the fits are chained from the largest fragment held at the
+    identity. RANSAC draws one stream per scene, keyed by the scene's name and
+    ``seed``, so a scene draws the same hypotheses whatever batch it lands in.
+    """
+    from ..evaluation.noise import drop_candidates, scene_generator
+    from ..nn.anchor import anchor_fragments
+
+    count = int(batch.num_fragments)
+    device = batch.node_features.device
+    dtype = batch.node_features.dtype
+    rotation = torch.eye(3, dtype=dtype, device=device).repeat(count, 1, 1)
+    reached = torch.zeros(count, dtype=torch.bool, device=device)
+    largest = anchor_fragments(batch.log_scale, batch.fragment_scene,
+                               batch.num_scenes).tolist()
+    fragment_ptr = batch.fragment_ptr.tolist()
+    vertex_ptr = batch.vertex_ptr.tolist()
+    fragment = batch.vertex_fragment
+    roots: List[int] = []
+    pairs: List[List[PairRotation]] = []
+    candidates: List[Optional[Tensor]] = []
+    for scene in range(batch.num_scenes):
+        f0, f1 = fragment_ptr[scene], fragment_ptr[scene + 1]
+        v0, v1 = vertex_ptr[f0], vertex_ptr[f1]
+        name = batch.scene_keys[scene] if batch.scene_keys else str(scene)
+        mask = None if batch.fracture is None else batch.fracture[v0:v1]
+        if drop:
+            mask = drop_candidates(mask, drop, scene_generator(name, seed, device, "drop"))
+        candidates.append(mask)
+        if f1 == f0:
+            roots.append(-1)
+            pairs.append([])
+            continue
+        root = largest[scene] - f0
+        local = fragment[v0:v1] - f0
+        scale = batch.unit[f0:f1].double() / batch.unit[f0:f1].double().max()
+        points = batch.node_features[v0:v1, 0, :].double() * scale[local, None]
+        start = torch.eye(3, dtype=torch.float64, device=device).repeat(f1 - f0, 1, 1)
+        fitted, hit, fits = match_rotations(
+            points, local, embedding[v0:v1], start, root, candidates=mask,
+            max_points=max_points, min_matches=min_matches, tau=tau,
+            iterations=iterations, generator=scene_generator(name, seed, device))
+        rotation[f0:f1] = fitted.to(dtype)
+        reached[f0:f1] = hit
+        roots.append(root)
+        pairs.append(fits)
+    return MatchedRotations(rotation, reached, roots, pairs, candidates)

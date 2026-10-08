@@ -11,7 +11,7 @@ implementing anything from it.
 
 | | |
 |---|---|
-| Pipeline | **built** — 535 tests, clean under `-W error` |
+| Pipeline | **built** — 523 tests, clean under `-W error` |
 | Dataset pass | 1,096,825 fragments across 1,442 objects |
 | Fracture surface | 10.6% of vertices, dataset-wide |
 | Model | **built and verified** — equivariance checked numerically in float64 |
@@ -28,6 +28,7 @@ implementing anything from it.
 | Benchmark range | `--max_fragments 20` trains and scores on GARF's 2–20 pieces; off by default — see §13 |
 | Hub mirror | optional `--hf_repo_id/--hf_local_dir/--hf_token`: files pushed every epoch, pulled into a fresh folder — see §14 |
 | Thesis v7 | matched rotations placed from the pair fits the chain agrees with, the anchor held, not one solve over every match; `--evaluate --jitter/--drop` without shared break vertices — see §17 |
+| Thesis v7, no head | the rotation head removed: trained on the embedding term alone, every rotation fitted from the matches, the four geometric terms scores only, `best.pt` on validation acc@10; `--split all`, `--predictions` — see §18 |
 
 ---
 
@@ -991,7 +992,7 @@ and per-piece alignment on synthetic records. 75 version markers.
 `E:\Thesis v7` is a copy of Thesis v6 with one change, in stage two only: how
 the fragments are placed once `--rotations matched` has turned them. The
 network, the training and the data are untouched; no checkpoint needs
-retraining.
+retraining. (§18 is the second change, which does retrain: the head removed.)
 
 ### Why
 
@@ -1142,3 +1143,85 @@ Every number above rests on Breaking Bad's shared break vertices, and
 `--evaluate --rotations matched --jitter 0.01 --drop 0.5` on W10, with and
 without `--placement global`: the matched route's number without the shared
 break vertices, the one to put beside GARF-style tables.
+
+## 18 · Thesis v7 — no rotation head; every rotation from the matches (Oct 2026)
+
+The second change in `E:\Thesis v7`, and the one that needs retraining.
+
+### Why
+
+- On W10 (epoch 334, Everyday val) the head's rotations were 102 deg off,
+  anchor-aligned, where the rotations fitted from its own embedding's matches
+  were 15 deg off (§15). The head was the weak part of its own model.
+- nrhl, the same network trained on the embedding term alone, beat W10 on
+  Everyday's validation split: 10.2 deg against 15.2, acc@5 0.905 against
+  0.847. Training the head bought nothing.
+- So the network ends in its embedding; stage two fits every rotation and
+  every translation; the four geometric terms only score the result.
+
+### What changed
+
+- `nn/model.py`: `Prediction` is `(vertex_embedding, vertex_features)`; the
+  pooled frame and the Gram-Schmidt head (`pool_proj`, `head`) are gone.
+  `DEFAULT_SCHEDULE` is `intra intra cross intra cross intra cross intra`, the
+  schedule nrhl was trained with; `intra x5` is the ablation without a cross
+  layer.
+- `nn/losses.py`: the total is the contrastive embedding term alone -- a
+  constant 0 with no gradient for a batch with no coincidence cluster. The
+  rotation, position, normal and face terms are computed under `no_grad` from
+  the rotations they are given and reported, per fragment too, for the
+  breakdowns by category.
+- `assembly/rotation.py`: `match_batch` fits every scene's rotations from the
+  embedding matches reading nothing the method lacks at inference -- each
+  scene's largest fragment held at the identity, a fragment the chain does
+  not reach left there. The anchor protocol turns them for scoring, so an
+  unreached fragment scores at chance.
+- `training.py`: every validation batch is matched and scored (training
+  batches too with `--score_train True`; off, because it matches 2,560 scenes
+  an epoch at the user's settings); a batch with no cluster is left out of the
+  step and named (`no-objective`); `best.pt` is the highest validation acc@10
+  (`BEST_METRIC`); the epoch line and the report give the share reached, and
+  the report the scores and accuracy per category. `--w_rot`, `--w_pos`,
+  `--w_normal`, `--w_face` and `--rotation_target` are refused by name
+  (`scripts/config_flags.py`). A checkpoint with the head evaluates and probes,
+  its head's weights left behind and said so; resuming one is refused.
+- `evaluate`: no `rotations` argument -- the files are `<split>_metrics.json`
+  and `<split>_report.txt` again (`_global` and the noise settings still
+  added). `--split all` scores every object of the given subsets whatever its
+  split, and counts the shapes the checkpoint was trained on (a
+  `volume_constrained-*` copy holds its base subset's shapes). `--predictions
+  DIR` writes every scored scene's dump into one zip, in the data's own layout
+  (`<subset>/<category>/<object>/fractured_<k>.npz`) with a CSV index
+  (`_PredictionWriter`, `assembly/dump.py` -- the writer `dump_prediction`
+  uses too).
+- `probe_val.py`: the matched route only (`--procrustes` accepted, always on);
+  `--table` gathers several probes' summaries into one table.
+- `viz/results.py`, `viz/figures.py`, `scripts/make_figures.py`: the best
+  epoch by acc@10, a validation-accuracy figure, `tables/by_type.csv/.md`
+  (every number per object type and for the whole subset); files from before
+  still read.
+- `evaluation/metrics.py`: `head_collinearity` removed with the head.
+
+### Verified
+
+523 tests, all passing (535 before: the tests of the head and of its training
+went with it). The head's tests were rewritten for what replaced it: the features
+turn with their fragment and the embedding does not move under any pose
+(`test_model.py`); exact matches score 0 in any frame, and the metrics and the
+rotation score are one number (`test_anchor.py`); the scores never enter the
+total (`test_split_integration.py`); a batch without clusters has nothing to
+train on and does not move the weights; a checkpoint with the head evaluates
+and does not resume (`test_training_recovery.py`). The learning test now trains
+the embedding on six broken slab stacks and requires the rotations fitted from
+it to be right: on one thread, over seven seeds, 120 epochs took them from
+chance to exact (0.0 deg, every fragment reached), where 80 epochs got one seed
+in four there. Mutation checks -- the coincidence labels shuffled over the
+vertices, the fitted rotations transposed, the anchor alignment on the wrong
+side -- each fail a test. 105 version markers.
+
+### Next
+
+Train the head-less model and its ablation (`--schedule intra intra intra intra
+intra`); probe both; evaluate both on Everyday val and on the whole
+volume-constrained Everyday, artifact and volume-constrained artifact subsets,
+with figures and every prediction.

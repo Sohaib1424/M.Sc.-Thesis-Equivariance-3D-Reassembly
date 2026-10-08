@@ -62,15 +62,6 @@ import numpy as np
 # ==========================================================================
 
 
-# What the rotation-dependent loss terms compare against; see
-# `Config.rotation_target` and `nn/anchor.py`.
-ROTATION_TARGETS = ("anchor", "absolute")
-
-# A checkpoint written before `rotation_target` existed (My Thesis Work) was
-# trained on the absolute target. Read through this, never through a default
-# that happens to be something else.
-LEGACY_ROTATION_TARGET = "absolute"
-
 # A single-fragment pattern has no relative pose to learn, so the smallest
 # scene is two fragments -- with or without `max_fragments`.
 MIN_FRAGMENTS = 2
@@ -190,13 +181,15 @@ class Config:
     """
     supervise_embedding: bool = True
     """Compute coincidence clusters for the embedding loss. Costs a KD-tree
-    pass per sample; without it that loss term is absent."""
+    pass per sample; without it there is nothing to train on (training
+    refuses to start), though a checkpoint can still be evaluated."""
     # No translation setting, and that is deliberate rather than an omission.
     # `build_scene` applies rotation only, then centres every fragment at its
     # own centroid -- which removes any translation that had been applied. A
-    # `translation_std` here would be a knob that changes nothing, and stage one
-    # predicts rotation alone. Translation is solved geometrically in stage two,
-    # in the world frame, from the centroids `Normalized` keeps.
+    # `translation_std` here would be a knob that changes nothing, and the
+    # network predicts neither. Rotation and translation are both solved
+    # geometrically in stage two, from the embedding matches and the
+    # centroids `Normalized` keeps.
 
     # -- model ------------------------------------------------------------
     channels: int = 64
@@ -216,44 +209,35 @@ class Config:
     whatever this says -- 1109 -> 86 bytes per pair for nearly no time -- so
     there is nothing to switch there.)
     """
-    schedule: Sequence[str] = ("intra",) * 5 + ("cross",) * 3 + ("intra",)
+    schedule: Sequence[str] = ("intra", "intra", "cross", "intra",
+                               "cross", "intra", "cross", "intra")
     """
-    Five intra-fragment layers, then three cross-fragment layers: describe each
-    fragment first, then let the fragments talk.
-
-    The trade this makes is real and worth knowing before reading a curve. A
-    cross layer updates only *token* vertices, and the head pools a mean over
-    *every* vertex -- so with nothing after the last cross layer, about 78% of
-    the pooled signal (2,048 tokens against a median 9,149 vertices) comes from
-    vertices that never heard from another fragment. The network can compensate
-    by scaling token features up, but it does not start there. See
-    `nn/model.py` for what to try if it parks at the axis-only landmark.
+    The layers in order: three rounds of "describe the fragment, then let the
+    fragments talk", each cross layer followed by an intra layer that carries
+    what its tokens heard one hop further along the mesh. The schedule nrhl was
+    trained with. ``intra intra intra intra intra`` is the ablation with no
+    cross-fragment layer at all.
     """
 
-    # -- what the rotation is scored against ------------------------------
-    rotation_target: str = "anchor"
-    """
-    ``anchor`` (the default in this version): each scene's largest fragment is
-    set to its true pose and every other fragment is scored relative to it --
-    the benchmark's protocol, and a question the input can answer for a shape
-    the model has never seen. ``absolute``: each fragment's rotation back into
-    the frame its object is stored in, as in My Thesis Work; for an unseen
-    round object the turn about its axis in that frame is arbitrary, so the
-    loss can then only be lowered by remembering training shapes.
-
-    Changes the four rotation-dependent loss terms only. The model, the
-    embedding term and the metrics are the same either way -- the metrics
-    always use the anchor protocol, with the absolute error printed beside it,
-    so runs with either target compare directly. ``nn/anchor.py`` has the
-    derivation.
-    """
-
-    # -- loss weights (all 1.0 and untuned, on purpose) --------------------
-    w_rotation: float = 1.0
-    w_position: float = 1.0
-    w_normal: float = 1.0
-    w_face: float = 1.0
+    # -- the loss -----------------------------------------------------------
     w_embedding: float = 1.0
+    """
+    The weight of the one term the network is trained on, the contrastive
+    embedding term. The four geometric terms -- rotation, position, normal,
+    face -- score the rotations stage two fits from the matches (anchor
+    protocol, ``nn/anchor.py``) and are never trained on, so they have no
+    weight: ``--w_rot``, ``--w_pos``, ``--w_normal`` and ``--w_face`` are
+    refused, as is ``--rotation_target``.
+    """
+    score_train: bool = False
+    """
+    Also fit the rotations on every TRAINING batch, so the training line
+    reports the four geometric scores and the matched error as well as
+    validation does. Off by default because it is not free: it matches every
+    scene of every step -- 2,560 scenes an epoch at ``--batch_size 128
+    --steps_per_epoch 20`` -- on top of the forward and backward pass.
+    Validation, ``--evaluate`` and ``probe_val.py`` always score.
+    """
 
     # -- optimisation -----------------------------------------------------
     epochs: int = 40
@@ -313,9 +297,13 @@ class Config:
     """
     Forward passes per optimizer step. The command line does not ask for it:
     it is ``--batch_size`` (scenes per step per GPU, as in Thesis 1) divided by
-    ``--micro_batch_scenes``. The gradients of the passes in a step are summed
-    and divided by their fragment count, so a step over 8 passes of 1 scene is
-    the same step as one pass over all 8 -- only the peak memory differs.
+    ``--micro_batch_scenes``. The gradients of the passes in a step are summed,
+    each weighted by its scored fragments, and divided by their total. The
+    trained term is contrastive and draws its negatives from its own pass, so
+    a step over 8 passes of 1 scene is not quite the step one pass over all 8
+    would take: there each scene's vertices are also negatives for the others.
+    Matching happens within a scene, so those extra negatives -- another
+    object's vertices -- are the ones that teach least.
     """
     amp: bool = False
     perturb_on_device: bool = True
@@ -433,9 +421,6 @@ class Config:
                              "implemented here" if self.lr_schedule == "plateau" else ""))
         if self.save_every < 1:
             raise ValueError("save_every must be >= 1")
-        if self.rotation_target not in ROTATION_TARGETS:
-            raise ValueError(f"rotation_target must be one of {ROTATION_TARGETS}, "
-                             f"got {self.rotation_target!r}")
         from .data.catalog import BALANCE_SCHEMES, SPLIT_MODES
 
         if self.split_by not in SPLIT_MODES:
@@ -463,17 +448,6 @@ class Config:
                   "generalisation to unseen fractures of known objects, which "
                   "is a strictly easier question than the benchmark's. Do not "
                   "report a number from it as an object-split result.")
-        if not self.supervise_embedding and self.w_embedding:
-            # Not an error -- it is a legitimate ablation -- but it must not be
-            # silent. The embedding-consistency loss is the only supervision the
-            # per-vertex embedding gets, so without it that head trains not at
-            # all while the rotation loss descends exactly as before. Stage two
-            # matches interface points in embedding space, so the result is a
-            # rotation model that works and a translation solver with nothing
-            # to use.
-            print("[config] supervise_embedding=False: the embedding head will "
-                  "receive no gradient at all, and stage two's correspondence "
-                  "search depends on it. Set w_embedding=0 to acknowledge this.")
 
 
 # The command-line name of each Config field that Thesis 1 also has, under
@@ -490,8 +464,6 @@ THESIS1_NAMES = {
     "mode_filter": "fracture_pattern",
     "channels": "hidden_channels",
     "embedding_dim": "embed_dim",
-    "w_rotation": "w_rot",
-    "w_position": "w_pos",
     "workers": "num_workers",
     "devices": "num_gpus",
     "max_hours": "time_budget_hours",
@@ -534,15 +506,48 @@ CHANCE = {
 # VN-GAT design reached 30.9 deg training error on eight Everyday objects --
 # bottles, bowls and mugs -- which is well under it.
 
+BEST_METRIC = "acc@10deg"
+"""What ``best.pt`` is chosen by: the validation share of scored fragments
+whose matched rotation is within 10 deg of the truth, higher is better."""
+_BEST_NAME = "acc@10"
+
+# The parameters of the rotation head v7 removed (`nn/model.py`). A checkpoint
+# trained before that carries them; it can still be evaluated -- they are
+# dropped -- but not resumed.
+_HEAD_PREFIXES = ("pool_proj.", "head.")
+
+
+def _head_keys(state_dict) -> List[str]:
+    """The keys of ``state_dict`` that belong to the removed rotation head."""
+    return [key for key in state_dict if key.startswith(_HEAD_PREFIXES)]
+
 
 # ==========================================================================
 # Dataset
 # ==========================================================================
 
 
+def _official_lists(config: Config) -> Dict[str, set]:
+    """
+    Breaking Bad's shipped split lists for ``config.official_subset``, keyed by
+    split; ``{}`` under ``--split_source hash`` or when none are found.
+    """
+    from .data.paths import load_official_split
+
+    if config.split_source == "hash":
+        return {}
+    lists = {name: load_official_split(config.root, name, config.official_subset)
+             for name in ("train", "val", "test")}
+    return {name: keys for name, keys in lists.items() if keys}
+
+
 class BreakingBadScenes:
     """
     One item is one (object, fracture mode) pair.
+
+    ``split`` is ``"train"``, ``"val"`` or ``"test"``, or ``"all"`` for every
+    object of ``config.subsets`` whatever its split -- evaluation only, on
+    subsets the model was not trained on.
 
     Returns the ``SceneSample`` that :func:`~reassembly.data.features.collate`
     consumes, so all the geometry runs in ``DataLoader`` workers and the main
@@ -557,7 +562,7 @@ class BreakingBadScenes:
     def __init__(self, config: Config, split: str, epoch_seed: int = 0,
                  cache_size: int = 4):
         from .data.catalog import Catalog, build_catalog, limit_fragments, split_catalog
-        from .data.paths import find_scenes, load_official_split
+        from .data.paths import find_scenes
 
         self.config = config
         self.split = split
@@ -577,11 +582,7 @@ class BreakingBadScenes:
         # `volume_constrained-everyday_compressed`, so an object split is not
         # one. Grouping keeps every break pattern and counts every shape once.
         full = build_catalog(scenes, mode_filter=config.mode_filter)
-        official = {} if config.split_source == "hash" else {
-            name: load_official_split(config.root, name, config.official_subset)
-            for name in ("train", "val", "test")
-        }
-        official = {k: v for k, v in official.items() if v}
+        official = _official_lists(config)
         if config.split_source == "official" and not official:
             raise FileNotFoundError(
                 f"--split_source official, but no official split lists for "
@@ -589,13 +590,19 @@ class BreakingBadScenes:
                 f"Use --split_source hash (or auto) to split what is on disk.")
         self.official = bool(official)
 
-        self.catalog: Catalog = split_catalog(
-            full, split,
-            split_by=config.split_by,
-            official=official or None,
-            val_frac=config.val_frac, test_frac=config.test_frac,
-            seed=config.split_seed, fracture_pool=config.fracture_pool,
-        )
+        if split == "all":
+            # Every object of the chosen subsets, whatever split it is in: for
+            # scoring a checkpoint on subsets it was not trained on. `evaluate`
+            # says how many of them it was trained on (`_trained_shapes`).
+            self.catalog: Catalog = full
+        else:
+            self.catalog = split_catalog(
+                full, split,
+                split_by=config.split_by,
+                official=official or None,
+                val_frac=config.val_frac, test_frac=config.test_frac,
+                seed=config.split_seed, fracture_pool=config.fracture_pool,
+            )
         if config.split_by == "object" and split in ("train", "val") and official:
             _assert_splits_disjoint(full, config, official)
         # The fragment limit comes after the split, so it only ever removes
@@ -712,6 +719,26 @@ class BreakingBadScenes:
             if self.key(i) == key:
                 return i
         return None
+
+    def location(self, i: int) -> str:
+        """
+        Where item ``i`` sits in the data directory, as the Visualizer's
+        predictions folder mirrors it: ``<subset>/<category>/<object>/<mode>``
+        -- ``everyday_compressed/Bottle/<id>/fractured_3``,
+        ``artifact_compressed/<id>/fractured_3`` -- without the archive's
+        doubled subset folder or, in a volume-constrained copy, the base subset
+        nested inside it (``volume_constrained-everyday_compressed/Bowl/...``).
+        """
+        scene_index, mode = self.items[i]
+        entry = self.catalog.objects[scene_index]
+        directory = Path(self._directories[(scene_index, mode)])
+        try:
+            top = directory.resolve().relative_to(Path(self.config.root).resolve()).parts[0]
+        except (ValueError, IndexError):
+            top = entry.subset
+        category = [part for part in (entry.category or "").replace("\\", "/").split("/")
+                    if part and not part.endswith("_compressed")]
+        return "/".join([top, *category, entry.name, mode])
 
     def meshes(self, i: int) -> list:
         """Item ``i``'s fragments as loaded, in the ASSEMBLED frame (trimesh)."""
@@ -994,26 +1021,37 @@ def _to_device(batch, device):
     return type(batch)(**moved)
 
 
-def _forward(model, batch, criterion, config, keep=None):
+def _forward(model, batch, criterion, config, keep=None, score=None, drop=0.0):
     """
-    One forward pass and the full loss breakdown.
+    One forward pass, the training loss, and -- when ``score`` -- the four
+    geometric scores of the rotations stage two fits from it.
 
-    ``keep``, a dict, receives the completed batch and the whole prediction --
-    for evaluation, which assembles from the embeddings as well as the
-    rotations.
+    Returns ``(loss, report, R)``. ``loss`` is the one trained term, the
+    contrastive embedding term (``nn/losses.py``); with no coincidence cluster
+    in the batch it is a constant 0 with no gradient. ``R`` is the
+    ``(F, 3, 3)`` rotations fitted from the embedding matches
+    (:func:`reassembly.assembly.rotation.match_batch`) -- each scene's root at
+    the identity, as the method has them, before the anchor protocol aligns
+    them -- or ``None`` without ``score``.
 
-    The predicted rotation is applied to the *centred, normalised* input and
-    compared against the assembled target, which is the convention derived in
-    ``nn/model.py``: ``v_perturbed @ R.T == v_assembled`` exactly when the
-    prediction is right.
+    ``score`` is ``None`` by default: on in eval mode, and in training mode
+    only with ``config.score_train`` -- matching every training scene is not
+    free. The scores are computed under ``no_grad`` from rotations that carry
+    no gradient, so nothing they say reaches the weights: they are the four
+    terms the head was once trained on, now measuring stage two. Under the
+    anchor protocol (``nn/anchor.py``) each scene's largest fragment is set to
+    its true pose and left out of them, as it is out of every metric.
 
-    Under ``rotation_target="anchor"`` the rotation compared is the prediction
-    after its scene's anchor has been set to its true pose (``nn/anchor.py``),
-    and the anchors themselves are left out of the four rotation-dependent
-    terms. The returned ``R`` is always the model's own, unaligned prediction.
+    ``keep``, a dict, receives the completed batch, the prediction, the
+    matched rotations (``"matched"``, a
+    :class:`~reassembly.assembly.rotation.MatchedRotations`) and each score
+    per fragment (``"fragments"``) -- for evaluation, which assembles from
+    them and breaks them down by category. ``drop`` leaves that share of the
+    break vertices out of the matching (``--evaluate --drop``).
     """
     import torch
 
+    from .assembly.rotation import match_batch
     from .data.features import clustered_vertices, complete_batch
     from .nn.anchor import anchor_alignment
     from .nn.model import apply_rotation
@@ -1025,87 +1063,95 @@ def _forward(model, batch, criterion, config, keep=None):
         log_scale=batch.log_scale, token_index=batch.token_index,
         token_query=batch.token_query, token_key=batch.token_key,
     )
-    R = prediction.rotation
     if keep is not None:
         keep["batch"], keep["prediction"] = batch, prediction
-    fragment = batch.vertex_fragment
-    edge_fragment = fragment[batch.edge_index[0]]
-
-    scored = None
-    compared = R
-    if config.rotation_target == "anchor":
-        compared, scored = anchor_alignment(batch, R)
-
-    positions = apply_rotation(batch.node_features[:, 0, :], compared, fragment)
-    normals = apply_rotation(batch.node_features[:, 1, :], compared, fragment)
-    # (E, C, 3) rotated per edge; the loss slices out the two normal channels.
-    edge_normals = torch.einsum("eij,ekj->eki", compared[edge_fragment], batch.edge_attr)
+    if score is None:
+        score = (not model.training) or config.score_train
 
     embeddings = cluster = None
     clusters = 0
     if batch.num_clusters:
-        keep, renumbered, clusters = clustered_vertices(batch.cluster)
+        chosen, renumbered, clusters = clustered_vertices(batch.cluster)
         if clusters:
-            embeddings, cluster = prediction.vertex_embedding[keep], renumbered
+            embeddings, cluster = prediction.vertex_embedding[chosen], renumbered
 
-    total, report = criterion(
-        compared, batch.target_rotation,
-        vertices=positions, target_vertices=batch.target_vertices,
-        vertex_batch=fragment,
-        normals=normals, target_normals=batch.target_normals,
-        face_normals=edge_normals, target_face_normals=batch.target_edge_normals,
-        edge_batch=edge_fragment,
+    R = compared = scored = None
+    scored_inputs = {}
+    if score:
+        with torch.no_grad():
+            matched = match_batch(batch, prediction.vertex_embedding.detach(),
+                                  seed=config.seed, drop=drop)
+            R = matched.rotation
+            if keep is not None:
+                keep["matched"] = matched
+            fragment = batch.vertex_fragment
+            edge_fragment = fragment[batch.edge_index[0]]
+            compared, scored = anchor_alignment(batch, R)
+            scored_inputs = dict(
+                vertices=apply_rotation(batch.node_features[:, 0, :], compared, fragment),
+                target_vertices=batch.target_vertices, vertex_batch=fragment,
+                normals=apply_rotation(batch.node_features[:, 1, :], compared, fragment),
+                target_normals=batch.target_normals,
+                # (E, C, 3) rotated per edge; the loss slices out the two normals.
+                face_normals=torch.einsum("eij,ekj->eki", compared[edge_fragment],
+                                          batch.edge_attr),
+                target_face_normals=batch.target_edge_normals, edge_batch=edge_fragment)
+
+    total, report, fragments = criterion(
+        compared, batch.target_rotation if score else None,
+        **scored_inputs,
         embeddings=embeddings, cluster=cluster, num_clusters=clusters,
-        keep=scored,
+        keep=scored, return_fragments=True,
     )
-    # Diagnostics ride along in `report`, which the epoch loop already averages
-    # weighted by the fragments the loss counts, and writes into the history.
-    # They are computed under no_grad and are not part of `total`, so they
-    # cannot influence what is optimised -- `tests/test_training.py` pins that
-    # the terms still sum to the total. Over the same fragments, in the same
-    # frame, as the rotation term; validation replaces them with the anchor
-    # protocol's own (`_summarise_tally`).
-    with torch.no_grad():
-        from .evaluation.metrics import head_collinearity, swing_twist_error
+    if keep is not None:
+        keep["fragments"] = fragments
+    if score:
+        # Diagnostics ride along in `report`, which the epoch loop averages
+        # weighted by the fragments the scores count, and writes into the
+        # history. Over the same fragments, in the same frame, as the rotation
+        # score; validation replaces them with the anchor protocol's own
+        # (`_summarise_tally`).
+        with torch.no_grad():
+            from .evaluation.metrics import swing_twist_error
 
-        tilt, twist = swing_twist_error(compared.detach(), batch.target_rotation,
-                                        axis=config.symmetry_axis)
-        if scored is not None:
+            tilt, twist = swing_twist_error(compared, batch.target_rotation,
+                                            axis=config.symmetry_axis)
             tilt, twist = tilt[scored], twist[scored]
-        report["tilt_deg"] = float(tilt.mean()) if tilt.numel() else 0.0
-        report["twist_deg"] = float(twist.mean()) if twist.numel() else 0.0
-        if prediction.head_axes is not None:
-            report["head_cos"] = float(head_collinearity(prediction.head_axes.detach()))
+            report["tilt_deg"] = float(tilt.mean()) if tilt.numel() else 0.0
+            report["twist_deg"] = float(twist.mean()) if twist.numel() else 0.0
     return total, report, R
 
 
 def _loss_fragments(batch, config) -> int:
     """
-    The fragments one batch's loss is a mean over, and so its weight in the
-    step and in the epoch's averages: every fragment under the absolute target,
-    all but one per scene under the anchor target. The step divides the summed
-    gradient by the total of these, so each scored fragment counts once.
+    One batch's weight in the step and in the epoch's averages: its fragments
+    less one per scene, the anchor, which the scores leave out. The step
+    divides the summed gradient by the total of these -- the weighting nrhl and
+    W10 were trained with.
     """
-    if config.rotation_target == "anchor":
-        from .nn.anchor import scored_count
+    from .nn.anchor import scored_count
 
-        return scored_count(batch)
-    return int(batch.num_fragments)
+    return scored_count(batch)
 
 
 def _metrics(predicted, target,
              categories: Optional[Sequence[str]] = None,
-             axis: Optional[str] = None) -> Dict[str, float]:
+             axis: Optional[str] = None,
+             extra: Optional[Dict] = None) -> Dict[str, float]:
     """
     Geodesic (primary) and Euler RMSE (GARF comparability), plus accuracy --
     and with ``axis``, the tilt/twist split about it.
 
-    ``categories`` adds a per-category breakdown under the ``by_category`` key.
-    It is the honest counterpart to the balanced sampler: balancing changes
-    what the model is *shown*, and this shows what it then *does*, on a
-    validation set that is never reweighted. Without it, "validation improved"
-    cannot be told apart from "validation is now dominated by different
-    categories", and the second is what a sampler change produces for free.
+    ``categories`` adds a per-category breakdown under the ``by_category`` key:
+    per category the fragments, the mean and median geodesic, acc@5/10/30, the
+    Euler RMSE, and the mean of each ``extra`` -- ``(F,)`` values aligned with
+    ``predicted`` (the share the matching reached, the position, normal and
+    face scores). It is the honest counterpart to the balanced sampler:
+    balancing changes what the model is *shown*, and this shows what it then
+    *does*, on a validation set that is never reweighted. Without it,
+    "validation improved" cannot be told apart from "validation is now
+    dominated by different categories", and the second is what a sampler
+    change produces for free.
     """
     import torch
 
@@ -1125,14 +1171,25 @@ def _metrics(predicted, target,
         tilt, twist = swing_twist_error(predicted, target, axis=axis)
         out["tilt_deg"], out["twist_deg"] = float(tilt.mean()), float(twist.mean())
 
+    extra = {name: values for name, values in (extra or {}).items()
+             if values is not None and values.numel() == angle.numel()}
     if categories and len(categories) == angle.numel():
-        from .evaluation.metrics import group_means
-
-        out["by_category"] = {
-            name: {"geodesic_deg": value, "fragments": count}
-            for name, (value, count) in group_means(
-                angle.tolist(), list(categories)).items()
-        }
+        labels = np.asarray(list(categories), dtype=object)
+        rows = {}
+        for name in dict.fromkeys(categories):
+            mask = torch.as_tensor(labels == name, device=angle.device)
+            values = angle[mask]
+            row = {"geodesic_deg": float(values.mean()),
+                   "geodesic_median_deg": float(values.median()),
+                   "fragments": int(mask.sum())}
+            for threshold in (5.0, 10.0, 30.0):
+                row[f"acc@{threshold:g}deg"] = float((values < threshold).float().mean())
+            row["euler_rmse_deg"] = float(euler_rmse(predicted[mask], target[mask]))
+            for key, column in extra.items():
+                row[key] = float(column[mask.to(column.device)].double().mean())
+            rows[name] = row
+        # Worst first, as every table of them is read.
+        out["by_category"] = dict(sorted(rows.items(), key=lambda kv: -kv[1]["geodesic_deg"]))
     elif categories:
         # Length mismatch means the labels and the angles came from different
         # things, and a breakdown built on that is worse than none: it looks
@@ -1144,7 +1201,8 @@ def _metrics(predicted, target,
 def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
               device="cpu", step=0, total_steps=1, label="train",
               show_progress=True, deadline=None, stop_signal=None,
-              on_checkpoint=None, distributed=False, on_prediction=None, inputs=None):
+              on_checkpoint=None, distributed=False, on_prediction=None, inputs=None,
+              drop=0.0):
     """
     One pass over ``loader``. Training when ``optimizer`` is given, else eval.
 
@@ -1178,13 +1236,18 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
     gathered from every GPU, so it describes the whole epoch rather than one
     GPU's share of it.
 
-    ``on_prediction(batch, prediction)`` is called in eval mode for every batch
-    that was scored -- :func:`evaluate` uses it to assemble.
+    In eval mode every batch is scored: its rotations are fitted from the
+    embedding matches (:func:`_forward`), and the metrics -- geodesic error,
+    accuracy, the share the matching reached, all broken down by category --
+    are computed from them. ``on_prediction(batch, prediction, shown=None,
+    matched=None)`` is called for every batch that was scored, with the
+    matched rotations -- :func:`evaluate` uses it to assemble.
 
     ``inputs(batch) -> batch``, eval mode only, is what the model is shown in
     place of the batch -- :func:`evaluate`'s ``jitter``. The loss and metrics
     are then the shown batch's, and ``on_prediction`` receives the batch as
-    loaded (completed), the prediction, and the batch shown.
+    loaded (completed), the prediction, and the batch shown. ``drop`` (eval
+    mode) leaves that share of the break vertices out of the matching.
     """
     import torch
 
@@ -1255,7 +1318,7 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
                     _count_outcome(tally, outcome, batch, names, vertices, detail,
                                    prefix, label, index)
                 else:
-                    holder = {} if on_prediction is not None else None
+                    holder = {}
                     shown = batch
                     if inputs is not None:
                         from .data.features import complete_batch
@@ -1263,28 +1326,32 @@ def run_epoch(model, loader, criterion, config, *, optimizer=None, scaler=None,
                         batch = complete_batch(batch)
                         shown = inputs(batch)
                     report, R, outcome, detail = _eval_batch(
-                        model, shown, criterion, config, device=device, keep=holder)
+                        model, shown, criterion, config, device=device, keep=holder,
+                        drop=drop)
                     _count_outcome(tally, outcome, batch, names, vertices, detail,
                                    prefix, label, index)
-                    if R is not None and holder:
+                    if R is not None and on_prediction is not None:
                         if inputs is None:
-                            on_prediction(holder["batch"], holder["prediction"])
+                            on_prediction(holder["batch"], holder["prediction"],
+                                          matched=holder["matched"])
                         else:
-                            on_prediction(batch, holder["prediction"], holder["batch"])
+                            on_prediction(batch, holder["prediction"], holder["batch"],
+                                          matched=holder["matched"])
                     if R is not None:
-                        # The metrics are the anchor protocol's whatever the
-                        # training target: the prediction with its scene's
-                        # largest fragment set to its true pose, scored on the
-                        # other fragments (`nn/anchor.py`). The model's own
-                        # absolute error is kept beside it.
+                        # The anchor protocol: the matched rotations with each
+                        # scene's largest fragment set to its true pose, scored
+                        # on the other fragments (`nn/anchor.py`).
                         from .nn.anchor import anchor_alignment
 
                         target = batch.target_rotation.detach()
                         aligned, scored = anchor_alignment(batch, R.detach())
                         tally["predictions"].append(aligned[scored].float().cpu())
                         tally["targets"].append(target[scored].float().cpu())
-                        tally["absolute_predictions"].append(R.detach().float().cpu())
-                        tally["absolute_targets"].append(target.float().cpu())
+                        tally["reached"].append(holder["matched"].reached[scored].cpu())
+                        for name in ("position", "normal", "face"):
+                            values = holder["fragments"].get(name)
+                            if values is not None:
+                                tally[f"scored_{name}"].append(values[scored].float().cpu())
                         # One category label per scored FRAGMENT, not per scene,
                         # so it lines up with the per-fragment angles `_metrics`
                         # produces. Taken from the batch rather than from the
@@ -1448,16 +1515,21 @@ def _attempt(model, batch, criterion, config, scaler, weight, forced):
         # never recover: the run continues for hours producing nothing.
         if not math.isfinite(value):
             return "nonfinite-loss", report, value
+        if not loss.requires_grad:
+            # No coincidence cluster anywhere in the batch, so the one trained
+            # term is absent: there is nothing to step on.
+            return "no-objective", report, value
         # Weighted by the micro-batch's fragment count, not divided by
-        # `accumulate`. Every loss term is a *mean over fragments*, so
-        # multiplying by the count turns it back into a sum; the step divides
-        # the sum by the fragments that actually contributed, on every GPU.
-        # "Fragments" are the ones the loss scores (`_loss_fragments`): under
-        # the anchor target the anchors are not among them.
-        # That makes 2 passes of 1 scene the same gradient as one pass of
-        # 2 scenes, which `loss / accumulate` is not -- it weights each
-        # *scene* equally, and a scene holds 2 to 35 fragments. Measured on a
-        # 2- and an 8-fragment scene, the two had cosine similarity 0.80.
+        # `accumulate`; the step divides the sum by the fragments that
+        # actually contributed, on every GPU. "Fragments" are the ones the
+        # scores count (`_loss_fragments`): every one but each scene's anchor.
+        # It is the weighting nrhl and W10 were trained with: a scene weighs
+        # in by its fragments, not one vote per scene as `loss / accumulate`
+        # would give it, and a scene holds 2 to 35 fragments. (For the
+        # geometric terms the removed head trained on, each a mean over
+        # fragments, it made 2 passes of 1 scene exactly one pass of 2; the
+        # contrastive term draws its negatives from its own pass, so for it no
+        # weighting can -- `test_the_contrastive_term_cannot_match_...`.)
         scaled = loss * weight
         (scaler.scale(scaled) if scaler else scaled).backward()
     return "ok", report, value
@@ -1506,7 +1578,7 @@ def _train_micro_batch(model, batch, criterion, config, *, scaler, parameters,
 
     if outcome in ("ok", "recovered") and scaler is None and not _gradients_finite(parameters):
         # A finite loss can still produce a non-finite gradient -- a norm of a
-        # zero vector, a Gram-Schmidt step on parallel axes. Under AMP this is
+        # zero vector, say. Under AMP this is
         # the GradScaler's job (it skips the step and lowers the scale), so the
         # check is fp32 only.
         outcome = "nonfinite-grad"
@@ -1520,16 +1592,14 @@ def _train_micro_batch(model, batch, criterion, config, *, scaler, parameters,
     return 0.0, None, outcome, value
 
 
-def _eval_batch(model, batch, criterion, config, *, device, keep=None):
+def _eval_batch(model, batch, criterion, config, *, device, keep=None, drop=0.0):
     """
-    One validation forward. An out-of-memory error skips the batch: under
-    ``no_grad`` checkpointing saves nothing, so there is nothing to retry with.
+    One validation forward, scored. An out-of-memory error skips the batch:
+    under ``no_grad`` checkpointing saves nothing, so there is nothing to retry
+    with.
     """
     try:
-        if keep is None:
-            loss, report, R = _forward(model, batch, criterion, config)
-        else:
-            loss, report, R = _forward(model, batch, criterion, config, keep=keep)
+        loss, report, R = _forward(model, batch, criterion, config, keep=keep, drop=drop)
     except Exception as error:                           # noqa: BLE001
         if not _is_oom(error):
             raise
@@ -1614,8 +1684,8 @@ def _new_tally() -> Dict:
         "steps": 0, "empty_steps": 0, "nonfinite_steps": 0, "grad_norm": 0.0,
         "repaired_faces": 0, "zero_normals": 0, "repaired": {},
         "dropped": {}, "failures": {},
-        "predictions": [], "targets": [], "categories": [],
-        "absolute_predictions": [], "absolute_targets": [],
+        "predictions": [], "targets": [], "categories": [], "reached": [],
+        "scored_position": [], "scored_normal": [], "scored_face": [],
     }
 
 
@@ -1672,23 +1742,26 @@ def _summarise_tally(tally: Dict, axis: Optional[str] = None) -> Dict:
         if tally["steps"]:
             summary["grad_norm"] = tally["grad_norm"] / tally["steps"]
     summary["dropped_names"] = sorted(tally["dropped"])[:20]
+    summary["dropped_reasons"] = dict(sorted(tally["dropped"].items())[:50])
     summary["most_repaired"] = sorted(tally["repaired"].items(),
                                       key=lambda kv: (-kv[1], kv[0]))[:3]
     summary["failures"] = dict(tally["failures"])
     if tally["predictions"]:
-        # The anchor protocol: the anchor-aligned prediction on every fragment
-        # that is not an anchor. Replaces the loss-side tilt/twist.
+        # The anchor protocol: the anchor-aligned matched rotation on every
+        # fragment that is not an anchor. Replaces the loss-side tilt/twist.
         predicted = torch.cat(tally["predictions"])
+        extra = {"reached": (torch.cat(tally["reached"]).double()
+                             if tally["reached"] else None)}
+        for name in ("position", "normal", "face"):
+            column = tally[f"scored_{name}"]
+            extra[name] = torch.cat(column) if column else None
         if len(predicted):
             summary.update(_metrics(predicted, torch.cat(tally["targets"]),
-                                    categories=tally["categories"], axis=axis))
+                                    categories=tally["categories"], axis=axis,
+                                    extra=extra))
+            if extra["reached"] is not None and len(extra["reached"]) == len(predicted):
+                summary["reached"] = float(extra["reached"].mean())
         summary["geodesic_fragments"] = len(predicted)
-    if tally["absolute_predictions"]:
-        from .nn.losses import geodesic_angle
-
-        angle = torch.rad2deg(geodesic_angle(torch.cat(tally["absolute_predictions"]),
-                                             torch.cat(tally["absolute_targets"])))
-        summary["absolute_geodesic_deg"] = float(angle.mean())
     return summary
 
 
@@ -1739,6 +1812,14 @@ def _count_outcome(tally, outcome, batch, names, vertices, detail, prefix,
         print(f"\n  {prefix}[oom] {label} batch {index} ({vertices:,} vertices) did "
               f"not fit even with gradient checkpointing; skipped. "
               f"--max_vertices_per_batch {int(vertices * 0.9)} skips these up front.")
+    elif outcome == "no-objective":
+        tally["skipped"] += 1
+        tally["dropped"][f"noclusters:{names}"] = (
+            f"{vertices:,} vertices, {batch.num_fragments} fragments, no coincident "
+            f"vertices to train on")
+        _note_batch_failure(tally, batch, "no coincident vertices")
+        print(f"\n  {prefix}[warn] {label} batch {index} ({names}) has no coincident "
+              f"vertices, so no embedding term to train on; left out of the step")
     elif outcome in ("nonfinite-loss", "nonfinite-grad"):
         what = "loss" if outcome == "nonfinite-loss" else "gradient"
         tally["nonfinite"] += 1
@@ -1756,22 +1837,32 @@ def _count_outcome(tally, outcome, batch, names, vertices, detail, prefix,
 # ==========================================================================
 
 _TERMS = ("rotation", "position", "normal", "face", "embedding")
+_SCORES = ("rotation", "position", "normal", "face")
 
 
 def format_losses(summary: Dict[str, float]) -> str:
-    """Every term, then the total -- one line, aligned."""
-    parts = [f"{name}={summary[name]:.4f}" for name in _TERMS if name in summary]
-    parts.append(f"TOTAL={summary.get('total', float('nan')):.4f}")
-    return "  ".join(parts)
+    """
+    The four geometric scores, when the batches were scored, then the trained
+    loss -- one line. The scores measure the matched rotations and are never
+    trained on; ``TOTAL`` is the loss the step descends, the embedding term
+    times its weight.
+    """
+    parts = []
+    scores = [f"{name}={summary[name]:.4f}" for name in _SCORES if name in summary]
+    if scores:
+        parts.append("scores: " + "  ".join(scores))
+    loss = [f"embedding={summary['embedding']:.4f}"] if "embedding" in summary else []
+    loss.append(f"TOTAL={summary.get('total', float('nan')):.4f}")
+    parts.append("loss: " + "  ".join(loss))
+    return "   ".join(parts)
 
 
 def format_metrics(summary: Dict[str, float]) -> str:
     """
-    The rotation metrics, under the anchor protocol: each scene's largest
-    fragment set to its true pose, the others scored (``nn/anchor.py``). The
-    model's own absolute error follows on the second line as ``absolute``.
-    Chance is the same 126.5 deg under both: a non-anchor fragment's error is
-    the angle between two independent rotations either way.
+    The rotation metrics of the matched rotations, under the anchor protocol:
+    each scene's largest fragment set to its true pose, the others scored
+    (``nn/anchor.py``). Chance is 126.5 deg: a fragment the matching does not
+    reach is left at a rotation unrelated to its true one.
     """
     if "geodesic_deg" not in summary:
         return ""
@@ -1779,23 +1870,18 @@ def format_metrics(summary: Dict[str, float]) -> str:
             f"(median {summary['geodesic_median_deg']:6.2f}, chance "
             f"{CHANCE['geodesic_deg']:.1f}, anchor = largest fragment)"
             f"  euler {summary['euler_rmse_deg']:6.2f}deg"
-            f"  acc@10 {summary['acc@10deg']:.3f}")
+            f"  acc@5 {summary['acc@5deg']:.3f}  acc@10 {summary['acc@10deg']:.3f}")
     if "match@1" in summary:
-        # The embedding head's only honest number. Its loss needs a per-batch
-        # reference to interpret, and the term it replaced could be driven to
-        # zero by a collapsed embedding; this cannot -- it is stage two's own
-        # retrieval, from ~0 at chance to 1.0.
+        # The embedding's own retrieval: its loss needs a per-batch reference
+        # to interpret, and this does not -- from ~0 at chance to 1.0.
         line += f"  match@1 {summary['match@1']:.3f}"
+    if "reached" in summary:
+        line += f"  reached {100 * summary['reached']:.0f}%"
     if "tilt_deg" in summary:
-        # The split that makes ~90 deg readable. Printed every epoch rather
-        # than only at the end, because which of the two regimes a run is in
-        # can change during training and the final number cannot show that.
+        # The split that makes ~90 deg readable: the axis found and the turn
+        # about it not, against neither.
         line += (f"\n        tilt {summary['tilt_deg']:6.2f}  "
                  f"twist {summary['twist_deg']:6.2f}")
-        if "head_cos" in summary:
-            line += f"  head|cos| {summary['head_cos']:.3f}"
-        if "absolute_geodesic_deg" in summary:
-            line += f"  absolute geo {summary['absolute_geodesic_deg']:6.2f}deg"
     return line
 
 
@@ -1808,23 +1894,20 @@ def check_initial_losses(summary: Dict[str, float]) -> List[str]:
     """
     complaints = []
     rotation_deg = summary.get("rotation_degrees")
-    # The band is wide on purpose, and the reason is the equivariance property.
-    # An untrained equivariant model does not sample the chance distribution: the
-    # perturbation cancels, so this number *is* the angle of the untrained frame
-    # on assembled fragments, which depends on the architecture. Measured over 12
-    # seeds on a 24-fragment batch: 132 +- 12 for the old six-layer schedule,
-    # 122 +- 15 for intra x5 + cross x3, 134 +- 14 with a trailing intra layer,
-    # spanning 92-154 overall. A band tight around 126.5 would therefore flag
-    # every architecture change as a defect.
+    # The band is wide on purpose. An untrained embedding matches next to
+    # nothing, so almost every scored fragment keeps a rotation unrelated to
+    # its true one -- a draw from chance, 126.5 deg on average -- but a scene
+    # holds a handful of fragments, and the odd spurious fit lands anywhere.
+    # (The band was set for the removed rotation head, whose untrained frames
+    # measured 92-154 deg over seeds and schedules.)
     #
-    # What this still catches is gross breakage -- a model that starts near 0 or
-    # near 180 cannot be measuring the angle it claims to. It was never what
-    # caught a transposed label: chance is chance in either direction, which is
-    # why `test_model.py` asserts the round trip directly instead.
+    # What this catches is gross breakage -- a pipeline that starts near 0 or
+    # near 180 cannot be measuring the angle it claims to: a near-0 start
+    # before any training means the truth is reaching the rotations.
     if rotation_deg is not None and not 85.0 < rotation_deg < 170.0:
         complaints.append(
             f"rotation starts at {rotation_deg:.1f} deg, which is too far from "
-            f"~{CHANCE['geodesic_deg']:.0f} to be an untrained frame"
+            f"~{CHANCE['geodesic_deg']:.0f} for rotations from an untrained embedding"
         )
     if "normal" in summary and not 0.75 < summary["normal"] < 1.3:
         complaints.append(f"normal starts at {summary['normal']:.3f}, expected ~1.0")
@@ -1992,17 +2075,6 @@ def _check_resume_compatible(config: Config, saved: Dict, announce: bool) -> Non
             print(f"[resume] architecture differs ({detail}) -- load will "
                   f"probably fail with a shape error")
 
-    trained_on = saved.get("rotation_target", LEGACY_ROTATION_TARGET)
-    if trained_on != config.rotation_target and announce:
-        # Allowed -- starting the anchor target from absolute-trained weights
-        # is a legitimate thing to try -- but the objective changes at this
-        # step, and the curve will show a step that is not the model's doing.
-        print(f"[resume] the rotation target changed: the checkpoint was "
-              f"trained on {trained_on!r}, this run trains on "
-              f"{config.rotation_target!r} (--rotation_target). The loss "
-              f"curve steps here; the metrics do not, they use the anchor "
-              f"protocol either way.")
-
     saved = {**_DATA_BEFORE_IT_EXISTED, **saved}
     changed = [(k, saved.get(k), current.get(k)) for k in _DATA
                if k in saved and _differs(saved[k], current[k])]
@@ -2165,10 +2237,7 @@ def build_model(config: Config):
 def build_criterion(config: Config):
     from .nn.losses import ReassemblyLoss
 
-    return ReassemblyLoss(
-        rotation=config.w_rotation, position=config.w_position,
-        normal=config.w_normal, face=config.w_face, embedding=config.w_embedding,
-    )
+    return ReassemblyLoss(embedding=config.w_embedding)
 
 
 def _seed_everything(seed: int) -> None:
@@ -2380,6 +2449,9 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
         device = "cpu"
 
     main = rank == 0
+    if not config.supervise_embedding:
+        raise ValueError("supervise_embedding=False leaves nothing to train: the embedding "
+                         "term is the only one, and it needs the coincidence clusters")
     _seed_everything(config.seed + rank)
     out_dir = Path(config.out_dir)
     if main:
@@ -2393,13 +2465,21 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
     scaler = torch.amp.GradScaler(device.split(":")[0]) if config.amp else None
 
     history: List[dict] = []
-    start_epoch, step, best, elapsed = 0, 0, float("inf"), 0.0
+    # best.pt holds the epoch with the highest validation acc@10 of the
+    # matched rotations (BEST_METRIC); -inf until one is measured.
+    start_epoch, step, best, elapsed = 0, 0, float("-inf"), 0.0
     offenders: Dict[str, Dict] = {}
     last_path, best_path = out_dir / "last.pt", out_dir / "best.pt"
     load_path = _resume_path(config, last_path)
 
     if config.resume and load_path is not None:
         state = torch.load(load_path, map_location=device, weights_only=False)
+        if _head_keys(state["model"]):
+            raise ValueError(
+                f"cannot resume from {load_path}: it was trained with the rotation head, "
+                f"which this version no longer has. Train from scratch in a fresh "
+                f"--checkpoint_dir (or --resume none); --evaluate and probe_val.py still "
+                f"read it, ignoring the head.")
         _check_resume_compatible(config, state.get("config", {}), main)
         model.load_state_dict(state["model"])
         if state.get("optimizer"):
@@ -2413,7 +2493,7 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
         start_epoch = state["epoch"] + (1 if completed else 0)
         step = state["step"] if completed else state.get("epoch_step", state["step"])
         history = state.get("history", [])
-        best = state.get("best", float("inf"))
+        best = state.get("best", float("-inf"))
         elapsed = float(state.get("elapsed", 0.0))
         offenders = dict(state.get("offenders") or {})
         _restore_rng(state, rank)
@@ -2423,12 +2503,12 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
             print(f"  epoch {start_epoch}, step {step}, "
                   f"{_hms(elapsed)} trained so far{partial}")
             if history:
-                print(f"  best val geodesic so far: {best:.3f} deg")
+                print(f"  best val {_BEST_NAME} so far: {best:.4f}")
         if _fragment_limit_changed(state.get("config") or {}, config):
             # A different limit is a different validation set: the best-so-far
             # was measured on other scenes, so comparing against it would keep
             # or discard best.pt for no reason.
-            best = float("inf")
+            best = float("-inf")
             if main:
                 print("[resume] --max_fragments changed: validation is a different "
                       "set of scenes, so the best-so-far is reset")
@@ -2542,8 +2622,9 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
         _report_dropped(train_summary, val_summary, repaired)
         _report_offenders(offenders, new_failures)
 
-        train_summary.pop("dropped_names", None)
-        val_summary.pop("dropped_names", None)
+        for summary in (train_summary, val_summary):
+            summary.pop("dropped_names", None)
+            summary.pop("dropped_reasons", None)
         row = {"epoch": epoch, "step": step,
                # An epoch cut short by a signal is recorded, because its
                # metrics are real measurements -- but flagged: in training the
@@ -2571,9 +2652,14 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
         # after, so last.pt carried the previous best; a run resumed from it
         # then took the next epoch as a "new best" even when it was worse, and
         # overwrote best.pt with it.
-        score = val_summary.get("geodesic_deg", val_summary["total"])
+        #
+        # The share of validation fragments the matched rotations put within
+        # 10 deg, higher is better: the method's own success rate, which a
+        # few unreachable fragments at ~126 deg cannot swing the way they
+        # swing a mean.
+        score = val_summary.get(BEST_METRIC, float("-inf"))
         # A validation cut short scored part of the split: not a best.
-        improved = score < best and not val_stopped
+        improved = score > best and not val_stopped
         if improved:
             best = score
         if (stopped or val_stopped or out_of_time or (epoch + 1) % config.save_every == 0
@@ -2584,7 +2670,7 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
                             history, best, scaler, completed=not stopped,
                             elapsed=elapsed + (time.time() - session_started),
                             epoch_step=epoch_step, offenders=offenders)
-            print(f"  new best: {best:.3f} deg -> {best_path.name}")
+            print(f"  new best: val {_BEST_NAME} {best:.4f} -> {best_path.name}")
         report = _time_report(history, config, elapsed + (time.time() - session_started),
                               start_epoch, steps_per_epoch=per_epoch)
         if report:
@@ -2592,7 +2678,7 @@ def _worker(rank: int, world: int, config: Config, hub=None) -> List[dict]:
         if hub is not None and hub.enabled:
             # After this epoch's files are written, before the stop decision,
             # so the last epoch of a session is mirrored too.
-            hub.push(f"epoch {epoch + 1}: val geodesic {score:.3f}")
+            hub.push(f"epoch {epoch + 1}: val {_BEST_NAME} {score:.4f}")
         if stopped or val_stopped or out_of_time:
             break
 
@@ -2782,10 +2868,11 @@ def _banner(config, train_set, val_set, parameters, device, world, per_epoch) ->
         f"  tokens        {config.tokens_per_scene}/scene, {config.token_mode}"
         f" by {config.token_metric} distance",
         f"  precision     {'AMP' if config.amp else 'fp32'}",
-        f"  target        {config.rotation_target}"
-        + ("  (each fragment relative to its scene's largest, set to its true pose)"
-           if config.rotation_target == "anchor" else
-           "  (each fragment's own stored frame; metrics still use the anchor)"),
+        "  loss          the embedding term alone; the rotations come from its matches",
+        "                (stage two), scored with rotation/position/normal/face on "
+        + ("every batch" if config.score_train else
+           "validation\n                (--score_train True adds the training batches)"),
+        f"  best.pt       the epoch with the highest val {_BEST_NAME}",
         (f"  lr            {config.lr:.2e} -> {config.lr * config.min_lr_fraction:.2e}"
          if config.lr_schedule == "cosine" else f"  lr            {config.lr:.2e}")
         + f"  ({config.lr_schedule}, warmup {config.warmup_fraction * config.epochs:g}"
@@ -2797,7 +2884,7 @@ def _banner(config, train_set, val_set, parameters, device, world, per_epoch) ->
         f"collapsing to identity scores the same",
         f"    axis only     {CHANCE['axis_only_deg']:.1f} deg   <- axis right, rotation about it not"
         f"  (tilt/twist tells them apart)",
-        f"    normal/face   {CHANCE['normal']:.1f} / {CHANCE['face']:.1f} at initialisation",
+        f"    normal/face   {CHANCE['normal']:.1f} / {CHANCE['face']:.1f} for a random rotation",
         "=" * 74,
     ]
     return "\n".join(lines)
@@ -2808,37 +2895,25 @@ def _final_report(history: List[dict]) -> None:
     Refuse to imply a conclusion the run did not earn.
 
     Two preconditions are checked because both invalidate a result while
-    leaving it looking perfectly reportable: a run still descending at its
+    leaving it looking perfectly reportable: a run still improving at its
     cutoff gives a lower bound on progress rather than a ceiling, and a
     validation error at chance is not a small number that needs more epochs.
     """
     last = history[-1]
-    best = min(h.get("val_geodesic_deg", float("inf")) for h in history)
+    key = f"val_{BEST_METRIC}"
+    scored = [h for h in history if h.get(key) is not None]
     print("\n" + "=" * 74)
-    print(f"finished {len(history)} epoch(s).  best val geodesic {best:.3f} deg"
-          f"  (chance {CHANCE['geodesic_deg']:.1f}; largest fragment as anchor)")
-    if best > CHANCE["geodesic_deg"] - 5:
-        print("  [verdict] at chance -- the model has not learned rotation. Do not")
-        print("            report this as a small error; check the data and the")
-        print("            loss conventions before tuning anything.")
-    elif abs(best - CHANCE["axis_only_deg"]) < 5:
-        tilt = last.get("val_tilt_deg")
-        twist = last.get("val_twist_deg")
-        print("  [verdict] parked near the axis-only landmark. Read tilt/twist"
-              " before concluding anything:")
-        if tilt is not None and twist is not None:
-            print(f"            tilt {tilt:.1f} deg, twist {twist:.1f} deg.")
-            if tilt < 20 and twist > 70:
-                print("            The axis IS being recovered and the rotation about it")
-                print("            is not. That is a real finding about this geometry --")
-                print("            but it is not a hard floor: a fragment's fracture")
-                print("            boundary is unique even when the whole object is a")
-                print("            surface of revolution, so the information is there.")
-            elif tilt > 70:
-                print("            The axis is not being recovered either, so this is an")
-                print("            optimisation problem rather than a symmetry one.")
-        else:
-            print("            (tilt/twist not recorded for this run)")
+    if scored:
+        top = max(scored, key=lambda h: h[key])
+        print(f"finished {len(history)} epoch(s).  best val {_BEST_NAME} {top[key]:.4f} at "
+              f"epoch {top['epoch'] + 1} (geodesic {top.get('val_geodesic_deg', float('nan')):.2f}"
+              f" deg; chance {CHANCE['geodesic_deg']:.1f}; largest fragment as anchor)")
+        if top.get("val_geodesic_deg", 0.0) > CHANCE["geodesic_deg"] - 5:
+            print("  [verdict] at chance -- the matching has not found the rotations. Do")
+            print("            not report this as a small error; check match@1 and the")
+            print("            share reached before tuning anything.")
+    else:
+        print(f"finished {len(history)} epoch(s); validation measured no rotation")
     tail = [h.get("val_geodesic_deg") for h in history[-max(len(history) // 4, 2):]]
     tail = [t for t in tail if t is not None]
     if len(tail) >= 2 and tail[0] - tail[-1] > 0.5:
@@ -2849,38 +2924,48 @@ def _final_report(history: List[dict]) -> None:
     print("=" * 74)
 
 
+EVALUATION_SPLITS = ("train", "val", "test", "all")
+"""What ``--evaluate --split`` takes: one of the three splits, or ``all`` --
+every object of the chosen subsets whatever its split, for subsets the
+checkpoint was not trained on."""
+
+
 def evaluate(config: Config, checkpoint: str = "best.pt",
              split: str = "test", assemble: bool = True,
              collision: bool = False,
              data_from_checkpoint: bool = True,
              override: Sequence[str] = (),
-             rotations: str = "network",
              placement: Optional[str] = None,
-             jitter: float = 0.0, drop: float = 0.0) -> Dict[str, float]:
+             jitter: float = 0.0, drop: float = 0.0,
+             predictions: Optional[str] = None) -> Dict[str, float]:
     """
-    Score a saved checkpoint on a held-out split: rotation, and -- with
+    Score a saved checkpoint on a held-out split: the rotations stage two fits
+    from its embedding matches, their four geometric scores, and -- with
     ``assemble`` -- the full assembly the benchmark scores.
 
-    ``assemble`` runs the translation solver on the predicted rotations
-    (:mod:`reassembly.assembly`) and reports translation RMSE, Chamfer distance
-    and part accuracy in world units, averaged per scene then over scenes as
-    the benchmark does. Without it, only rotation is reported -- and said to be,
-    rather than the other numbers being silently absent.
+    ``split`` is ``"train"``, ``"val"``, ``"test"``, or ``"all"``: every
+    object of the chosen subsets whatever its split, for scoring a checkpoint
+    on subsets it was not trained on. The report says how many of the objects
+    scored are shapes the checkpoint was trained on: a volume-constrained copy
+    holds the same shapes as its base subset, broken differently.
 
-    ``rotations="matched"`` replaces the rotation head's rotations with ones
-    fitted from the embedding matches and chained from the anchor
-    (:mod:`reassembly.assembly.rotation`), reports their error over the same
-    scored fragments as the head's, and assembles with them. A fragment the
-    chain cannot reach keeps the head's rotation, and the share reached is
-    printed. Not comparable with tables built on independently sampled points:
-    see that module's docstring.
+    The rotations are fitted from the embedding matches and chained from each
+    scene's largest fragment (:func:`reassembly.assembly.rotation.match_batch`),
+    which the anchor protocol sets to its true pose (``nn/anchor.py``); the
+    report gives their error, accuracy, the share the chain reached and the
+    four scores -- rotation, position, normal, face -- overall and by category.
+    ``assemble`` places the turned fragments and reports translation RMSE,
+    Chamfer distance and part accuracy in world units, averaged per scene then
+    over scenes as the benchmark does. Without it, only the rotations are
+    reported -- and said to be, rather than the other numbers being silently
+    absent. Breaking Bad's fragments share their break vertices, so correct
+    matches line up exactly: not comparable with tables built on independently
+    sampled points without saying so (``jitter`` and ``drop`` take that away).
 
-    ``placement`` picks how the fragments are placed once turned: ``"global"``,
-    one least-squares solve over every embedding match (the only placement
-    before v7, and the default for the head's rotations), or ``"checked"``,
-    from the pair fits the chain agrees with, the anchor held
-    (:mod:`reassembly.assembly.placement`; matched rotations only, and their
-    default). ``None`` is the default for ``rotations``.
+    ``placement`` picks how the fragments are placed once turned:
+    ``"checked"`` (the default), from the pair fits the chain agrees with, the
+    anchor held (:mod:`reassembly.assembly.placement`), or ``"global"``, one
+    least-squares solve over every embedding match (v6's placement).
 
     ``jitter`` and ``drop`` take Breaking Bad's shared break vertices away
     (:mod:`reassembly.evaluation.noise`): Gaussian noise of ``jitter``
@@ -2890,36 +2975,47 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     inputs'; the assembly scores apply the predicted poses to the clean
     fragments. The draws are tied to each scene and ``config.seed``.
 
+    ``predictions``, a folder: every scored scene's prediction is written too,
+    in ``scripts/dump_prediction.py``'s format, into one zip there --
+    ``<folder>/<subsets>-<split>.zip`` holding
+    ``<folder name>/<subset>/<category>/<object>/<mode>.npz``, the data
+    directory's own layout as the Visualizer's predictions folder has it, and
+    ``<folder name>/<subsets>-<split>.csv``, one row per scene. Each scene's
+    meshes are rebuilt to be written, which adds to the evaluation's time.
+    Needs ``assemble``.
+
     The model, and by default the DATA definition, come from the checkpoint's
     own config: a model is scored on the split, labels, tokens and
     normalisation it was trained with, whatever the flags say, and every
     setting that differed is printed. ``data_from_checkpoint=False`` keeps the
-    flags' data settings (to score a fracture-split model on the object split,
-    say); the architecture is always the checkpoint's. ``override`` names data
-    settings whose flag value wins even so -- ``("max_fragments",)`` scores any
-    checkpoint on the benchmark's 2-20 pieces.
+    flags' data settings (to score on another subset, say); the architecture
+    is always the checkpoint's. ``override`` names data settings whose flag
+    value wins even so -- ``("max_fragments",)`` scores any checkpoint on the
+    benchmark's 2-20 pieces.
 
     Single-device on purpose: an evaluation that shards across GPUs has to
     gather predictions to be correct, and getting that subtly wrong produces a
     plausible number.
 
-    Writes two files to ``config.out_dir``: ``<split>_metrics.json`` (with
-    ``rotations="matched"``, ``<split>_metrics_matched.json``) -- the summary,
-    and with ``assemble`` one record per scene holding the per-fragment
-    numbers figures need (``scripts/make_figures.py``) -- and the printed
-    report as ``<split>_report.txt`` / ``<split>_report_matched.txt``. A
-    placement other than the default for the rotations adds its name:
-    ``<split>_metrics_matched_global.json``, and noise its settings:
-    ``<split>_metrics_matched_jitter0.01_drop0.5.json``.
+    Writes two files to ``config.out_dir``: ``<split>_metrics.json`` -- the
+    summary, and with ``assemble`` one record per scene holding the
+    per-fragment numbers figures need (``scripts/make_figures.py``) -- and the
+    printed report as ``<split>_report.txt``. ``placement="global"`` adds
+    ``_global`` to both names, and noise its settings:
+    ``<split>_metrics_jitter0.01_drop0.5.json``.
     """
     import torch
 
-    from .assembly import check_placement, default_placement, mean_over_scenes, score_batch
+    from .assembly import check_placement, mean_over_scenes, score_batch
     from .evaluation.noise import check_noise, jitter_inputs, noise_suffix
 
-    placement = check_placement(rotations, placement)
+    if split not in EVALUATION_SPLITS:
+        raise ValueError(f"split must be one of {EVALUATION_SPLITS}, got {split!r}")
+    placement = check_placement(placement)
     check_noise(jitter, drop)
-    matched = rotations == "matched"
+    if predictions and not assemble:
+        raise ValueError("predictions are placed scenes: they need the assembly, so not "
+                         "with --no_assemble")
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model, config, state, path = load_checkpoint(
         checkpoint, config, device, data_from_checkpoint=data_from_checkpoint,
@@ -2929,28 +3025,42 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     loader = _loader(dataset, config, False, 0, 1, 0,
                      pairs_in_worker=not device.startswith("cuda"))
     scenes: List[Dict] = []
+    suffix = ("" if placement == "checked" else f"_{placement}") + noise_suffix(jitter, drop)
+    writer = None
+    if predictions:
+        subsets = "+".join(config.subsets) if config.subsets else "all-subsets"
+        writer = _PredictionWriter(Path(predictions), f"{subsets}-{split}{suffix}", dataset,
+                                   axis=config.symmetry_axis, checkpoint=path.name,
+                                   epoch=int(state.get("epoch", -1)), placement=placement)
 
-    def collect(batch, prediction, shown=None) -> None:
-        scores = score_batch(batch, prediction, collision=collision, rotations=rotations,
-                             seed=config.seed, placement=placement, observed=shown,
-                             drop=drop)
+    def collect(batch, prediction, shown=None, matched=None) -> None:
+        scores = score_batch(batch, prediction, collision=collision, seed=config.seed,
+                             placement=placement, observed=shown, drop=drop, matched=matched)
+        if writer is not None:
+            writer.add(batch, scores)
         for key, category, score in zip(batch.scene_keys, batch.categories, scores):
             score["_scene"], score["_category"] = key, category
             scenes.append(score)
 
-    # The matched rotations are built by the scorer, so it runs for them even
-    # under --no_assemble; only the assembly report is then left out.
     # With --jitter the model is shown a noisy copy; the scorer gets both.
     noisy = (lambda batch: jitter_inputs(batch, jitter, config.seed)) if jitter else None
-    summary, _, _ = run_epoch(model, loader, build_criterion(config), config,
-                              device=device, label=split,
-                              on_prediction=collect if (assemble or matched) else None,
-                              inputs=noisy)
+    try:
+        summary, _, _ = run_epoch(model, loader, build_criterion(config), config,
+                                  device=device, label=split,
+                                  on_prediction=collect if assemble else None,
+                                  inputs=noisy, drop=drop)
+    except BaseException:
+        if writer is not None:
+            writer.abandon()
+        raise
 
     summary.pop("failures", None)
     summary.pop("most_repaired", None)
     summary["max_fragments"] = config.max_fragments
-    summary["rotations"] = rotations
+    # Read back by viz/results.py: every rotation here was fitted from the
+    # matches, and there is no head to compare with.
+    summary["rotations"] = "matched"
+    summary["rotation_head"] = False
     summary["placement"] = placement
     if jitter or drop:
         summary["noise"] = {"jitter": jitter, "drop": drop}
@@ -2961,10 +3071,11 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
         "epoch": state["epoch"] + 1,
         "subsets": list(config.subsets) if config.subsets else None,
         "fragment_line": _fragment_line(config, dataset),
-        "rotation_target": config.rotation_target,
+        "objects": len(dataset.catalog.objects),
+        "trained_shapes": _trained_shapes(dataset, state.get("config") or {}, config),
     }
-    if matched:
-        summary["matched"] = _matched_summary(scenes)
+    if writer is not None:
+        summary["evaluation"]["predictions"] = writer.close()
     if assemble:
         public = [{k: v for k, v in scene.items() if not k.startswith("_")}
                   for scene in scenes]
@@ -2977,14 +3088,9 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
         summary["assembly_by_category"] = by_category
         summary["assembly_scenes"] = [dict(scene) for scene in scenes]
 
-    # One pair of files per rotation source, so scoring both ways keeps both:
-    # the metrics, and the report exactly as printed -- a few kilobytes to
+    # The metrics, and the report exactly as printed -- a few kilobytes to
     # share, where the metrics of a full split run to tens of megabytes. The
     # metrics first: they are what the evaluation cost.
-    suffix = "_matched" if matched else ""
-    if placement != default_placement(rotations):
-        suffix += f"_{placement}"
-    suffix += noise_suffix(jitter, drop)
     out_dir = Path(config.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{split}_metrics{suffix}.json").write_text(dump_metrics(summary),
@@ -2995,15 +3101,106 @@ def evaluate(config: Config, checkpoint: str = "best.pt",
     return summary
 
 
+class _PredictionWriter:
+    """
+    Every scored scene of one evaluation as a dump (``assembly/dump.py``),
+    written straight into one zip -- ``evaluate``'s ``predictions``.
+
+    Straight into the zip, stored rather than compressed again (each ``.npz``
+    is compressed already), so the predictions never take their room twice:
+    a whole volume-constrained subset is gigabytes. It is written as
+    ``<name>.zip.part`` and renamed when complete, so a zip under its own name
+    is never a partial one.
+    """
+
+    def __init__(self, folder: Path, name: str, dataset, *, axis: str, checkpoint: str,
+                 epoch: int, placement: str):
+        import zipfile
+
+        self.folder = Path(folder)
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.name = name
+        self.path = self.folder / f"{name}.zip"
+        self.partial = self.folder / f"{name}.zip.part"
+        self.root = self.folder.name or "predictions"
+        self.dataset = dataset
+        self.index = {dataset.key(i): i for i in range(len(dataset))}
+        self.axis, self.checkpoint, self.epoch, self.placement = axis, checkpoint, epoch, placement
+        self.rows: List[Dict] = []
+        self.skipped: List[str] = []
+        self.archive = zipfile.ZipFile(self.partial, "w", compression=zipfile.ZIP_STORED,
+                                       allowZip64=True)
+
+    def add(self, batch, scores) -> None:
+        from .assembly.dump import dump_arrays, dump_bytes
+
+        fragment_ptr = batch.fragment_ptr.tolist()
+        for scene, (key, score) in enumerate(zip(batch.scene_keys, scores)):
+            index = self.index.get(key)
+            meshes = self.dataset.meshes(index) if index is not None else []
+            f0, f1 = fragment_ptr[scene], fragment_ptr[scene + 1]
+            if len(meshes) != f1 - f0:
+                self.skipped.append(key)
+                continue
+            arrays = dump_arrays(meshes, score, batch.target_rotation[f0:f1], axis=self.axis,
+                                 key=key, checkpoint=self.checkpoint, epoch=self.epoch,
+                                 seed=-1, placement=self.placement)
+            location = f"{self.dataset.location(index)}.npz"
+            self.archive.writestr(f"{self.root}/{location}", dump_bytes(arrays))
+            angles = score.get("_scored_geodesic_deg") or []
+            self.rows.append({
+                "file": location, "scene": key,
+                "category": self.dataset.catalog.objects[self.dataset.items[index][0]].category
+                or "(uncategorised)",
+                "fragments": int(score["fragments"]),
+                "reached": score.get("matched_share"),
+                "geodesic_deg": score.get("geodesic_deg"),
+                "geodesic_median_deg": float(np.median(angles)) if angles else float("nan"),
+                "part_accuracy": score.get("part_accuracy"),
+                "rmse_t": score.get("rmse_t"), "chamfer": score.get("chamfer"),
+                "matches": score.get("matches"),
+            })
+
+    def close(self) -> Dict:
+        """Finish the zip with its index; what was written, for the summary."""
+        import csv
+        import io
+
+        text = io.StringIO()
+        columns = ["file", "scene", "category", "fragments", "reached", "geodesic_deg",
+                   "geodesic_median_deg", "part_accuracy", "rmse_t", "chamfer", "matches"]
+        writer = csv.DictWriter(text, fieldnames=columns)
+        writer.writeheader()
+        for row in self.rows:
+            writer.writerow({k: (f"{v:.6g}" if isinstance(v, float) else v)
+                             for k, v in row.items()})
+        self.archive.writestr(f"{self.root}/{self.name}.csv", text.getvalue())
+        self.archive.close()
+        self.partial.replace(self.path)
+        if self.skipped:
+            print(f"[predictions] {len(self.skipped)} scene(s) not written -- their meshes "
+                  f"did not rebuild as scored: {', '.join(self.skipped[:3])}")
+        print(f"[predictions] {len(self.rows)} scene(s) in {self.path} "
+              f"({self.path.stat().st_size / 1e9:.2f} GB)")
+        return {"zip": str(self.path), "scenes": len(self.rows), "skipped": self.skipped}
+
+    def abandon(self) -> None:
+        """Close a zip that will not be finished; the ``.part`` file stays."""
+        try:
+            self.archive.close()
+        except Exception:                                  # noqa: BLE001
+            pass
+
+
 def format_evaluation(summary: Dict) -> str:
     """
     The report ``--evaluate`` prints, built from its summary alone.
 
     So the ``<split>_metrics*.json`` an evaluation writes reproduces its report
     (``scripts/report_metrics.py``), and the text written beside it as
-    ``<split>_report*.txt`` is the text that was printed. A file from before
-    the header fields were saved (``summary["evaluation"]``) gives every number
-    but not the checkpoint and fragment lines.
+    ``<split>_report*.txt`` is the text that was printed. A file written before
+    v7 removed the rotation head (no ``rotation_head`` key) still reads: its
+    four terms are then the head's losses, which the first line says.
     """
     info = summary.get("evaluation") or {}
     detail = []
@@ -3014,55 +3211,108 @@ def format_evaluation(summary: Dict) -> str:
     if "checkpoint" in info:
         detail.append(f"checkpoint {info['checkpoint']} from epoch {info.get('epoch', '?')}")
     lines = [info.get("split", "evaluation") + (f" ({', '.join(detail)})" if detail else "")]
+    if info.get("subsets"):
+        lines.append(f"  subsets: {', '.join(info['subsets'])}")
     if info.get("fragment_line"):
         lines.append(info["fragment_line"])
+    if "objects" in info:
+        trained = info.get("trained_shapes")
+        line = f"  objects: {info['objects']}"
+        if trained:
+            line += (f", {trained} of them shapes the checkpoint was trained on (seen in "
+                     f"other break patterns)")
+        elif trained is not None:
+            line += ", none of them a shape the checkpoint was trained on"
+        lines.append(line)
+    if summary.get("dropped"):
+        reasons = summary.get("dropped_reasons") or {}
+        shown = "; ".join(f"{key} ({why})" for key, why in list(reasons.items())[:4])
+        more = summary["dropped"] - min(len(reasons), 4)
+        lines.append(f"  not scored: {summary['dropped']} scene(s) or batch(es)"
+                     + (f" -- {shown}" if shown else "") + (f"; +{more} more" if more > 0 else ""))
     if summary.get("noise"):
         lines.append(_noise_line(summary["noise"]))
-    if info.get("rotation_target"):
-        lines.append(f"  loss on the {info['rotation_target']!r} target, the one this "
-                     f"checkpoint was trained on:")
+    if summary.get("rotation_head", True):
+        lines.append("  (written before v7 removed the rotation head: the four terms below "
+                     "were its losses)")
     else:
-        lines.append("  loss:")
+        lines.append("  rotations: fitted from the embedding matches and chained from each "
+                     "scene's largest fragment,\n  which is set to its true pose "
+                     "(assembly/rotation.py, nn/anchor.py); the four scores measure them and\n"
+                     "  are never trained on")
     lines.append(f"  {format_losses(summary)}")
     lines.append(f"  {format_metrics(summary)}")
-    if "geodesic_deg" in summary and "absolute_geodesic_deg" in summary:
-        # The re-score in two rows: the same predictions, read in the frame the
-        # objects are stored in, and with each scene's largest fragment set to
-        # its true pose (`nn/anchor.py`). Chance is 126.5 deg for both.
-        lines.append(f"  rotation error, mean geodesic (chance {CHANCE['geodesic_deg']:.1f} deg):")
-        lines.append(f"    absolute  {summary['absolute_geodesic_deg']:7.2f} deg   every "
-                     f"fragment, in its object's stored frame ({summary['fragments']} fragments)")
-        lines.append(f"    anchor    {summary['geodesic_deg']:7.2f} deg   largest fragment set "
-                     f"to its true pose, the others scored "
-                     f"({summary.get('geodesic_fragments', 0)} fragments)")
     breakdown = summary.get("by_category")
     if breakdown:
-        from .evaluation.metrics import format_group_table
-
-        lines.append(format_group_table(
-            {name: (values["geodesic_deg"], values["fragments"])
-             for name, values in breakdown.items()},
-            "geodesic error by category"))
-        lines.append("  A large spread means the headline mean is partly a statement "
-                     "about which\n  categories are numerous. Symmetric categories "
-                     "scoring worse than asymmetric\n  ones is evidence for the "
-                     "azimuth-ambiguity reading; check tilt/twist to confirm.")
+        lines += _category_lines(breakdown, summary)
     lines.append(f"  geodesic is the primary number; Euler RMSE (residual convention, "
                  f"chance {CHANCE['euler_rmse_deg']:.1f} deg)\n  is for comparability "
                  f"with GARF's tables. Compare against the VANILLA Everyday "
                  f"supplementary\n  table -- SE(3)-Equiv 79.30 deg, GARF-mini 10.41 deg "
                  f"-- not the headline row.")
-    if "matched" in summary:
-        lines += _matched_lines(summary["matched"], summary)
+    if not summary.get("rotation_head", True):
+        if (summary.get("noise") or {}).get("jitter"):
+            lines.append("  The inputs were jittered, so the two sides of a break no longer "
+                         "share their vertices.")
+        else:
+            lines.append("  Breaking Bad's fragments share their break vertices, so correct "
+                         "matches line up exactly:\n  not comparable with tables built on "
+                         "independently sampled points without saying so.")
     if "assembly" in summary:
         lines += _assembly_lines(summary["assembly"], summary.get("assembly_by_category") or {},
                                  len(summary.get("assembly_scenes") or []),
-                                 rotations=summary.get("rotations", "network"),
                                  placement=summary.get("placement"))
     else:
         lines.append("  (rotation only: --no_assemble skipped the translation solver, so "
                      "there is no RMSE(T), Chamfer or part accuracy)")
+    predictions = info.get("predictions")
+    if predictions:
+        lines.append(f"\n  predictions: {predictions['scenes']} scene(s) in {predictions['zip']}")
     return "\n".join(lines)
+
+
+_CATEGORY_COLUMNS = (
+    ("fragments", "frags", "{:>7d}", 7),
+    ("geodesic_deg", "mean", "{:>8.2f}", 8),
+    ("geodesic_median_deg", "median", "{:>8.2f}", 8),
+    ("acc@5deg", "acc@5", "{:>7.3f}", 7),
+    ("acc@10deg", "acc@10", "{:>7.3f}", 7),
+    ("acc@30deg", "acc@30", "{:>7.3f}", 7),
+    ("reached", "reached", "{:>8.0%}", 8),
+    ("position", "position", "{:>9.4f}", 9),
+    ("normal", "normal", "{:>8.4f}", 8),
+    ("face", "face", "{:>7.4f}", 7),
+)
+
+
+def _category_lines(breakdown: Dict[str, Dict], summary: Dict) -> List[str]:
+    """
+    The rotations by category, worst mean first, and every scored fragment as
+    the last row: error in degrees, accuracy, the share the chain reached and
+    the three scores beside the rotation's (the per-fragment means). A file
+    from before these columns existed has the mean and count only.
+    """
+    columns = [c for c in _CATEGORY_COLUMNS
+               if any(c[0] in row for row in breakdown.values())]
+    width = max([len("category")] + [len(name) for name in breakdown] + [len("all")])
+    head = "".join(f"{label:>{size}}" for _, label, _, size in columns)
+    lines = ["  by category (scored fragments; degrees, and the scores' per-fragment means):",
+             f"    {'category':<{width}}{head}"]
+    total = dict(summary, fragments=summary.get("geodesic_fragments"))
+    for name, row in list(sorted(breakdown.items(),
+                                 key=lambda kv: -kv[1].get("geodesic_deg", 0.0))) + [("all", total)]:
+        cells = []
+        for key, _, fmt, size in columns:
+            value = row.get(key)
+            if value is None or (isinstance(value, float) and value != value):
+                cells.append(f"{'-':>{size}}")
+            else:
+                cells.append(fmt.format(int(value) if key == "fragments" else value))
+        lines.append(f"    {name:<{width}}" + "".join(cells))
+    if len(breakdown) > 1:
+        lines.append("  A large spread means the headline mean is partly a statement about "
+                     "which categories are numerous.")
+    return lines
 
 
 def dump_metrics(summary: Dict) -> str:
@@ -3113,7 +3363,16 @@ def load_checkpoint(checkpoint, config: Optional[Config] = None, device="cpu",
     config = _adopt_checkpoint_settings(config, state.get("config") or {},
                                         data=data_from_checkpoint, override=override)
     model = build_model(config).to(device)
-    model.load_state_dict(state["model"])
+    weights = state["model"]
+    head = _head_keys(weights)
+    if head:
+        # A checkpoint from before v7 removed the head: the backbone and the
+        # embedding are all this version uses, so the head is left behind.
+        print(f"[checkpoint] {path.name} carries the rotation head this version removed "
+              f"({len(head)} tensors); it is not loaded -- the rotations come from the "
+              f"embedding matches")
+        weights = {key: value for key, value in weights.items() if key not in head}
+    model.load_state_dict(weights)
     model.eval()
     return model, config, state, path
 
@@ -3146,11 +3405,12 @@ def find_scene(config: Config, key: str, splits=("train", "val", "test")):
 
 
 def _adopt_checkpoint_settings(config: Config, stored: Dict, data: bool,
-                               override: Sequence[str] = ()) -> Config:
+                               override: Sequence[str] = (), quiet: bool = False) -> Config:
     """
     The checkpoint's architecture (always) and data definition (by default,
     except the data settings named in ``override``), with every change
-    announced.
+    announced -- unless ``quiet``, for reading the settings back without using
+    them.
     """
     import dataclasses
 
@@ -3158,20 +3418,47 @@ def _adopt_checkpoint_settings(config: Config, stored: Dict, data: bool,
     keys = _ARCHITECTURE + (tuple(k for k in _DATA if k not in override) if data else ())
     changes = {key: stored[key] for key in keys
                if key in stored and key in names and _differs(stored[key], getattr(config, key))}
-    # The loss is reported on the target the model was trained on, so the
-    # numbers match its own training log; the metrics use the anchor protocol
-    # whatever this is. A checkpoint from before the setting existed was
-    # trained on the absolute target.
-    if stored:
-        trained_on = stored.get("rotation_target", LEGACY_ROTATION_TARGET)
-        if trained_on != config.rotation_target:
-            changes["rotation_target"] = trained_on
     for key, value in changes.items():
-        print(f"[checkpoint] using the checkpoint's {flag(key)} {value!r} "
-              f"(the flags said {getattr(config, key)!r})")
+        if not quiet:
+            print(f"[checkpoint] using the checkpoint's {flag(key)} {value!r} "
+                  f"(the flags said {getattr(config, key)!r})")
     if "schedule" in changes:
         changes["schedule"] = tuple(changes["schedule"])
     return dataclasses.replace(config, **changes) if changes else config
+
+
+def _trained_shapes(dataset, stored: Dict, config: Config) -> Optional[int]:
+    """
+    How many of ``dataset``'s objects are shapes the checkpoint was trained on:
+    of a subset it trained on -- a ``volume_constrained-*`` copy holds the same
+    shapes as its base subset -- and in its training split under its own split
+    settings (``max_objects`` aside). Matched the way the splits themselves
+    match objects: by split-list key, or, under the hash fallback, by the
+    shape's key in its base subset. ``None`` for a checkpoint that stores no
+    config.
+    """
+    import dataclasses
+
+    from .data.catalog import Catalog, split_catalog
+    from .data.paths import assign_split, base_subset
+
+    if not stored:
+        return None
+    trained = _adopt_checkpoint_settings(config, stored, data=True, quiet=True)
+    if stored.get("split_source") in ("auto", "official", "hash"):
+        trained = dataclasses.replace(trained, split_source=stored["split_source"])
+    bases = {base_subset(s) for s in trained.subsets} if trained.subsets else None
+    shapes = tuple(entry for entry in dataset.catalog.objects
+                   if bases is None or entry.subset in bases)
+    official = _official_lists(trained)
+    if trained.split_by == "fracture" and (trained.fracture_pool == "all" or not official):
+        return len(shapes)            # every shape, with other break patterns
+    if official:
+        return len(split_catalog(Catalog(shapes), "train", split_by="object",
+                                 official=official).objects)
+    return sum(assign_split("/".join((entry.subset, *entry.split_key)),
+                            trained.val_frac, trained.test_frac, trained.split_seed) == "train"
+               for entry in shapes)
 
 
 def _fragment_line(config: Config, dataset) -> str:
@@ -3181,60 +3468,6 @@ def _fragment_line(config: Config, dataset) -> str:
                 f"(--max_fragments 20 for the benchmark's 2-20)")
     return (f"  fragments: {MIN_FRAGMENTS}-{config.max_fragments} per scene, keeping "
             f"{dataset.fragment_limit.describe()}")
-
-
-def _matched_summary(scenes: List[Dict]) -> Dict[str, float]:
-    """
-    The matched rotations' error over the same scored fragments as the head's
-    (fragment-weighted, as ``geodesic_deg`` is); ``{}`` when none was scored.
-    """
-    import torch
-
-    angles = torch.tensor([a for scene in scenes for a in scene.get("_scored_geodesic_deg", [])],
-                          dtype=torch.float64)
-    # Scored = every fragment but the anchor (`_anchor` is -1 without one).
-    reached = [bool(r) for scene in scenes
-               for index, r in enumerate(scene.get("_reached", []))
-               if index != scene.get("_anchor", -1)]
-    if not angles.numel():
-        return {}
-    out = {
-        "geodesic_deg": float(angles.mean()),
-        "geodesic_median_deg": float(angles.median()),
-        "reached": sum(reached) / max(len(reached), 1),
-        "fragments": int(angles.numel()),
-    }
-    for threshold in (5.0, 10.0, 30.0):
-        out[f"acc@{threshold:g}deg"] = float((angles < threshold).double().mean())
-    return out
-
-
-def _matched_lines(matched: Dict[str, float], summary: Dict) -> List[str]:
-    """The matched rotations beside the head's, for the report."""
-    if not matched:
-        return ["", "  rotations from the embedding matches: no fragment could be scored"]
-    lines = ["", "  rotations from the embedding matches (--rotations matched, "
-                 "assembly/rotation.py), same fragments:",
-             f"    matched   {matched['geodesic_deg']:7.2f} deg   median "
-             f"{matched['geodesic_median_deg']:6.2f}   "
-             f"acc@5 {matched['acc@5deg']:.3f}  acc@10 {matched['acc@10deg']:.3f}  "
-             f"acc@30 {matched['acc@30deg']:.3f}   ({matched['fragments']} fragments)"]
-    if "geodesic_deg" in summary:
-        lines.append(f"    network   {summary['geodesic_deg']:7.2f} deg   median "
-                     f"{summary.get('geodesic_median_deg', float('nan')):6.2f}   "
-                     f"acc@5 {summary.get('acc@5deg', float('nan')):.3f}  "
-                     f"acc@10 {summary.get('acc@10deg', float('nan')):.3f}  "
-                     f"acc@30 {summary.get('acc@30deg', float('nan')):.3f}   (the rotation head)")
-    lines.append(f"    the chain reached {100 * matched['reached']:.0f}% of the scored "
-                 f"fragments; the rest kept the head's rotation")
-    if (summary.get("noise") or {}).get("jitter"):
-        lines.append("    the inputs were jittered, so the two sides of a break no longer "
-                     "share their vertices.")
-    else:
-        lines.append("    Breaking Bad's fragments share their break vertices, so correct matches "
-                     "line up exactly:\n    not comparable with tables built on independently "
-                     "sampled points without saying so.")
-    return lines
 
 
 def _noise_line(noise: Dict[str, float]) -> str:
@@ -3259,21 +3492,17 @@ _PLACEMENT_LINES = {
 
 
 def _assembly_lines(assembly: Dict[str, float], by_category: Dict[str, Dict],
-                    scenes: int, rotations: str = "network",
-                    placement: Optional[str] = None) -> List[str]:
+                    scenes: int, placement: Optional[str] = None) -> List[str]:
     """The assembly block of the report: the benchmark's scores, per scene."""
     if not assembly:
         return ["  assembly: no scene could be scored"]
-    source = ("rotations fitted from the embedding matches" if rotations == "matched"
-              else "the predicted rotations")
     # A file from before v7 names no placement: the global solve was the only one.
     placement = placement or "global"
     matches = f"    matches/scene  {assembly.get('matches', float('nan')):.0f}"
     if "verified_matches" in assembly:
         matches += f"   ({assembly['verified_matches']:.0f} in the verified pair fits)"
-    lines = ["", f"  assembly ({scenes} scenes, translation solver on {source}, world units, "
-                 f"per-scene means;\n  largest fragment set to its true pose, the other "
-                 f"fragments scored):",
+    lines = ["", f"  assembly ({scenes} scenes, world units, per-scene means; largest "
+                 f"fragment set to its\n  true pose, the other fragments scored):",
              f"    placement      {_PLACEMENT_LINES.get(placement, placement)}",
              f"    RMSE(T)        {assembly.get('rmse_t', float('nan')):.4f}",
              f"    Chamfer (CD)   {assembly.get('chamfer', float('nan')):.5f}   "
@@ -3284,14 +3513,26 @@ def _assembly_lines(assembly: Dict[str, float], by_category: Dict[str, Dict],
              f"Euler RMSE {assembly.get('euler_rmse_deg', float('nan')):.2f} deg   "
              f"(per scene, as the benchmark averages)",
              matches]
+    if "matched_share" in assembly:
+        lines.append(f"    reached        {assembly['matched_share']:.3f}   (per scene: the "
+                     f"share of its scored fragments the chain placed)")
     if len(by_category) > 1:
-        lines.append(f"    {'category':<20}{'scenes':>7}{'PA':>8}{'RMSE(T)':>10}{'CD':>10}")
+        width = max([len("category")] + [len(name) for name in by_category])
+        verified = any("verified_matches" in row for row in by_category.values())
+        lines.append(f"    {'category':<{width}}{'scenes':>7}{'PA':>8}{'RMSE(T)':>10}{'CD':>10}"
+                     f"{'part CD':>10}{'geo':>8}{'matches':>9}"
+                     + (f"{'verified':>9}" if verified else ""))
         for name, row in sorted(by_category.items(),
                                 key=lambda kv: -kv[1].get("part_accuracy", 0.0)):
-            lines.append(f"    {name:<20}{row['scenes']:>7}"
+            lines.append(f"    {name:<{width}}{row['scenes']:>7}"
                          f"{row.get('part_accuracy', float('nan')):>8.3f}"
                          f"{row.get('rmse_t', float('nan')):>10.4f}"
-                         f"{row.get('chamfer', float('nan')):>10.5f}")
+                         f"{row.get('chamfer', float('nan')):>10.5f}"
+                         f"{row.get('part_chamfer', float('nan')):>10.5f}"
+                         f"{row.get('geodesic_deg', float('nan')):>8.2f}"
+                         f"{row.get('matches', float('nan')):>9.0f}"
+                         + (f"{row.get('verified_matches', float('nan')):>9.0f}"
+                            if verified else ""))
     return lines
 
 
@@ -3585,14 +3826,14 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
           f"{int(np.median(tokens))}  max {tokens.max()}  "
           f"(budget {config.tokens_per_scene})")
 
-    # How far cross-fragment information can travel before the head pools.
+    # How far cross-fragment information can travel by the last layer.
     #
-    # A cross layer writes only to token vertices, and the head takes a mean
-    # over *every* vertex -- so a vertex the tokens never reach contributes to
-    # the rotation without having heard from another fragment. Each intra layer
-    # *after* the last cross layer buys one hop along mesh edges. This measures
-    # the reach on the real meshes rather than assuming it, because the answer
-    # depends on how the fracture surface is shaped and cannot be guessed.
+    # A cross layer writes only to token vertices -- sampled from the fracture
+    # surface, where the matching works -- and each intra layer *after* the
+    # last cross layer carries what they heard one hop further along the mesh,
+    # to the break vertices that were not sampled. This measures the reach on
+    # the real meshes rather than assuming it, because the answer depends on
+    # how the fracture surface is shaped and cannot be guessed.
     trailing = 0
     for kind in reversed(list(config.schedule)):
         if kind != "intra":
@@ -3602,25 +3843,21 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
     token_share = 100 * tokens.sum() / max(vertices.sum(), 1)
     spread = "  ".join(f"+{h}: {100 * r:.0f}%" for h, r in enumerate(reached, start=1))
     print(f"  cross-fragment reach   tokens alone: {token_share:.0f}%   {spread}")
-    if trailing:
+    has_cross = "cross" in config.schedule
+    if not has_cross:
+        print("    no cross layer: every fragment is described on its own (the ablation)")
+    elif trailing:
         print(f"    {trailing} intra layer(s) follow the last cross layer, so "
-              f"{100 * reached[trailing - 1]:.0f}% of vertices reach the head "
+              f"{100 * reached[trailing - 1]:.0f}% of vertices end the network "
               f"having heard from another fragment")
     else:
         print("    no intra layer follows the last cross layer")
-    if trailing == 0:
+    if has_cross and trailing == 0:
         warnings.append(
             f"no intra layer follows the last cross layer, so only the "
             f"{100 * tokens.sum() / vertices.sum():.0f}% of vertices that are "
-            f"tokens carry cross-fragment information into the pooled rotation. "
-            f"Append 'intra' to --schedule to propagate it."
-        )
-    elif reached[trailing - 1] < 0.5:
-        warnings.append(
-            f"after the last cross layer only {100 * reached[trailing - 1]:.0f}% "
-            f"of vertices are reached, and the head pools over all of them. One "
-            f"more trailing intra layer would reach "
-            f"{100 * reached[min(trailing, len(reached) - 1)]:.0f}%."
+            f"tokens carry the last round of cross-fragment information into "
+            f"the embedding. Append 'intra' to --schedule to propagate it."
         )
     if unusable:
         print(f"  {len(unusable)} unusable: "
@@ -3656,7 +3893,8 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             torch.cuda.reset_peak_memory_stats()
         try:
             loss, report, _ = _forward(model, batch, criterion, config)
-            loss.backward()
+            if loss.requires_grad:          # no cluster at all: nothing to train on
+                loss.backward()
         except torch.cuda.OutOfMemoryError:
             # `loss` must go too, not just `batch`. If the OOM landed in
             # `backward` rather than the forward, `loss` is bound and holds the
@@ -3783,7 +4021,7 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
             plain, _ = _collate_samples(built[start:start + chunk])
             with torch.no_grad():
                 _, piece, _ = _forward(model, _to_device(plain, device),
-                                       criterion, config)
+                                       criterion, config, score=True)
             # Fragment-weighted, the same way `run_epoch` aggregates, so the
             # average does not over-count scenes that happen to be small.
             weight = _loss_fragments(plain, config)
@@ -3807,27 +4045,19 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
         _summarise(problems, warnings)
         return False
     print(f"  {format_losses(report)}")
-    print(f"  rotation {report['rotation_degrees']:.1f} deg "
+    print(f"  rotation {report.get('rotation_degrees', float('nan')):.1f} deg "
           f"(chance {CHANCE['geodesic_deg']:.1f})   "
           f"normal {report.get('normal', float('nan')):.3f} (1.0)   "
           f"face {report.get('face', float('nan')):.3f} (2.0)")
-    # Worth stating, because the obvious reading of this line is wrong. Because
-    # the model is equivariant, the perturbation cancels out of the error at
-    # initialisation exactly: R_pred R_label^T = frame(assembled)^T. So this
-    # number is the mean angle of the untrained frames on *assembled* fragments,
-    # not a draw from the chance distribution -- it equals 126.5 deg only if
-    # those frames happen to be uniformly spread. A few degrees either way is a
-    # property of the initialisation, and there is nothing there to fix.
-    print("  (equivariance cancels the perturbation here, so this is the "
-          "untrained frame's own angle" + (" relative to its anchor's"
-          if config.rotation_target == "anchor" else "") +
-          ", not a sample from chance)")
+    # An untrained embedding matches next to nothing, so almost every fragment
+    # keeps a rotation unrelated to its true one and these read near chance.
+    print("  (the rotations fitted from an untrained embedding's matches: near chance)")
     for complaint in check_initial_losses(report):
         problems.append(f"loss at init: {complaint}")
     if "embedding" not in report:
-        warnings.append("no embedding term -- these scenes produced no "
-                        "coincidence clusters, so the embedding head will not "
-                        "train and stage two has nothing to match on")
+        problems.append("no embedding term -- these scenes produced no "
+                        "coincidence clusters, so there is nothing to train on "
+                        "and stage two has nothing to match on")
 
     # -- 7. speed ----------------------------------------------------------
     # Time at the size step 5 *proved* fits, never at the configured one. Timing
@@ -3852,9 +4082,10 @@ def preflight(config: Config, samples: int = 12, timed_batches: int = 6) -> bool
         try:
             batch = _to_device(batch, device)
             loss, _, _ = _forward(model, batch, criterion, config)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-            optimizer.step()
+            if loss.requires_grad:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                optimizer.step()
         except torch.cuda.OutOfMemoryError:
             # Step 5 measured the largest *sampled* scene; the loader draws from
             # the whole set, where the largest single fragment is 83k vertices.
@@ -3982,11 +4213,9 @@ def _token_reach(samples, hops: int) -> List[float]:
     """
     Fraction of vertices within 1..`hops` mesh edges of a cross-fragment token.
 
-    The number that says whether the schedule's trailing intra layers are
-    enough. A cross layer writes only to tokens; each intra layer after it
-    spreads that one hop further; and the rotation head means over *every*
-    vertex, so whatever is never reached dilutes the prediction with features
-    that know nothing about the other fragments.
+    The number that says how far the schedule's trailing intra layers carry
+    the last cross layer's information: a cross layer writes only to tokens,
+    and each intra layer after it spreads that one hop further along the mesh.
 
     Averaged over the sampled scenes, weighted by size, so one large scene does
     not get the same say as one small one.

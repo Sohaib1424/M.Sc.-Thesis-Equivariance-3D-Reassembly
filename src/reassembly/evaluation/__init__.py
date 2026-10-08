@@ -14,7 +14,6 @@ Breaking Bad's shared break vertices (``--evaluate --jitter/--drop``).
 """
 from .metrics import (  # noqa: F401
     chamfer_distance,
-    head_collinearity,
     matrix_to_quaternion,
     part_accuracy,
     swing_twist_error,
@@ -31,7 +30,6 @@ __all__ = [
     "chamfer_distance",
     "check_noise",
     "drop_candidates",
-    "head_collinearity",
     "jitter_inputs",
     "matrix_to_quaternion",
     "noise_suffix",

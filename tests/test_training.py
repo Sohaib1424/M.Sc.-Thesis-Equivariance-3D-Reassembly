@@ -4,10 +4,10 @@ The training engine: schedule, checkpoints, reporting, and can it learn.
 The last one is the point of the file. Everything else here guards a failure
 mode that produces finite numbers and a descending curve --
 `test_the_model_can_actually_learn` is the check that the architecture and all
-of its conventions are *consistent enough to fit anything at all*. If the
-rotation label were transposed, or the head's frame pointed the wrong way, or
-the loss compared misaligned rows, every other test in this repository would
-still pass and this one would not.
+of its conventions are *consistent enough to fit anything at all*, from the
+coincidence labels through the trained embedding to the rotations stage two
+fits from it. A label misaligned with its vertex, or a convention flipped
+anywhere along that chain, still trains to a falling loss; it fails there.
 """
 from __future__ import annotations
 
@@ -93,65 +93,94 @@ class _Fixed(torch.utils.data.Dataset):
 # Can it learn
 # --------------------------------------------------------------------------
 
-# (target, epochs, schedule length in steps). The anchor target is slower to
-# fit, and that is a measurement, not a guess: on these six scenes, four seeds
-# on one thread, the absolute target ends 45 epochs at 23-36 deg while the
-# anchor target is at 37-76 deg after 45 epochs and 19-30 deg after 80. Its
-# targets move with the anchor's own prediction while both are being learned.
-_LEARNING_RUNS = [("absolute", 45, 200), ("anchor", 80, 240)]
+def _broken(seed: int, pieces: int):
+    """
+    Slabs stacked and broken along rough interfaces whose vertices both sides
+    share -- a fracture as Breaking Bad stores one -- labelled with their
+    coincidence clusters, so there is something real to learn and to match.
+    """
+    from reassembly.mesh.correspondence import compute_scene_correspondence
+    from reassembly.mesh.fracture import fracture_vertex_masks
+    from test_assembly_placement import _stack
+
+    meshes = _stack(n=8, seed=seed,
+                    thickness=tuple(0.6 + 0.2 * ((seed + i) % 3) for i in range(pieces)))
+    clusters, _ = compute_scene_correspondence(meshes)
+    return build_scene([np.asarray(m.vertices) for m in meshes],
+                       [np.asarray(m.faces) for m in meshes], fracture_vertex_masks(meshes),
+                       rotations=random_rotations(pieces, np.random.default_rng(100 + seed)),
+                       tokens_per_scene=48, cluster=np.concatenate(clusters), key=f"slabs{seed}")
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("target,epochs,total_steps", _LEARNING_RUNS)
-def test_the_model_can_actually_learn(target, epochs, total_steps):
+def test_the_model_can_actually_learn():
     """
-    Memorise six scenes and drive the rotation error far below chance.
+    Memorise six broken scenes, and drive the rotations stage two fits from the
+    learned embedding from chance to exact.
 
     This is a *training*-error check and proves nothing about generalisation --
     that is exactly what makes it useful. It isolates "are the conventions
     self-consistent and is the architecture capable of fitting" from "does it
     generalise", and only the first question can be answered without the real
-    dataset. A transposed label or a misaligned loss row fails here and passes
-    everywhere else. Run under both rotation targets: under the anchor target
-    the error is each fragment's relative to its scene's largest.
+    dataset. The network is trained on the contrastive embedding term alone;
+    the rotations come from matching its embeddings, chained from each scene's
+    largest fragment and scored under the anchor protocol, as in validation.
+
+    Measured on one thread over seven seeds: in 120 epochs the embedding term
+    falls to 0.20-0.36 of its start and match@1 rises from ~0.005 to 0.34-0.73,
+    and the matched rotations are exact -- 0.0 deg, every fragment reached. At
+    80 epochs only one seed in four was there, so the margin is in the epochs.
+    Shuffling the coincidence labels over the vertices fails it, and so does
+    transposing the fitted rotations.
     """
-    torch.manual_seed(0)
-    config = Config(accumulate=1, channels=64, heads=4, lr=3e-3, batch_size=2, workers=0,
-                    rotation_target=target)
-    loader = torch.utils.data.DataLoader(
-        _Fixed(6), batch_size=2, shuffle=True, collate_fn=_collate_samples
-    )
-    model = build_model(config)
-    criterion = build_criterion(config)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)                 # the run that was measured
+    try:
+        torch.manual_seed(0)
+        config = Config(accumulate=1, channels=32, heads=4, lr=3e-3, batch_size=2,
+                        workers=0, schedule=("intra", "intra", "cross", "intra"))
+        scenes = [_broken(seed, 2 + seed % 2) for seed in range(6)]
+        loader = torch.utils.data.DataLoader(scenes, batch_size=2, shuffle=True,
+                                             collate_fn=_collate_samples)
+        validation = [_collate_samples(scenes[i:i + 2]) for i in range(0, 6, 2)]
+        model = build_model(config)
+        criterion = build_criterion(config)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
 
-    first, step, _ = run_epoch(model, loader, criterion, config,
-                               optimizer=optimizer, step=0, total_steps=total_steps,
-                               label="train", show_progress=False)
-    assert 90.0 < first["rotation_degrees"] < 165.0, (
-        f"an untrained model should start near chance "
-        f"({CHANCE['geodesic_deg']:.0f} deg), got {first['rotation_degrees']:.1f}"
-    )
+        untrained, _, _ = run_epoch(model, validation, criterion, config, label="val",
+                                    show_progress=False)
+        assert untrained["acc@10deg"] < 0.5, "an untrained embedding should not place them"
+        epochs, step = 120, 0
+        for epoch in range(epochs):
+            summary, step, _ = run_epoch(model, loader, criterion, config,
+                                         optimizer=optimizer, step=step,
+                                         total_steps=3 * epochs, label="train",
+                                         show_progress=False)
+            if epoch == 0:
+                first = summary
+        trained, _, _ = run_epoch(model, validation, criterion, config, label="val",
+                                  show_progress=False)
+    finally:
+        torch.set_num_threads(threads)
 
-    for _ in range(epochs - 1):
-        summary, step, _ = run_epoch(model, loader, criterion, config,
-                                     optimizer=optimizer, step=step,
-                                     total_steps=total_steps, label="train",
-                                     show_progress=False)
-
-    assert summary["rotation_degrees"] < 70.0, (
-        f"after {epochs} epochs on six memorisable scenes the rotation error is "
-        f"{summary['rotation_degrees']:.1f} deg, against a chance level of "
-        f"{CHANCE['geodesic_deg']:.0f}. The model cannot fit its own training "
-        f"set, which means a convention is wrong -- not that it needs more data."
-    )
-    assert summary["total"] < first["total"]
+    assert summary["embedding"] < 0.6 * first["embedding"]
+    assert summary["match@1"] > 0.2, (
+        f"match@1 {summary['match@1']:.3f}: the embedding does not find the "
+        f"coincident vertices of six scenes it has seen {epochs} times")
+    assert trained["geodesic_deg"] < 30.0 and trained["acc@10deg"] > 0.8, (
+        f"after {epochs} epochs on six memorisable scenes the matched rotations are "
+        f"{trained['geodesic_deg']:.1f} deg off (acc@10 {trained['acc@10deg']:.2f}), "
+        f"against a chance level of {CHANCE['geodesic_deg']:.0f}. The embedding "
+        f"cannot be matched on its own training set, which means a convention is "
+        f"wrong -- not that it needs more data.")
 
 
 def test_losses_start_at_their_reference_values():
     """
-    An untrained forward pass, read against what each term must be at chance.
-    A term far from its reference is measuring something other than its name.
+    An untrained forward pass, scored, read against what each score must be at
+    chance: an untrained embedding matches next to nothing, so stage two
+    leaves almost every fragment at a rotation unrelated to its true one. A
+    term far from its reference is measuring something other than its name.
     """
     torch.manual_seed(0)
     config = Config(channels=32, heads=4)
@@ -161,7 +190,7 @@ def test_losses_start_at_their_reference_values():
     # luck alone, which is exactly what it did. Twenty-four fragments halve it.
     batch, _ = _collate_samples([_scene(s) for s in range(1, 9)])
     model = build_model(config)
-    loss, report, R = _forward(model, batch, build_criterion(config), config)
+    loss, report, R = _forward(model, batch, build_criterion(config), config, score=True)
 
     assert torch.isfinite(loss)
     assert 80.0 < report["rotation_degrees"] < 175.0
@@ -183,37 +212,35 @@ def test_every_parameter_trains():
     assert not dead, f"no gradient reaches: {dead}"
 
 
-def test_without_coincidence_labels_the_embedding_head_is_untrained():
+def test_without_coincidence_labels_there_is_nothing_to_train_on():
     """
     A consequence worth stating rather than discovering later.
 
-    The embedding-consistency loss is the *only* thing that supervises the
-    per-vertex embedding. With `supervise_embedding=False`, or on a scene whose
-    fragments share no vertices, that term is absent and the readout and its MLP
-    receive no gradient at all -- silently, since the rotation loss keeps
-    descending exactly as before.
-
-    It matters because stage two matches interface points by mutual nearest
-    neighbours *in embedding space*. An untrained embedding head means the
-    rotation model still works and the translation solver has nothing to use.
-    `Config` warns about this at startup.
+    The contrastive embedding term is the only one trained, and it is defined
+    over coincidence clusters. A batch without any -- fragments that share no
+    vertices -- has no objective: its loss is a constant zero with no
+    gradient, and the epoch loop leaves it out of the step and names it,
+    rather than letting AdamW move the weights on momentum and decay alone.
+    (`supervise_embedding=False` would make every batch one of these, so
+    training refuses it.)
     """
     torch.manual_seed(0)
-    config = Config(channels=32, heads=4)
+    config = Config(channels=32, heads=4, workers=0, accumulate=1)
     batch, _ = _collate_samples([_scene(1, clusters=False),
                                  _scene(2, clusters=False)])
     assert batch.num_clusters == 0
     model = build_model(config)
     loss, report, _ = _forward(model, batch, build_criterion(config), config)
-    loss.backward()
-
     assert "embedding" not in report, "the term should be absent, not zero"
-    dead = {n for n, p in model.named_parameters()
-            if p.grad is None or p.grad.abs().sum() == 0}
-    assert any(n.startswith("embedding.") for n in dead)
-    assert "readout.directions.weight" in dead
-    # Everything else still trains -- which is exactly why this is easy to miss.
-    assert not any(n.startswith(("intra.", "cross.", "head.")) for n in dead)
+    assert float(loss) == 0.0 and not loss.requires_grad
+
+    before = [p.detach().clone() for p in model.parameters()]
+    summary, _, _ = run_epoch(model, [(batch, [])], build_criterion(config), config,
+                              optimizer=torch.optim.AdamW(model.parameters(), lr=1e-2),
+                              step=0, total_steps=10, label="train", show_progress=False)
+    assert summary["skipped"] == 1 and summary["empty_steps"] == 1 and summary["steps"] == 0
+    assert [n for n in summary["dropped_names"] if n.startswith("noclusters:")]
+    assert all(torch.equal(a, b) for a, b in zip(before, model.parameters()))
 
 
 def test_metrics_agree_with_a_perfect_prediction():
@@ -390,40 +417,33 @@ def test_initial_loss_check_catches_a_term_that_is_off():
 
 
 @pytest.mark.parametrize("curve,expected", [
-    ([126.4, 126.3], "at chance"),
-    ([91.0, 89.5], "axis-only landmark"),
-    ([60.0, 50.0, 40.0, 20.0], "still descending"),
+    ([(126.4, 0.0), (126.3, 0.01)], "at chance"),
+    ([(60.0, 0.2), (50.0, 0.3), (40.0, 0.5), (20.0, 0.7)], "still descending"),
 ])
 def test_the_final_verdict_refuses_to_flatter_a_run(curve, expected, capsys):
     """
     Interpretation rules written before the results, and enforced. A run at
-    chance, one parked at the axis-only landmark, and one truncated mid-descent
-    all produce a perfectly reportable number that means something quite
-    different from what it looks like.
+    chance and one truncated mid-descent both produce a perfectly reportable
+    number that means something quite different from what it looks like.
     """
-    _final_report([{"val_geodesic_deg": v} for v in curve])
+    _final_report([{"epoch": i, "val_geodesic_deg": geodesic, "val_acc@10deg": accuracy}
+                   for i, (geodesic, accuracy) in enumerate(curve)])
     assert expected in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("tilt,twist,expected", [
-    (2.0, 88.0, "axis IS being recovered"),
-    (85.0, 60.0, "not being recovered either"),
-])
-def test_the_axis_only_verdict_reads_tilt_and_twist(tilt, twist, expected, capsys):
+def test_the_best_epoch_is_the_most_fragments_within_10_degrees(capsys):
     """
-    ~90 deg geodesic has two quite different causes and the number alone cannot
-    tell them apart: the axis learned but not the rotation about it, or nothing
-    learned at all. The verdict must consult the tilt/twist split rather than
-    assert the first, which is what it used to do -- and it used to call it a
-    structural floor, which is false: a fragment's fracture boundary is unique
-    even when the whole object is a surface of revolution.
+    best.pt is the epoch with the highest validation acc@10, not the lowest
+    mean error. The matched rotations are a mixture -- fragments placed to a
+    degree or two, and fragments left at chance -- and the mean moves with how
+    far the misses miss as much as with how many fragments are recovered.
     """
-    _final_report([{"val_geodesic_deg": 91.0},
-                   {"val_geodesic_deg": 89.5, "val_tilt_deg": tilt,
-                    "val_twist_deg": twist}])
-    output = capsys.readouterr().out
-    assert expected in output
-    assert "structural result" not in output
+    _final_report([{"epoch": 0, "val_geodesic_deg": 30.0, "val_acc@10deg": 0.6},
+                   {"epoch": 1, "val_geodesic_deg": 25.0, "val_acc@10deg": 0.5}])
+    out = capsys.readouterr().out
+    assert "best val acc@10 0.6000 at epoch 1 (geodesic 30.00 deg" in out
+    _final_report([{"epoch": 0, "train_total": 4.0}])
+    assert "validation measured no rotation" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------
@@ -1086,13 +1106,13 @@ def test_preflight_times_at_a_batch_size_that_fits(tmp_path, monkeypatch, capsys
     real_forward = training._forward
     seen = []
 
-    def limited(model, batch, criterion, config):
+    def limited(model, batch, criterion, config, **kwargs):
         """Anything above two scenes 'runs out of memory'."""
         size = int(batch.num_scenes)
         seen.append(size)
         if size > 2:
             raise torch.cuda.OutOfMemoryError("simulated")
-        return real_forward(model, batch, criterion, config)
+        return real_forward(model, batch, criterion, config, **kwargs)
 
     monkeypatch.setattr(training, "_forward", limited)
     config = Config(root=str(tmp_path / "data"), out_dir=str(tmp_path / "out"),
@@ -1118,10 +1138,10 @@ def test_preflight_says_the_batch_does_not_fit_rather_than_crashing(tmp_path,
     _fake_dataset(tmp_path / "data", objects=24)
     real_forward = training._forward
 
-    def limited(model, batch, criterion, config):
+    def limited(model, batch, criterion, config, **kwargs):
         if int(batch.num_scenes) > 1:
             raise torch.cuda.OutOfMemoryError("simulated")
-        return real_forward(model, batch, criterion, config)
+        return real_forward(model, batch, criterion, config, **kwargs)
 
     monkeypatch.setattr(training, "_forward", limited)
     config = Config(root=str(tmp_path / "data"), out_dir=str(tmp_path / "out"),
@@ -1326,9 +1346,9 @@ def test_an_oversized_batch_is_skipped_before_it_is_attempted():
 def test_token_reach_measures_how_far_cross_information_travels():
     """
     The number that decides whether a schedule's trailing intra layers are
-    enough. A cross layer writes only to tokens, and the rotation head pools a
-    mean over *every* vertex — so vertices the tokens never reach dilute the
-    prediction with features that know nothing about the other fragments.
+    enough. A cross layer writes only to tokens, and the embedding is read at
+    *every* vertex -- so a break vertex the tokens never reach is matched on
+    features that know nothing about the other fragments.
 
     Each trailing intra layer buys exactly one hop along mesh edges, so the
     sequence must be strictly increasing and bounded by 1, and its first entry
@@ -1394,39 +1414,18 @@ def _batched_gradient(scenes, **overrides):
     return _grad_vector(model)
 
 
-@pytest.mark.parametrize("term", ["rotation", "position", "normal", "face"])
-def test_accumulation_matches_a_real_batch_on_the_geometric_terms(term):
-    """
-    `--batch-size 1 --accumulate 2` must give the same gradient as
-    `--batch-size 2`, because preflight recommends the first as a substitute for
-    the second whenever memory forces the batch down.
-
-    It did not. `loss / accumulate` weights each *scene* equally, while a real
-    batch weights each *fragment* equally — and a Breaking Bad scene holds
-    anywhere from 2 to 35 fragments. Measured on a 2-fragment and an 8-fragment
-    scene, the two gradients had cosine similarity **0.80** and norms 45% apart:
-    a silent re-weighting of the objective, applied by a flag chosen for memory
-    reasons. Weighting each micro-batch by its fragment count and normalising by
-    the group total makes them identical.
-    """
-    scenes = [_scene(1, fragments=2), _scene(2, fragments=8)]
-    off = {f"w_{k}": 0.0 for k in ("rotation", "position", "normal", "face", "embedding")}
-    off[f"w_{term}"] = 1.0
-
-    batched = _batched_gradient(scenes, **off)
-    accumulated = _accumulated_gradient(scenes, **off)
-    cosine = torch.nn.functional.cosine_similarity(batched, accumulated, dim=0)
-    assert cosine > 0.99999, f"{term}: accumulation diverged from a real batch, {cosine}"
-
-
 def test_the_contrastive_term_cannot_match_a_real_batch_and_that_is_correct():
     """
-    The one term that does *not* decompose, stated so nobody tries to fix it.
+    The trained term does not decompose, stated so nobody tries to fix it:
+    `--micro_batch_scenes 1` over two passes is not the step one pass of two
+    scenes would take.
 
     InfoNCE draws its negatives from whatever is in the batch. Two scenes in one
     batch see each other's vertices as negatives; the same two scenes forwarded
-    separately do not. No accumulation scheme can reproduce that — it is a
-    property of contrastive objectives, not a defect.
+    separately do not. No accumulation scheme can reproduce that -- it is a
+    property of contrastive objectives, not a defect. (The geometric terms the
+    removed rotation head trained on were means over fragments, and for them
+    the fragment weighting made the two identical.)
 
     It is also the better behaviour here. Matching only ever happens *within* a
     scene, so a scene's own fracture vertices are the real confusion set and
@@ -1434,11 +1433,8 @@ def test_the_contrastive_term_cannot_match_a_real_batch_and_that_is_correct():
     tightens this term rather than weakening it.
     """
     scenes = [_scene(1, fragments=2), _scene(2, fragments=8)]
-    off = {f"w_{k}": 0.0 for k in ("rotation", "position", "normal", "face")}
-    off["w_embedding"] = 1.0
-
     cosine = torch.nn.functional.cosine_similarity(
-        _batched_gradient(scenes, **off), _accumulated_gradient(scenes, **off), dim=0)
+        _batched_gradient(scenes), _accumulated_gradient(scenes), dim=0)
     assert cosine < 0.99, (
         "the contrastive term matched a real batch exactly, which would mean the "
         "negatives are no longer drawn from the batch — check correspondence_loss"

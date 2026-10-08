@@ -35,10 +35,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from reassembly.training import ROTATION_TARGETS, THESIS1_NAMES, Config, flag  # noqa: E402
+from reassembly.training import THESIS1_NAMES, Config, flag  # noqa: E402
 
 CHOICES = {
-    "rotation_target": ROTATION_TARGETS,
     "split_by": ("object", "fracture"),
     "split_source": ("auto", "official", "hash"),
     "fracture_pool": ("train", "all"),
@@ -50,11 +49,6 @@ CHOICES = {
 }
 
 HELP = {
-    "rotation_target": "what the rotation losses compare against: each "
-                       "fragment relative to its scene's largest fragment, set "
-                       "to its true pose (anchor, the benchmark's protocol), or "
-                       "each fragment's own stored frame (absolute, as in My "
-                       "Thesis Work). The metrics use the anchor either way",
     "split_by": "what is held out: whole shapes (object, the benchmark) or "
                 "break patterns (fracture, an easier diagnostic question)",
     "split_source": "official: Breaking Bad's own lists (an error if missing); "
@@ -82,6 +76,10 @@ HELP = {
     "max_fragments": "only break patterns of 2 to this many pieces, for "
                      "training, validation and --evaluate; 20 = the "
                      "benchmark's 2-20 (GARF); 0 = no limit",
+    "score_train": "also fit the rotations on every training batch, so the "
+                   "training line reports the four geometric scores too "
+                   "(slower: it matches every training scene); validation "
+                   "always scores",
 }
 
 # Config fields that only the converted flags below set.
@@ -94,7 +92,7 @@ THESIS1_ONLY = {
     "config": "there are no YAML configs here; pass the flags themselves",
     "tag": "checkpoints are always last.pt and best.pt inside --checkpoint_dir",
     "num_layers": "the depth here is --schedule, e.g. the default "
-                  "--schedule intra intra intra intra intra cross cross cross intra",
+                  "--schedule intra intra cross intra cross intra cross intra",
     "num_vn_slots": "there are no virtual nodes here; fragments exchange "
                     "information through --tokens_per_scene fracture-surface tokens",
     "max_scenes": "use --max_objects, which limits the TRAINING objects only "
@@ -108,10 +106,22 @@ THESIS1_ONLY = {
     "drive_credentials": "point --checkpoint_dir at a mounted Drive folder instead",
     "prefetch_factor": "not configurable here", "pin_memory": "not configurable here",
     "persistent_workers": "not configurable here", "log_every": "every epoch is logged",
-    "w_node": "the loss weights here are --w_rot --w_pos --w_normal --w_face --w_embedding",
-    "w_mid": "the loss weights here are --w_rot --w_pos --w_normal --w_face --w_embedding",
-    "w_emb_v": "the loss weights here are --w_rot --w_pos --w_normal --w_face --w_embedding",
-    "w_emb_e": "the loss weights here are --w_rot --w_pos --w_normal --w_face --w_embedding",
+    "w_node": "the one loss weight here is --w_embedding",
+    "w_mid": "the one loss weight here is --w_embedding",
+    "w_emb_v": "the one loss weight here is --w_embedding",
+    "w_emb_e": "the one loss weight here is --w_embedding",
+}
+
+_SCORED = ("the network has no rotation head since v7: it is trained on the embedding "
+           "term alone (--w_embedding), and rotation, position, normal and face are "
+           "scores of the rotations fitted from its matches, never trained on")
+# Settings this project had before v7 removed the rotation head, refused the
+# same way, so an old command stops with the reason instead of training a
+# different model than it says.
+REMOVED = {
+    "w_rot": _SCORED, "w_pos": _SCORED, "w_normal": _SCORED, "w_face": _SCORED,
+    "rotation_target": "the scores always use the anchor protocol -- each scene's largest "
+                       "fragment set to its true pose -- and nothing is trained on them",
 }
 
 
@@ -130,11 +140,14 @@ def _bool(value) -> bool:
 class _Refused(argparse.Action):
     """A Thesis 1 flag this project does not have: stop, and say what to use."""
 
-    def __init__(self, *args, reason: str = "", **kwargs):
+    def __init__(self, *args, reason: str = "", removed: bool = False, **kwargs):
         self.reason = reason
+        self.removed = removed
         super().__init__(*args, **kwargs)
 
     def __call__(self, parser, namespace, values, option_string=None):
+        if self.removed:
+            parser.error(f"{option_string} was removed in v7: {self.reason}.")
         parser.error(f"{option_string} is a Thesis 1 setting with no counterpart "
                      f"here: {self.reason}.")
 
@@ -204,6 +217,9 @@ def add_config_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
     for name, reason in THESIS1_ONLY.items():
         parser.add_argument(f"--{name}", action=_Refused, reason=reason, nargs="?",
                             help=argparse.SUPPRESS)
+    for name, reason in REMOVED.items():
+        parser.add_argument(f"--{name}", action=_Refused, reason=reason, removed=True,
+                            nargs="?", help=argparse.SUPPRESS)
     return parser
 
 
@@ -308,5 +324,5 @@ def config_flags(config: Config, fields=None) -> list:
     return out
 
 
-__all__ = ["THESIS1_NAMES", "THESIS1_ONLY", "add_config_arguments", "config_from_args",
-           "config_flags"]
+__all__ = ["REMOVED", "THESIS1_NAMES", "THESIS1_ONLY", "add_config_arguments",
+           "config_from_args", "config_flags"]

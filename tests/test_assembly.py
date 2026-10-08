@@ -109,25 +109,45 @@ def _broken_scene(fractured_solid):
     return collate([sample], dtype=DTYPE), vertices
 
 
-def _oracle(batch, rotation):
-    """A 'prediction' that knows the answer: exact rotations, and the assembled
-    world position as the (invariant) embedding, so matches are the truly
-    coincident interface points."""
+def _oracle(batch):
+    """A 'prediction' that knows the answer: the assembled world position as
+    the (invariant) embedding, so matches are the truly coincident interface
+    points, and the rotations fitted from them exact."""
     from reassembly.nn.model import Prediction
 
     world = (batch.target_vertices * batch.unit[batch.vertex_fragment, None]
              + batch.centroid[batch.vertex_fragment])
-    return Prediction(rotation=rotation, frame=rotation.transpose(-1, -2),
-                      vertex_embedding=world, vertex_features=None)
+    return Prediction(vertex_embedding=world, vertex_features=None)
+
+
+def _given(batch, rotation):
+    """Stage two's output with the rotations given instead of fitted: every
+    fragment reached, no pair fits -- for placing known rotations with the
+    global solve, which needs nothing else."""
+    from reassembly.assembly import MatchedRotations
+    from reassembly.nn.anchor import anchor_fragments
+
+    roots = anchor_fragments(batch.log_scale, batch.fragment_scene, batch.num_scenes).tolist()
+    fragment_ptr = batch.fragment_ptr.tolist()
+    vertex_ptr = batch.vertex_ptr.tolist()
+    scenes = range(batch.num_scenes)
+    return MatchedRotations(
+        rotation, torch.ones(rotation.shape[0], dtype=torch.bool),
+        [roots[s] - fragment_ptr[s] for s in scenes], [[] for _ in scenes],
+        [batch.fracture[vertex_ptr[fragment_ptr[s]]:vertex_ptr[fragment_ptr[s + 1]]]
+         for s in scenes])
 
 
 def test_a_perfect_prediction_scores_perfectly(fractured_solid):
     batch, _ = _broken_scene(fractured_solid)
-    scenes = score_batch(batch, _oracle(batch, batch.target_rotation))
+    scenes = score_batch(batch, _oracle(batch))
     assert len(scenes) == 1
     scene = scenes[0]
     assert scene["matches"] > 0
-    assert scene["rmse_t"] < 1e-9
+    # The fitted rotations are exact to 1e-14 deg; what is left is the solves'
+    # 1e-6 ridge pulling each fragment a hair toward its prior -- 1.5e-9 under
+    # the checked placement, 9e-10 under the global one, 2e-15 without it.
+    assert scene["rmse_t"] < 1e-8
     assert scene["chamfer"] < 1e-12 and scene["part_chamfer"] < 1e-12
     assert scene["part_accuracy"] == 1.0
 
@@ -142,7 +162,8 @@ def test_a_wrong_rotation_is_not_rescued_by_the_solver(fractured_solid):
     turn = torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]], dtype=DTYPE)
     rotation = batch.target_rotation.clone()
     rotation[1] = turn @ rotation[1]
-    scene = score_batch(batch, _oracle(batch, rotation))[0]
+    scene = score_batch(batch, _oracle(batch), matched=_given(batch, rotation),
+                        placement="global")[0]
     assert scene["part_accuracy"] < 1.0
     assert scene["chamfer"] > 1e-3
 
@@ -159,13 +180,15 @@ def test_the_anchor_forgives_one_global_rotation_and_nothing_else(fractured_soli
     batch, _ = _broken_scene(fractured_solid)
     turn = torch.as_tensor(random_rotations(1, np.random.default_rng(11))[0], dtype=DTYPE)
     rotated = turn @ batch.target_rotation
-    scene = score_batch(batch, _oracle(batch, rotated))[0]
+    given = _given(batch, rotated)
+    scene = score_batch(batch, _oracle(batch), matched=given, placement="global")[0]
     assert scene["rmse_t"] < 1e-9 and scene["chamfer"] < 1e-12
     assert scene["part_accuracy"] == 1.0 and scene["geodesic_deg"] < 1e-6
     assert scene["_anchor"] in (0, 1)
     assert int(np.argmax(batch.log_scale.flatten().numpy())) == scene["_anchor"]
 
-    unanchored = score_batch(batch, _oracle(batch, rotated), anchor=False)[0]
+    unanchored = score_batch(batch, _oracle(batch), matched=given, placement="global",
+                             anchor=False)[0]
     assert unanchored["chamfer"] > 1e-3 and unanchored["geodesic_deg"] > 10.0
 
 

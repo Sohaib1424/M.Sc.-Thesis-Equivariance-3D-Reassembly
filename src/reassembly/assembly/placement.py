@@ -37,10 +37,11 @@ says which fits it believes. So, for ONE scene:
    inliers alone, with the root held at its own position -- under the
    benchmark protocol the anchor, at its true position -- rather than the
    zero-mean gauge, and Huber reweighting as in the global solve.
-3. **Place the rest.** The fragments the chain did not reach keep the head's
-   rotation; they are placed from every match that touches them, with the
-   reached fragments held where step 2 put them, so a wrong rotation can
-   misplace its own fragment and no other. A fragment with no match at all
+3. **Place the rest.** The fragments the chain did not reach keep a rotation
+   unrelated to their true one (the head's, before v7 removed it); they are
+   placed from every match that touches them, with the reached fragments held
+   where step 2 put them, so a wrong rotation can misplace its own fragment
+   and no other. A fragment with no match at all
    goes to the mean position of the reached ones, where the global solve's
    gauge would have put it.
 

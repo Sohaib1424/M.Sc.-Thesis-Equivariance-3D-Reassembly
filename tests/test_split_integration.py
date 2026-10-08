@@ -279,13 +279,14 @@ def test_a_real_epoch_runs_under_every_setting(root, overrides):
     assert np.isfinite(history[0]["val_geodesic_deg"])
 
 
-def test_the_epoch_reports_tilt_twist_and_head_collinearity(root):
+def test_the_epoch_reports_tilt_twist_and_the_share_reached(root):
     history = training.train(_config(root))
     row = history[0]
-    for key in ("val_tilt_deg", "val_twist_deg", "val_head_cos"):
+    for key in ("val_tilt_deg", "val_twist_deg", "val_reached"):
         assert key in row and np.isfinite(row[key]), key
-    assert 0.0 <= row["val_head_cos"] <= 1.0
-    # An untrained frame's residual is close to uniform, so most of it is tilt.
+    assert 0.0 <= row["val_reached"] <= 1.0
+    # An untrained embedding reaches next to nothing, and an unreached
+    # fragment's residual is close to uniform, so most of it is tilt.
     assert row["val_tilt_deg"] > 20.0
 
 
@@ -307,11 +308,12 @@ def test_the_category_breakdown_covers_every_fragment(root):
     assert counted < history[0]["val_fragments"]
 
 
-def test_diagnostics_do_not_change_the_optimised_total(root):
+def test_the_scores_do_not_change_the_optimised_total(root):
     """
-    tilt, twist and head|cos| are reported and must be inert. If any of them
-    ever entered the total, the model would be optimising a diagnostic and the
-    diagnostic would stop being one.
+    The four geometric scores, tilt and twist are reported and must be inert:
+    the total is the embedding term alone, scored or not. If a score ever
+    entered the total, the model would be optimising a measurement of stage
+    two, and the measurement would stop being one.
     """
     from reassembly.training import build_criterion
 
@@ -321,11 +323,16 @@ def test_diagnostics_do_not_change_the_optimised_total(root):
                               epoch=0)
     batch, _dropped = next(iter(loader))
     model = training.build_model(config)
-    loss, report, _R = training._forward(model, batch, build_criterion(config),
-                                         config)
+    criterion = build_criterion(config)
+    outcomes = {}
+    for score in (False, True):
+        torch.manual_seed(0)              # the embedding term's anchor draw
+        outcomes[score] = training._forward(model, batch, criterion, config, score=score)
+    (plain, plain_report, none), (loss, report, R) = outcomes[False], outcomes[True]
 
-    terms = sum(report[name] * getattr(config, f"w_{name}")
-                for name in ("rotation", "position", "normal", "face", "embedding")
-                if name in report)
-    assert float(loss.detach()) == pytest.approx(terms, rel=1e-5)
-    assert {"tilt_deg", "twist_deg", "head_cos"} <= set(report)
+    assert none is None and R is not None and not R.requires_grad
+    assert {"rotation", "position", "normal", "face", "tilt_deg", "twist_deg"} <= set(report)
+    assert not {"rotation", "position", "normal", "face"} & set(plain_report)
+    assert float(loss.detach()) == float(plain.detach())
+    assert float(loss.detach()) == pytest.approx(config.w_embedding * report["embedding"],
+                                                 rel=1e-6)

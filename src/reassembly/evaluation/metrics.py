@@ -131,33 +131,6 @@ def swing_twist_error(predicted: Tensor, target: Tensor,
     return tilt * degrees, twist * degrees
 
 
-# ----------------------------------------------------------------- head ----
-
-def head_collinearity(axes: Tensor) -> Tensor:
-    """
-    ``|cos|`` between the two channels the rotation head feeds to Gram-Schmidt.
-
-    ``axes`` is ``(F, 2, 3)``. Returns one scalar, the mean over fragments.
-
-    Near 1 means the two vectors have become parallel, so the frame's second
-    column is determined almost entirely by numerical noise in the component of
-    the second vector orthogonal to the first. The predicted rotation is then
-    effectively a one-vector prediction with a random roll, and the run is
-    stuck for a structural reason rather than a data one.
-
-    This is the cheapest measurement that separates "in a bad basin" from
-    "still descending". In the earlier design two seeds of an otherwise
-    identical eight-object run finished 74 degrees apart (30.9 against 104.7),
-    and the healthy runs sat at 0.78-0.90. It costs one dot product per
-    fragment and belongs in the epoch table for that reason alone.
-    """
-    if axes.ndim != 3 or axes.shape[-2:] != (2, 3):
-        raise ValueError(f"expected (F, 2, 3) head axes, got {tuple(axes.shape)}")
-    first = torch.nn.functional.normalize(axes[:, 0].double(), dim=-1, eps=1e-12)
-    second = torch.nn.functional.normalize(axes[:, 1].double(), dim=-1, eps=1e-12)
-    return (first * second).sum(-1).abs().mean()
-
-
 # --------------------------------------------------------------- assembly --
 
 def chamfer_distance(predicted: Tensor, target: Tensor,

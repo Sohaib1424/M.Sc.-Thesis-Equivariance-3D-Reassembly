@@ -4,53 +4,55 @@ Read-only probe of a trained checkpoint on the scenes it was validated on.
 
 Changes nothing in the repository. It imports the package, rebuilds the run's
 own validation set from the Config stored in the checkpoint (same scenes, same
-perturbations), predicts, and writes per-fragment and per-pair numbers that the
-history cannot show.
+perturbations), predicts, fits each fragment's rotation from the embedding
+matches with the package's own code (``reassembly.assembly.rotation.match_batch``,
+what ``--evaluate`` and validation run), and writes per-fragment and per-pair
+numbers that the history cannot show.
 
-    cd "E:\\Thesis v6"
-    python probe_val.py --checkpoint path\\to\\W10\\best.pt --out probe\\W10
+    cd "E:\\Thesis v7"
+    python probe_val.py --checkpoint path\\to\\run\\best.pt --out probe\\run
 
-Outputs <out>/fragments.csv, <out>/pairs.csv and <out>/summary.txt, and prints:
+Outputs <out>/fragments.csv, <out>/pairs.csv, <out>/summary.txt and
+<out>/summary.json, and prints:
 
+  headline      the matched rotations' anchor-aligned error, accuracy and the
+                share the matching reached, beside what the run logged
   token reach   share of vertices within k mesh hops of a token, and how many
-                hops each cross layer's output travels before the pooling
-  (a)           anchor-aligned error by quartile of fragment size, fracture
-                share, tokens and token reach
+                hops each cross layer's output travels by the last layer
+  (a)           error by quartile of fragment size, fracture share, tokens and
+                token reach
   (b)           relative-rotation error of touching vs non-touching pairs, and
                 the error through the anchor by contact hops from it
   (c)           tilt/twist of the error in the OBJECT frame, E = (C R_hat) R^T,
-                per category, about x, y and z -- beside what the installed code
-                logs (the input frame, R_hat^T R, before metrics.swing_twist_error
-                was fixed; the object frame after)
-  (d)           with --procrustes: the relative rotation of each pair fitted
-                from the model's own embedding matches, against the network's
+                per category, about x, y and z
+  (d)           the relative rotation fitted for each pair from the embedding
+                matches, against the truth, and the chain built from the fits
 
-Two tests
----------
---cross none   The cross layers get no partners: every fragment is predicted
+Since v7 the network has no rotation head: every rotation here is fitted from
+the matches and chained from each scene's largest fragment, which is set to its
+true pose only for scoring (the anchor protocol). A fragment the chain does not
+reach keeps the rotation of the anchor's input frame -- unrelated to its own,
+so it scores at chance. ``--procrustes`` is accepted and always on.
+
+Two tests of the cross layers
+-----------------------------
+--cross none   The cross layers get no partners: every fragment is described
                as if it were alone in its scene.
 --cross swap   Each scene's tokens attend to the tokens of a DIFFERENT object's
                scene instead of their own. The cross layers get realistic input
                that carries no information about this scene. Run with fewer
                scenes per batch (4 by default) to bound memory.
-               If the validation error barely moves under these, the cross
-               layers are not contributing to the rotation.
-
---procrustes   For every pair of fragments, match fracture-surface points by
-               their embeddings (mutual nearest neighbours, as the assembly
-               stage does), fit the rotation that lines the matched points up
-               (Kabsch with RANSAC), and compare its error with the network's.
-               Then chain those fitted rotations outward from the anchor along
-               the best-matched pairs -- no ground-truth contacts used -- and
-               report the per-fragment error that would give.
+               If the error barely moves under these, the cross layers are not
+               contributing to the matching.
 
 Is the matched route using anything it should not?
 ---------------------------------------------------
 --hide_truth            Every ground-truth field of the batch (target rotations,
                         positions, normals, centroids, coincidence clusters) is
-                        replaced by NaN / none before the network and the solver
-                        run; the truth is used only afterwards, to score. If
-                        anything read it, the numbers would change or turn NaN.
+                        replaced by NaN / none before the network and the
+                        matching run; the truth is used only afterwards, to
+                        score. If anything read it, the numbers would change or
+                        turn NaN.
 --untrained             Random weights, same architecture: fingerprints that
                         learned nothing. The matched route should fail.
 --shuffle_fingerprints  The trained fingerprints, dealt out at random among each
@@ -60,6 +62,12 @@ Is the matched route using anything it should not?
                         matching: the two sides of a break no longer coincide
                         and many partners are missing. Measures how much the
                         result owes to Breaking Bad's shared break vertices.
+                        The same draws as ``--evaluate --jitter S --drop P``.
+
+``--table`` gathers the summary.json of several probes into one table
+(<out>/probes.md and <out>/probes.csv) -- the documentation of a set of tests:
+
+    python probe_val.py --table probe/best-plain probe/best-hidden ... --out probe
 
 --split train scores training scenes the same way. --print_flags prints the
 scripts.train command that reproduces the checkpoint's run, and exits. Run from
@@ -70,6 +78,7 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import json
 import math
 import sys
 import time
@@ -85,7 +94,7 @@ CHANCE_DEG = 126.48
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--checkpoint", required=True, help="e.g. runs/W10/best.pt")
+    p.add_argument("--checkpoint", default=None, help="e.g. runs/W10/best.pt")
     p.add_argument("--root_dir", default=None,
                    help="dataset root, when it is not where the run was trained")
     p.add_argument("--split", default="val", choices=("val", "train", "test"))
@@ -101,14 +110,16 @@ def parse_args(argv=None):
                    help="scenes per forward pass; default: the run's own (at most 4 with "
                         "--cross swap)")
     p.add_argument("--procrustes", action="store_true",
-                   help="fit each pair's rotation from the embedding matches (table d)")
+                   help="kept so earlier commands run: the rotations are always fitted from "
+                        "the embedding matches (the network has no rotation head since v7)")
     p.add_argument("--min_matches", type=int, default=6,
-                   help="--procrustes: matches (and RANSAC inliers) a pair needs")
+                   help="matches (and RANSAC inliers) a pair needs; 6 as everywhere else")
     p.add_argument("--ransac_tau", type=float, default=0.05,
-                   help="--procrustes: inlier distance, in units of the largest fragment's "
-                        "radius")
+                   help="inlier distance, in units of the largest fragment's radius")
     p.add_argument("--ransac_iters", type=int, default=256)
-    p.add_argument("--seed", type=int, default=0, help="RANSAC draws and the swap order")
+    p.add_argument("--seed", type=int, default=None,
+                   help="RANSAC, --jitter and --drop draws (per scene, as validation's), the "
+                        "shuffle and the swap order; default: the run's own seed")
     # -- tests of what the matched route depends on ------------------------
     p.add_argument("--hide_truth", action="store_true",
                    help="replace every ground-truth field of the batch (target rotations, "
@@ -118,14 +129,14 @@ def parse_args(argv=None):
     p.add_argument("--untrained", action="store_true",
                    help="the same architecture with random weights instead of the checkpoint's")
     p.add_argument("--shuffle_fingerprints", action="store_true",
-                   help="--procrustes: shuffle the embeddings among each fragment's "
-                        "fracture-surface vertices before matching")
+                   help="shuffle the embeddings among each fragment's fracture-surface "
+                        "vertices before matching")
     p.add_argument("--jitter", type=float, default=0.0,
                    help="Gaussian noise on every input vertex, in units of the scene's largest "
                         "fragment's radius, so the two sides of a break no longer coincide")
     p.add_argument("--drop", type=float, default=0.0,
-                   help="--procrustes: drop this share of each fragment's fracture-surface "
-                        "vertices from the matching at random, so many partners are missing")
+                   help="drop this share of each fragment's fracture-surface vertices from "
+                        "the matching at random, so many partners are missing")
     p.add_argument("--num_workers", type=int, default=None,
                    help="data-loader workers; default: the run's own")
     p.add_argument("--device", default=None, help="default: cuda:0 if available, else cpu")
@@ -135,7 +146,13 @@ def parse_args(argv=None):
     p.add_argument("--print_flags", action="store_true",
                    help="print the scripts.train command that reproduces the checkpoint's "
                         "run (its stored Config), and exit")
-    return p.parse_args(argv)
+    p.add_argument("--table", nargs="+", default=None, metavar="PROBE_DIR",
+                   help="gather these probes' summary.json into one table, "
+                        "<out>/probes.md and <out>/probes.csv, and exit")
+    args = p.parse_args(argv)
+    if not args.table and not args.checkpoint:
+        p.error("--checkpoint is required (or --table)")
+    return args
 
 
 def config_from_checkpoint(state, args):
@@ -247,124 +264,40 @@ def hide_truth(batch):
     return batch._replace(**hidden)
 
 
-def jitter_inputs(batch, sigma, generator):
-    """
-    Independent Gaussian noise on every input vertex, so the two sides of a
-    break no longer share exact positions; each edge's relative-position
-    feature (``p_source - p_destination``) is recomputed to match.
-    """
-    import torch
-
-    node = batch.node_features.clone()
-    node[:, 0, :] += sigma * torch.randn(node[:, 0, :].shape, generator=generator,
-                                         device=node.device, dtype=node.dtype)
-    edge = batch.edge_attr.clone()
-    edge[:, 2, :] = node[batch.edge_index[0], 0, :] - node[batch.edge_index[1], 0, :]
-    return batch._replace(node_features=node, edge_attr=edge)
-
-
 # ---------------------------------------------------------------------------
 # --procrustes: rotations fitted from the embedding matches
 # ---------------------------------------------------------------------------
 
-def kabsch(P, Q):
-    """``(R, t)`` minimising ``sum ||R p + t - q||^2`` over the last-but-one axis."""
+def shuffled_embedding(batch, embedding, generator):
+    """
+    ``--shuffle_fingerprints``: the trained fingerprints, each fragment's dealt
+    out among its own fracture-surface vertices at random -- what they encode
+    about the piece survives, which vertex carries which does not.
+    """
     import torch
 
-    cp, cq = P.mean(-2), Q.mean(-2)
-    H = (P - cp.unsqueeze(-2)).transpose(-1, -2) @ (Q - cq.unsqueeze(-2))
-    U, _, Vt = torch.linalg.svd(H)
-    V, Ut = Vt.transpose(-1, -2), U.transpose(-1, -2)
-    d = torch.sign(torch.det(V @ Ut))
-    d = torch.where(d == 0, torch.ones_like(d), d)
-    D = torch.diag_embed(torch.stack([torch.ones_like(d), torch.ones_like(d), d], -1))
-    R = V @ D @ Ut
-    t = cq - (R @ cp.unsqueeze(-1)).squeeze(-1)
-    return R, t
-
-
-def ransac_rotation(P, Q, iterations, tau, generator):
-    """Best rotation mapping ``P`` onto ``Q`` despite wrong matches, and its inlier count."""
-    import torch
-
-    m = P.shape[0]
-    weights = torch.ones(iterations, m, device=P.device)
-    sample = torch.multinomial(weights, 3, replacement=False, generator=generator)
-    R, t = kabsch(P[sample], Q[sample])                            # (K, 3, 3), (K, 3)
-    residual = (torch.einsum("kij,mj->kmi", R, P) + t[:, None, :] - Q[None]).norm(dim=-1)
-    inliers = residual < tau
-    best = int(inliers.sum(1).argmax())
-    mask = inliers[best]
-    for _ in range(2):                                             # refit on the inliers
-        if int(mask.sum()) < 3:
-            break
-        R_fit, t_fit = kabsch(P[mask], Q[mask])
-        mask = (P @ R_fit.T + t_fit - Q).norm(dim=-1) < tau
-        R[best], t[best] = R_fit, t_fit
-    return R[best], int(mask.sum())
-
-
-def fitted_rotations(batch, prediction, args, generator, noise=None):
-    """``{(i, j): (R_ij, matches, inliers)}``, global fragment indices ``i < j``;
-    ``R_ij`` maps fragment i's input frame onto fragment j's.
-
-    Reads only the network's input (scattered coordinates, which fragment each
-    vertex is in, the fracture mask, the normalisation scale) and its output
-    (the embeddings) -- never a ground-truth field; ``--hide_truth`` checks it.
-    ``noise`` is the generator for ``--drop`` and ``--shuffle_fingerprints``,
-    kept apart from the RANSAC one so those draws are unchanged without them."""
-    import torch
-
-    from reassembly.assembly.translation import mutual_nearest_neighbours, subsample_per_fragment
-
-    fitted = {}
-    points = batch.node_features[:, 0, :].double()
-    unit = batch.unit.double()
+    embedding = embedding.clone()
     fragment = batch.vertex_fragment.long()
-    fragment_ptr = batch.fragment_ptr.tolist()
-    vertex_ptr = batch.vertex_ptr.tolist()
-    embedding = prediction.vertex_embedding
-    for s in range(int(batch.num_scenes)):
-        f0, f1 = fragment_ptr[s], fragment_ptr[s + 1]
-        v0, v1 = vertex_ptr[f0], vertex_ptr[f1]
-        if f1 - f0 < 2:
-            continue
-        local = fragment[v0:v1] - f0
-        # In units of the scene's largest fragment, whatever the normalisation mode.
-        scale = unit[f0:f1] / unit[f0:f1].max()
-        p = points[v0:v1] * scale[local, None]
-        candidates = None if batch.fracture is None else batch.fracture[v0:v1].clone()
-        if args.drop > 0 and candidates is not None:
-            candidates &= torch.rand(candidates.shape, generator=noise,
-                                     device=candidates.device) >= args.drop
-        scene_embedding = embedding[v0:v1]
-        if args.shuffle_fingerprints:
-            # Same fingerprints, each fragment's dealt out among its own
-            # fracture-surface vertices at random: what they encode about the
-            # piece survives, which vertex carries which does not.
-            scene_embedding = scene_embedding.clone()
-            pool = candidates if candidates is not None else torch.ones_like(local, dtype=torch.bool)
-            for f in range(f1 - f0):
-                index = torch.nonzero((local == f) & pool).flatten()
-                if index.numel() > 1:
-                    order = torch.randperm(index.numel(), generator=noise, device=index.device)
-                    scene_embedding[index] = scene_embedding[index[order]]
-        keep = subsample_per_fragment(local, 2048, candidates)
-        source, target = mutual_nearest_neighbours(scene_embedding[keep], local[keep])
-        source, target = keep[source], keep[target]
-        if source.numel() == 0:
-            continue
-        a, b = local[source], local[target]                       # a < b by construction
-        pair_id = a * (f1 - f0) + b
-        for pid in torch.unique(pair_id).tolist():
-            chosen = pair_id == pid
-            count = int(chosen.sum())
-            if count < args.min_matches:
-                continue
-            i, j = divmod(pid, f1 - f0)
-            R, inliers = ransac_rotation(p[source[chosen]], p[target[chosen]],
-                                         args.ransac_iters, args.ransac_tau, generator)
-            fitted[(f0 + i, f0 + j)] = (R, count, inliers)
+    pool = batch.fracture if batch.fracture is not None else torch.ones_like(fragment,
+                                                                              dtype=torch.bool)
+    for f in range(int(batch.num_fragments)):
+        index = torch.nonzero((fragment == f) & pool).flatten()
+        if index.numel() > 1:
+            order = torch.randperm(index.numel(), generator=generator, device=index.device)
+            embedding[index] = embedding[index[order]]
+    return embedding
+
+
+def fitted_pairs(matched, fragment_ptr):
+    """``{(i, j): (R_ij, matches, inliers)}`` in global fragment indices, ``i < j``,
+    from the package's per-scene fits; ``R_ij`` maps fragment i's input frame
+    onto fragment j's."""
+    fitted = {}
+    for scene, pairs in enumerate(matched.pairs):
+        f0 = fragment_ptr[scene]
+        for pair in pairs:
+            fitted[(f0 + pair.i, f0 + pair.j)] = (pair.rotation.double(), pair.matches,
+                                                  pair.inliers)
     return fitted
 
 
@@ -372,10 +305,11 @@ def chain_from_anchor(fitted, anchors, fragment_ptr, roots, min_inliers):
     """Fitted rotations composed outward from each scene's anchor along a maximum
     spanning tree of inlier counts. ``{fragment: (R, parent)}`` for reached fragments.
 
-    ``roots`` are the NETWORK's rotations: each tree starts from the anchor's
-    predicted rotation, so nothing here touches the truth. Scoring then sets the
-    anchor to its true pose (the benchmark protocol), which turns ``R`` into
-    ``T_a R_hat_a^T R`` -- exactly as if the tree had started from ``T_a``."""
+    The same tree the package's ``chain_rotations`` grows (Prim's, the largest
+    inlier count across the boundary, the same order on ties), kept here for
+    one thing that function does not return: each fragment's parent, to say
+    whether the tree's edges join pieces that really touch. ``roots`` are the
+    rotations each tree starts from -- the identity, as the method has them."""
     reached = {}
     for s, a in enumerate(anchors):
         f0, f1 = fragment_ptr[s], fragment_ptr[s + 1]
@@ -432,12 +366,14 @@ def contact_matrix(cluster, vertex_fragment, count):
     return contact + contact.T
 
 
-def analyse(batch, prediction, config, args, generator=None, seen=None, noise=None):
+def analyse(batch, matched, config, args):
     """Per-fragment rows, per-pair rows and reach counts for one batch.
 
-    ``batch`` carries the truth and is used to SCORE; ``seen`` is what the
-    solver is given (the same batch, or with ``--hide_truth`` one whose
-    ground-truth fields are NaN)."""
+    ``batch`` carries the truth and is used to SCORE; ``matched`` is what the
+    method made of what it was shown -- the rotations fitted from the
+    embedding matches (``match_batch`` on the batch as seen, which under
+    ``--hide_truth`` has its ground-truth fields NaN), each scene's root at the
+    identity."""
     import torch
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import shortest_path
@@ -453,12 +389,14 @@ def analyse(batch, prediction, config, args, generator=None, seen=None, noise=No
     N = vf.numel()
     dev = vf.device
 
-    R_hat = prediction.rotation.double()
+    R_hat = matched.rotation.double()
     T = batch.target_rotation.double()
     anchor = anchor_fragments(batch.log_scale, scene, S)
+    # Scoring only: the benchmark protocol sets each anchor to its true pose,
+    # which carries every fragment chained from it along.
     aligned, _ = align_to_anchor(R_hat, T, scene, anchor)
     err = (geodesic_angle(aligned, T) * deg).cpu().numpy()
-    absolute = (geodesic_angle(R_hat, T) * deg).cpu().numpy()
+    reached_by_chain = matched.reached.cpu().numpy()
     # Object frame, E = aligned @ T^T. Computed with the identity as the
     # "prediction", so it does not depend on which residual the installed
     # swing_twist_error takes: both conventions then give E or E^T, whose
@@ -534,18 +472,11 @@ def analyse(batch, prediction, config, args, generator=None, seen=None, noise=No
         rel_matrix[I, J] = rel
         rel_matrix[J, I] = rel
 
-    fitted, chained = {}, {}
-    if args.procrustes:
-        # The solver gets `seen` -- with --hide_truth, a batch whose ground-truth
-        # fields are NaN -- and starts each tree from the network's own rotation.
-        fitted = fitted_rotations(seen if seen is not None else batch, prediction, args,
-                                  generator, noise)
-        chained = chain_from_anchor(fitted, anchors.tolist(), ptr.tolist(), R_hat,
-                                    args.min_matches)
-        # Scoring only: the benchmark protocol sets each anchor to its true pose.
-        for f, (R, parent) in list(chained.items()):
-            a = int(anchors[int(scene_np[f])])
-            chained[f] = (T[a] @ R_hat[a].transpose(-1, -2) @ R, parent)
+    # The package's own fits, and the same tree grown again for its parents.
+    fitted = fitted_pairs(matched, ptr.tolist())
+    identity = torch.eye(3, dtype=torch.float64, device=R_hat.device).expand(F, 3, 3)
+    chained = chain_from_anchor(fitted, anchors.tolist(), ptr.tolist(), identity,
+                                args.min_matches)
 
     def fit_error(R, i, j):
         truth = T[j].transpose(-1, -2) @ T[i]
@@ -571,22 +502,20 @@ def analyse(batch, prediction, config, args, generator=None, seen=None, noise=No
             **{f"reach{h}": reach[f, h] for h in range(HOPS + 1)},
             neighbours=len(neighbours), contact_with_anchor=int(contact[f, a]) if f != a else 0,
             hops_to_anchor=hops[f],
-            err_anchor_deg=err[f], err_absolute_deg=absolute[f],
+            err_anchor_deg=err[f],
             err_nbr_mean_deg=float(nbr.mean()) if len(nbr) else np.nan,
             err_nbr_min_deg=float(nbr.min()) if len(nbr) else np.nan,
             **{f"tilt_{x}": obj[x][0][f] for x in AXES},
             **{f"twist_{x}": obj[x][1][f] for x in AXES},
             tilt_logged=logged[0][f], twist_logged=logged[1][f],
         )
-        if args.procrustes:
-            pose = chained.get(f)
-            parent = pose[1] if pose else -1
-            row.update(
-                chain_reached=int(pose is not None and f != a),
-                chain_err_deg=(float(geodesic_angle(pose[0][None], T[f][None])[0] * deg)
-                               if pose is not None and f != a else np.nan),
-                chain_edge_touching=(int(touch[f, parent]) if pose is not None and f != a
-                                     else -1))
+        pose = chained.get(f)
+        parent = pose[1] if pose else -1
+        reached = bool(reached_by_chain[f]) and f != a
+        row.update(
+            chain_reached=int(reached),
+            chain_err_deg=float(err[f]) if reached else np.nan,
+            chain_edge_touching=int(touch[f, parent]) if reached and parent >= 0 else -1)
         rows.append(row)
 
     pairs = []
@@ -597,10 +526,9 @@ def analyse(batch, prediction, config, args, generator=None, seen=None, noise=No
                    contact=int(contact[i, j]), touching=int(touch[i, j]),
                    vertices_i=rows[i]["vertices"], vertices_j=rows[j]["vertices"],
                    rel_err_deg=float(r))
-        if args.procrustes:
-            hit = fitted.get((int(i), int(j)))
-            row.update(matches=hit[1] if hit else 0, inliers=hit[2] if hit else 0,
-                       fit_err_deg=fit_error(hit[0], int(i), int(j)) if hit else np.nan)
+        hit = fitted.get((int(i), int(j)))
+        row.update(matches=hit[1] if hit else 0, inliers=hit[2] if hit else 0,
+                   fit_err_deg=fit_error(hit[0], int(i), int(j)) if hit else np.nan)
         pairs.append(row)
     return rows, pairs, reach_counts, N
 
@@ -632,29 +560,60 @@ def quartiles(x, e):
     return cells, rho
 
 
+def headline(rows, state, args, seconds, counters) -> dict:
+    """The numbers summary.json keeps, and --table lines up across probes."""
+    scored = column(rows, "anchor") == 0
+    err = column(rows, "err_anchor_deg")[scored]
+    reached = column(rows, "chain_reached")[scored]
+    epoch = state.get("epoch")
+    out = {
+        "test": tests(args) or "none", "cross": args.cross, "split": args.split,
+        # The folder and the file: which run, and which of its checkpoints.
+        "checkpoint": "/".join(Path(str(args.checkpoint)).parts[-2:]),
+        # 1-based, as the training log and --evaluate print it.
+        "epoch": epoch + 1 if isinstance(epoch, int) else epoch,
+        "scenes": len({r["scene"] for r in rows}), "scored_fragments": int(scored.sum()),
+        "mean_deg": float(err.mean()) if err.size else float("nan"),
+        "median_deg": float(np.median(err)) if err.size else float("nan"),
+        "reached": float(reached.mean()) if reached.size else float("nan"),
+        "seconds": round(seconds, 1), "oom_batches": counters["oom"],
+    }
+    for threshold in (5, 10, 30):
+        out[f"acc@{threshold}"] = float((err < threshold).mean()) if err.size else float("nan")
+    return out
+
+
 def summarise(rows, pairs, reach_counts, vertex_total, config, state, args, seconds, counters):
     out = []
     say = out.append
     scored = column(rows, "anchor") == 0
     err = column(rows, "err_anchor_deg")
-    scenes = len({r["scene"] for r in rows})
-    say(f"{args.split}: {scenes} scenes, {int(scored.sum())} scored fragments "
+    top = headline(rows, state, args, seconds, counters)
+    say(f"{args.split}: {top['scenes']} scenes, {int(scored.sum())} scored fragments "
         f"({len(rows) - int(scored.sum())} anchors), {seconds:.0f} s, cross layers: {args.cross}")
-    if tests(args):
-        say(f"  tests: {tests(args)}")
-    say(f"  mean anchor-aligned error {err[scored].mean():.2f} deg, median "
-        f"{np.median(err[scored]):.2f} (chance {CHANCE_DEG})")
+    say(f"  tests: {tests(args) or 'none -- the model and the data as trained and validated'}")
+    say(f"  rotations fitted from the embedding matches, anchor-aligned: mean "
+        f"{top['mean_deg']:.2f} deg, median {top['median_deg']:.2f} (chance {CHANCE_DEG})")
+    say(f"  acc@5 {top['acc@5']:.3f}  acc@10 {top['acc@10']:.3f}  acc@30 {top['acc@30']:.3f}   "
+        f"reached by the chain {100 * top['reached']:.1f}% (the rest at chance)")
     history = state.get("history") or []
     logged = [r for r in history if r.get("epoch") == state.get("epoch")] or history[-1:]
-    unchanged_model = not (args.untrained or args.jitter > 0)
+    head = bool(logged) and any(key in logged[0] for key in ("val_head_cos",
+                                                             "val_absolute_geodesic_deg"))
+    unchanged = (args.cross == "normal" and not tests(args))
     if logged and args.split == "val" and "val_geodesic_deg" in logged[0]:
-        if args.cross == "normal" and unchanged_model:
-            say(f"  the run logged val_geodesic_deg {logged[0]['val_geodesic_deg']:.2f} at epoch "
-                f"{logged[0].get('epoch')} -- the two should agree (same scenes, same draws)")
+        value = logged[0]["val_geodesic_deg"]
+        when = logged[0].get("epoch", -1) + 1
+        if head:
+            say(f"  the run logged val_geodesic_deg {value:.2f} at epoch {when} for its ROTATION "
+                f"HEAD (removed in v7), not for these rotations")
+        elif unchanged:
+            say(f"  the run logged val_geodesic_deg {value:.2f} at epoch {when} -- the two should "
+                f"agree when this probe scores the run's own validation scenes (the default "
+                f"--limit)")
         else:
-            say(f"  the run logged val_geodesic_deg {logged[0]['val_geodesic_deg']:.2f} at epoch "
-                f"{logged[0].get('epoch')} with the trained model, clean input and the cross "
-                f"layers working normally")
+            say(f"  the run logged val_geodesic_deg {value:.2f} at epoch {when} with the trained "
+                f"model, clean input and the cross layers working normally")
     if args.cross == "swap":
         say(f"  swap partners: {counters['swap_same_object']} scene(s) had to take a scene of "
             f"the same object, {counters['swap_alone']} had no partner (left with none)")
@@ -668,15 +627,16 @@ def summarise(rows, pairs, reach_counts, vertex_total, config, state, args, seco
     say("token reach (vertex-weighted): tokens " + f"{100 * share[0]:.0f}%  " +
         "  ".join(f"+{h} {100 * share[h]:.0f}%" for h in range(1, HOPS + 1)))
     layers = cross_hops(config.schedule)
+    say(f"  schedule {' '.join(config.schedule)}")
     if layers:
-        say(f"  schedule {' '.join(config.schedule)}")
         say("  " + ", ".join(f"cross layer {n} -> +{h}" for n, h in layers))
         first = max(h for _, h in layers)
         last = layers[-1][1]
-        say(f"  pooled by the head: {100 * share[min(first, HOPS)]:.0f}% of vertices carry "
+        say(f"  by the last layer: {100 * share[min(first, HOPS)]:.0f}% of vertices carry "
             f"some cross-fragment information, {100 * share[min(last, HOPS)]:.0f}% carry the "
             f"last round")
     else:
+        say("  no cross layer: every fragment is described on its own")
         first = last = 0
 
     # -- (a) error vs fragment properties -------------------------------------
@@ -758,62 +718,88 @@ def summarise(rows, pairs, reach_counts, vertex_total, config, state, args, seco
         say(f"    {name[:18]:18}{int(mask.sum()):6d}{e[mask].mean():7.1f}{cells}")
 
     # -- (d) rotations fitted from the embedding matches ----------------------
-    if args.procrustes:
-        say("")
-        say("(d) relative rotation fitted from the embedding matches (mutual nearest neighbours "
-            "on fracture-surface")
-        say(f"    points, Kabsch + RANSAC, inliers within {args.ransac_tau:g} of the largest "
-            f"fragment's radius, >= {args.min_matches} needed)")
-        fit = column(pairs, "fit_err_deg")
-        has_fit = np.isfinite(fit)
+    say("")
+    say("(d) relative rotation fitted for each pair from the embedding matches (mutual nearest "
+        "neighbours on")
+    say(f"    fracture-surface points, Kabsch + RANSAC, inliers within {args.ransac_tau:g} of "
+        f"the largest fragment's radius, >= {args.min_matches} needed), against the truth")
+    fit = column(pairs, "fit_err_deg")
+    has_fit = np.isfinite(fit)
 
-        def compare(label, mask):
-            n = int(mask.sum())
-            if not n:
-                say(f"    {label}: none")
-                return
-            net, fitted_ = rel[mask], fit[mask]
-            say(f"    {label}: {n} pairs")
-            say(f"      {'':16}{'network':>16}{'fitted':>16}")
-            say(f"      {'mean / median':16}{net.mean():8.1f}/{np.median(net):6.1f}"
-                f"{fitted_.mean():9.1f}/{np.median(fitted_):6.1f}")
-            for threshold in (5, 15, 30):
-                say(f"      {f'< {threshold} deg':16}{100 * (net < threshold).mean():15.0f}%"
-                    f"{100 * (fitted_ < threshold).mean():15.0f}%")
-            say(f"      fitted closer to the truth in {100 * (fitted_ < net).mean():.0f}% "
-                f"of them")
+    def fits(label, mask):
+        n = int(mask.sum())
+        if not n:
+            say(f"    {label}: none")
+            return
+        values = fit[mask]
+        say(f"    {label}: {n} pairs, fitted error mean {values.mean():.2f} / median "
+            f"{np.median(values):.2f} deg; " + ", ".join(
+                f"< {t} deg {100 * (values < t).mean():.0f}%" for t in (5, 15, 30)))
 
-        say(f"    touching pairs with a fit: {int((touching & has_fit).sum())} of "
-            f"{int(touching.sum())}")
-        compare("touching", touching & has_fit)
-        compare("touching, with the anchor", touching & has_fit & with_anchor)
-        say(f"    pairs that do NOT touch but still got a fit (false matches): "
-            f"{int((~touching & has_fit).sum())} of {int((~touching).sum())}, fitted error "
-            + (f"{np.median(fit[~touching & has_fit]):.1f} median" if (~touching & has_fit).any()
-               else "-"))
-        chain = column(sub, "chain_err_deg")
-        got = np.isfinite(chain)
-        say("    chained outward from the anchor along the best-matched pairs (no ground-truth "
-            "contacts used):")
-        if got.any():
-            edge = column(sub, "chain_edge_touching")
-            say(f"      reached {int(got.sum())} of {len(sub)} scored fragments "
-                f"({100 * got.mean():.0f}%); tree edges between pieces that really touch: "
-                f"{100 * (edge[got] == 1).mean():.0f}%")
-            say(f"      on those fragments: network {e[got].mean():.1f} / {np.median(e[got]):.1f}"
-                f"   chained {chain[got].mean():.1f} / {np.median(chain[got]):.1f}  "
-                f"(mean / median)")
-            combined = np.where(got, chain, e)
-            say(f"      all scored fragments, chained where reached and the network elsewhere: "
-                f"{combined.mean():.1f} mean, {np.median(combined):.1f} median "
-                f"(network alone {e.mean():.1f})")
-        else:
-            say("      no fragment reached")
+    say(f"    touching pairs with a fit: {int((touching & has_fit).sum())} of "
+        f"{int(touching.sum())}")
+    fits("touching", touching & has_fit)
+    fits("touching, with the anchor", touching & has_fit & with_anchor)
+    say(f"    pairs that do NOT touch but still got a fit (false matches): "
+        f"{int((~touching & has_fit).sum())} of {int((~touching).sum())}, fitted error "
+        + (f"{np.median(fit[~touching & has_fit]):.1f} median" if (~touching & has_fit).any()
+           else "-"))
+    chain = column(sub, "chain_err_deg")
+    got = np.isfinite(chain)
+    say("    chained outward from the anchor along the best-matched pairs (no ground-truth "
+        "contacts used):")
+    if got.any():
+        edge = column(sub, "chain_edge_touching")
+        say(f"      reached {int(got.sum())} of {len(sub)} scored fragments "
+            f"({100 * got.mean():.0f}%); tree edges between pieces that really touch: "
+            f"{100 * (edge[got] == 1).mean():.0f}%")
+        say(f"      reached fragments: {chain[got].mean():.2f} mean, {np.median(chain[got]):.2f} "
+            f"median; all scored fragments (the rest at chance): {e.mean():.2f} mean, "
+            f"{np.median(e):.2f} median")
+    else:
+        say("      no fragment reached")
     return out
+
+
+def table(folders, out: Path) -> int:
+    """``--table``: the probes' summary.json side by side, as Markdown and CSV."""
+    rows = []
+    for folder in folders:
+        path = Path(folder) / "summary.json"
+        if not path.is_file():
+            print(f"no summary.json in {folder} -- run the probe there first")
+            return 2
+        rows.append({"probe": Path(folder).name, **json.loads(path.read_text())})
+    out.mkdir(parents=True, exist_ok=True)
+    columns = ["probe", "test", "cross", "scenes", "scored_fragments", "mean_deg", "median_deg",
+               "acc@5", "acc@10", "acc@30", "reached", "checkpoint", "epoch"]
+    with open(out / "probes.csv", "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    def cell(value):
+        if isinstance(value, float):
+            return "-" if value != value else f"{value:.3f}"
+        return str(value)
+
+    lines = ["| " + " | ".join(columns) + " |", "|" + "---|" * len(columns)]
+    lines += ["| " + " | ".join(cell(row.get(c, "")) for c in columns) + " |" for row in rows]
+    lines += ["", "mean/median: anchor-aligned error of the rotations fitted from the embedding "
+              "matches, degrees (chance 126.5); acc@k: share of scored fragments within k "
+              "degrees; reached: share the chain placed (the rest at chance).",
+              "Expected: --hide_truth equals the plain run; --untrained and "
+              "--shuffle_fingerprints fall to chance; --jitter/--drop degrade."]
+    (out / "probes.md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    print(f"\nwrote {out / 'probes.md'} and {out / 'probes.csv'}")
+    return 0
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.table:
+        return table(args.table, Path(args.out))
     repo = Path(args.repo).resolve()
     if not (repo / "src" / "reassembly").is_dir():
         print(f"no src/reassembly under {repo}: run from the repository root or pass --repo")
@@ -823,13 +809,18 @@ def main(argv=None) -> int:
 
     import torch
 
+    from reassembly.assembly.rotation import match_batch
     from reassembly.data.features import complete_batch
-    from reassembly.training import (BreakingBadScenes, _is_oom, _loader, _to_device,
-                                     build_model)
+    from reassembly.evaluation.noise import jitter_inputs
+    from reassembly.training import (BreakingBadScenes, _head_keys, _is_oom, _loader,
+                                     _to_device, build_model)
 
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = config_from_checkpoint(state, args)
+    if args.seed is None:
+        # The run's own seed, so the RANSAC and noise draws are validation's.
+        args.seed = config.seed
     if args.print_flags:
         from scripts.config_flags import config_flags
 
@@ -849,7 +840,13 @@ def main(argv=None) -> int:
         torch.manual_seed(args.seed)               # random weights, same architecture
     model = build_model(config).to(device)
     if not args.untrained:
-        model.load_state_dict(state["model"])
+        weights = state["model"]
+        head = _head_keys(weights)
+        if head:
+            print(f"the checkpoint carries the rotation head v7 removed ({len(head)} tensors): "
+                  f"not loaded, the rotations come from the matches")
+            weights = {k: v for k, v in weights.items() if k not in head}
+        model.load_state_dict(weights)
     model.eval()
 
     scenes_per_batch = args.batch_scenes or (min(config.batch_size, 4) if args.cross == "swap"
@@ -863,10 +860,10 @@ def main(argv=None) -> int:
         dataset.items = [dataset.items[i] for i in order]
     loader = _loader(dataset, config, False, 0, 1, 0,
                      pairs_in_worker=not str(device).startswith("cuda"))
-    generator = torch.Generator(device=device).manual_seed(args.seed)
-    # A separate stream for the tests, so RANSAC draws exactly as it does without them.
+    # The shuffle's own stream; RANSAC, --jitter and --drop draw per scene from
+    # the seed and the scene's name, as validation and --evaluate do.
     noise = torch.Generator(device=device).manual_seed(args.seed + 1)
-    print(f"checkpoint {args.checkpoint} (epoch {state.get('epoch')}), {len(dataset)} "
+    print(f"checkpoint {args.checkpoint} (epoch {state.get('epoch', -1) + 1}), {len(dataset)} "
           f"{args.split} scenes, schedule {' '.join(config.schedule)}, cross layers: "
           f"{args.cross}, {scenes_per_batch} scenes per batch, device {device}")
     if tests(args):
@@ -886,7 +883,7 @@ def main(argv=None) -> int:
             # loader always does; after this point the truth is only for scoring.
             batch = rewire(complete_batch(_to_device(batch, device)), args.cross, counters)
             if args.jitter > 0:
-                batch = jitter_inputs(batch, args.jitter, noise)
+                batch = jitter_inputs(batch, args.jitter, args.seed)
             seen = hide_truth(batch) if args.hide_truth else batch
             try:
                 # Exactly the inputs `training._forward` passes the model.
@@ -895,6 +892,14 @@ def main(argv=None) -> int:
                     seen.vertex_fragment, seen.num_fragments,
                     log_scale=seen.log_scale, token_index=seen.token_index,
                     token_query=seen.token_query, token_key=seen.token_key)
+                embedding = prediction.vertex_embedding
+                if args.shuffle_fingerprints:
+                    embedding = shuffled_embedding(seen, embedding, noise)
+                # The method's rotations, from what it was shown -- the package's
+                # own matching, as validation and --evaluate run it.
+                matched = match_batch(seen, embedding, seed=args.seed, drop=args.drop,
+                                      min_matches=args.min_matches, tau=args.ransac_tau,
+                                      iterations=args.ransac_iters)
             except Exception as error:                      # noqa: BLE001
                 if not _is_oom(error):
                     raise
@@ -902,8 +907,7 @@ def main(argv=None) -> int:
                 if str(device).startswith("cuda"):
                     torch.cuda.empty_cache()
                 continue
-            r, p, counts, n = analyse(batch, prediction, config, args, generator,
-                                      seen=seen, noise=noise)
+            r, p, counts, n = analyse(batch, matched, config, args)
             rows += r
             pairs += p
             reach_counts += counts
@@ -920,12 +924,16 @@ def main(argv=None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     write_csv(out / "fragments.csv", rows)
     write_csv(out / "pairs.csv", pairs)
+    seconds = time.time() - began
     lines = summarise(rows, pairs, reach_counts, vertex_total, config, state, args,
-                      time.time() - began, counters)
+                      seconds, counters)
     text = "\n".join(lines)
     print("\n" + text)
     (out / "summary.txt").write_text(text + "\n")
-    print(f"\nwrote {out / 'fragments.csv'}, {out / 'pairs.csv'}, {out / 'summary.txt'}")
+    (out / "summary.json").write_text(json.dumps(headline(rows, state, args, seconds, counters),
+                                                 indent=2) + "\n")
+    print(f"\nwrote {out / 'fragments.csv'}, {out / 'pairs.csv'}, {out / 'summary.txt'}, "
+          f"{out / 'summary.json'}")
     return 0
 
 

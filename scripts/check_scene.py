@@ -94,10 +94,11 @@ def check_trial(dataset, index, model, criterion, config, device, seed, amp) -> 
 
     with torch.no_grad():
         keep = {}
-        loss, terms, _ = _forward(model, batch, criterion, config, keep=keep)
+        loss, terms, _ = _forward(model, batch, criterion, config, keep=keep, score=True)
     prediction = keep["prediction"]
     report["loss"] = float(loss)
-    report["model_nonfinite"] = (_bad(prediction.rotation) + _bad(prediction.vertex_embedding)
+    report["model_nonfinite"] = (_bad(keep["matched"].rotation)
+                                 + _bad(prediction.vertex_embedding)
                                  + _bad(prediction.vertex_features))
     if report["model_nonfinite"] or not np.isfinite(report["loss"]):
         report["stage"] = "MODEL in float32 -- a real numerical bug"
@@ -105,15 +106,16 @@ def check_trial(dataset, index, model, criterion, config, device, seed, amp) -> 
 
     if amp and str(device).startswith("cuda"):
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-            loss16, _, R16 = _forward(model, batch, criterion, config)
+            loss16, _, R16 = _forward(model, batch, criterion, config, score=True)
         if not np.isfinite(float(loss16)) or _bad(R16):
             report["stage"] = "MODEL under AMP only -- fp16 overflow"
             return report
 
     model.zero_grad(set_to_none=True)
     with torch.enable_grad():
-        loss, _, _ = _forward(model, batch, criterion, config)
-        loss.backward()
+        loss, _, _ = _forward(model, batch, criterion, config, score=False)
+        if loss.requires_grad:          # no coincidence cluster: nothing to differentiate
+            loss.backward()
     bad = [name for name, p in model.named_parameters()
            if p.grad is not None and not bool(torch.isfinite(p.grad).all())]
     model.zero_grad(set_to_none=True)

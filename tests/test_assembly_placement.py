@@ -22,7 +22,7 @@ from reassembly.assembly import (  # noqa: E402
     PairRotation,
     agreement_deg,
     check_placement,
-    default_placement,
+    match_batch,
     match_rotations,
     pairwise_rotations,
     ransac_motion,
@@ -119,7 +119,7 @@ def _stacked_scene():
     return collate([sample], dtype=DTYPE)
 
 
-def _with_wrong_matches(batch, rotation, decoys: int, seed: int = 5, isolate=()):
+def _with_wrong_matches(batch, decoys: int, seed: int = 5, isolate=()):
     """
     The oracle's prediction (exact matches across every break), with
     ``decoys`` wrong matches added: two break vertices on slabs that do not
@@ -128,7 +128,7 @@ def _with_wrong_matches(batch, rotation, decoys: int, seed: int = 5, isolate=())
     gets a code of its own first, so none of its true matches survives; the
     wrong ones may still use it.
     """
-    prediction = _oracle(batch, rotation)
+    prediction = _oracle(batch)
     fragment = batch.vertex_fragment.long()
     fracture = batch.fracture.bool()
     count = int(batch.fragment_ptr[-1])
@@ -167,9 +167,9 @@ def test_wrong_matches_pull_the_global_solve_together_but_not_the_checked_one():
     the same rotations, places every slab exactly.
     """
     batch = _stacked_scene()
-    prediction = _with_wrong_matches(batch, _rotations(len(THICKNESS), 9), decoys=150)
-    global_ = score_batch(batch, prediction, rotations="matched", placement="global")[0]
-    checked = score_batch(batch, prediction, rotations="matched", placement="checked")[0]
+    prediction = _with_wrong_matches(batch, decoys=150)
+    global_ = score_batch(batch, prediction, placement="global")[0]
+    checked = score_batch(batch, prediction, placement="checked")[0]
 
     assert global_["_rotation"] == checked["_rotation"]
     assert checked["geodesic_deg"] < 1e-6 and checked["matched_share"] == 1.0
@@ -186,9 +186,9 @@ def test_wrong_matches_pull_the_global_solve_together_but_not_the_checked_one():
 
 def test_without_wrong_matches_both_placements_are_exact():
     batch = _stacked_scene()
-    prediction = _oracle(batch, _rotations(len(THICKNESS), 9))
+    prediction = _oracle(batch)
     for placement in ("global", "checked"):
-        scene = score_batch(batch, prediction, rotations="matched", placement=placement)[0]
+        scene = score_batch(batch, prediction, placement=placement)[0]
         assert scene["part_accuracy"] == 1.0 and scene["rmse_t"] < 1e-6, placement
     assert scene["verified_matches"] == scene["matches"]
 
@@ -196,13 +196,13 @@ def test_without_wrong_matches_both_placements_are_exact():
 def test_a_fragment_the_chain_cannot_reach_misplaces_only_itself():
     """
     Slab 0 keeps no true match, only wrong ones, so the chain cannot reach it
-    and it keeps the head's wrong rotation. It is placed from those matches
-    with every other slab held: wherever it lands, the others stay exact.
+    and it keeps a rotation unrelated to its own (the anchor's input frame).
+    It is placed from those matches with every other slab held: wherever it
+    lands, the others stay exact.
     """
     batch = _stacked_scene()
-    head = _rotations(len(THICKNESS), 9)
-    prediction = _with_wrong_matches(batch, head, decoys=40, isolate=(0,))
-    scene = score_batch(batch, prediction, rotations="matched", placement="checked")[0]
+    prediction = _with_wrong_matches(batch, decoys=40, isolate=(0,))
+    scene = score_batch(batch, prediction, placement="checked")[0]
     assert scene["_reached"] == [False] + [True] * (len(THICKNESS) - 1)
     assert scene["_scored_geodesic_deg"][0] > 10.0
     true = (batch.centroid - batch.centroid[scene["_anchor"]]).numpy()
@@ -212,8 +212,15 @@ def test_a_fragment_the_chain_cannot_reach_misplaces_only_itself():
 
 
 def test_the_mean_gauge_centres_the_checked_placement(fractured_solid):
+    """Without the anchor the rotations are taken as they are, so they are given
+    here already in the true frame: the matched ones, aligned by hand."""
+    from reassembly.nn.anchor import anchor_alignment
+
     batch, _ = _broken_scene(fractured_solid)
-    scene = score_batch(batch, _oracle(batch, batch.target_rotation), rotations="matched",
+    oracle = _oracle(batch)
+    matched = match_batch(batch, oracle.vertex_embedding)
+    aligned, _ = anchor_alignment(batch, matched.rotation)
+    scene = score_batch(batch, oracle, matched=matched._replace(rotation=aligned),
                         anchor=False)[0]
     assert scene["rmse_t"] < 1e-9 and scene["part_accuracy"] == 1.0
     assert np.allclose(np.mean(scene["_translation"], axis=0), 0.0, atol=1e-12)
@@ -221,8 +228,7 @@ def test_the_mean_gauge_centres_the_checked_placement(fractured_solid):
 
 def test_collisions_still_measure_from_the_anchor(fractured_solid):
     batch, _ = _broken_scene(fractured_solid)
-    scene = score_batch(batch, _oracle(batch, batch.target_rotation), rotations="matched",
-                        collision=True)[0]
+    scene = score_batch(batch, _oracle(batch), collision=True)[0]
     assert scene["_translation"][scene["_anchor"]] == [0.0, 0.0, 0.0]
 
 
@@ -249,7 +255,7 @@ def test_each_pair_carries_the_matches_its_motion_moves_into_place(fractured_sol
     batch, _ = _broken_scene(fractured_solid)
     points = batch.node_features[:, 0, :] * batch.unit[batch.vertex_fragment, None]
     points = points / batch.unit.max()
-    oracle = _oracle(batch, batch.target_rotation)
+    oracle = _oracle(batch)
     pairs = pairwise_rotations(points, batch.vertex_fragment, oracle.vertex_embedding, 2,
                                candidates=batch.fracture,
                                generator=torch.Generator().manual_seed(0))
@@ -327,26 +333,21 @@ def test_agreement_is_the_angle_between_the_fit_and_the_chain():
 
 # ------------------------------------------------------------ the switch --
 
-def test_the_placement_defaults_follow_the_rotations(fractured_solid):
-    assert default_placement("matched") == "checked"
-    assert default_placement("network") == "global"
-    assert check_placement("matched", None) == "checked"
-    assert check_placement("matched", "global") == "global"
+def test_the_placement_defaults_to_checked(fractured_solid):
+    assert check_placement(None) == "checked"
+    assert check_placement("global") == "global"
     batch, _ = _broken_scene(fractured_solid)
-    oracle = _oracle(batch, batch.target_rotation)
-    assert "verified_matches" in score_batch(batch, oracle, rotations="matched")[0]
-    network = score_batch(batch, oracle)[0]
-    assert "verified_matches" not in network
-    assert network == score_batch(batch, oracle, placement="global")[0]
+    oracle = _oracle(batch)
+    checked = score_batch(batch, oracle)[0]
+    assert "verified_matches" in checked
+    assert checked == score_batch(batch, oracle, placement="checked")[0]
+    assert "verified_matches" not in score_batch(batch, oracle, placement="global")[0]
 
 
-def test_a_placement_that_cannot_be_used_is_rejected(fractured_solid):
+def test_an_unknown_placement_is_rejected(fractured_solid):
     batch, _ = _broken_scene(fractured_solid)
-    oracle = _oracle(batch, batch.target_rotation)
-    with pytest.raises(ValueError, match="placement 'checked' places"):
-        score_batch(batch, oracle, placement="checked")
     with pytest.raises(ValueError, match="placement must be one of"):
-        score_batch(batch, oracle, rotations="matched", placement="sideways")
+        score_batch(batch, _oracle(batch), placement="sideways")
 
 
 def test_the_root_is_held_where_it_is(fractured_solid):
@@ -362,7 +363,7 @@ def test_the_root_is_held_where_it_is(fractured_solid):
     points = apply_rotation(batch.node_features[:, 0, :], rotation, fragment) * unit
     normals = apply_rotation(batch.node_features[:, 1, :], rotation, fragment)
     raw = batch.node_features[:, 0, :] * unit / batch.unit.max()
-    oracle = _oracle(batch, rotation)
+    oracle = _oracle(batch)
     root = int(torch.argmax(batch.log_scale.flatten()))
     chained, reached, pairs = match_rotations(
         raw, fragment, oracle.vertex_embedding, rotation.clone(), root,
@@ -380,7 +381,7 @@ def test_the_chain_and_the_pairs_agree_on_a_real_scene(fractured_solid):
     batch, _ = _broken_scene(fractured_solid)
     points = batch.node_features[:, 0, :] * batch.unit[batch.vertex_fragment, None]
     points = points / batch.unit.max()
-    oracle = _oracle(batch, batch.target_rotation)
+    oracle = _oracle(batch)
     root = int(torch.argmax(batch.log_scale.flatten()))
     start = _rotations(2, 26)
     start[root] = batch.target_rotation[root]

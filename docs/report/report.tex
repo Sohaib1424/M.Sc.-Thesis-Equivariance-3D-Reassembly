@@ -1,0 +1,1113 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[a4paper, margin=2.2cm, headheight=14pt]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
+\usepackage{graphicx}
+\usepackage[export]{adjustbox}
+\usepackage{booktabs,tabularx,array,multirow}
+\usepackage{xcolor}
+\usepackage[font=small, labelfont=bf, margin=0.4cm]{caption}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{fancyhdr}
+\usepackage[hidelinks]{hyperref}
+\usepackage[nameinlink,capitalise,noabbrev]{cleveref}
+
+\setlist{itemsep=2pt, topsep=4pt, leftmargin=1.4em}
+\setlength{\parskip}{3pt}
+\renewcommand{\arraystretch}{1.18}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small Equivariant fracture reassembly: technical description}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\definecolor{vec}{HTML}{2A78D6}
+\definecolor{inv}{HTML}{EB6834}
+\definecolor{att}{HTML}{1BAF7A}
+\definecolor{outc}{HTML}{4A3AA7}
+
+\newtheorem{proposition}{Proposition}
+\theoremstyle{remark}
+\newtheorem*{remark}{Remark}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\SO}{\mathrm{SO}(3)}
+\newcommand{\x}{\mathbf{x}}
+\newcommand{\y}{\mathbf{y}}
+\newcommand{\n}{\mathbf{n}}
+\newcommand{\z}{\mathbf{z}}
+\newcommand{\T}{^{\top}}
+\newcommand{\ip}[2]{\langle #1,#2\rangle}
+\newcommand{\norm}[1]{\lVert #1\rVert}
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\atantwo}{atan2}
+\DeclareMathOperator{\tr}{tr}
+\DeclareMathOperator{\mean}{mean}
+\DeclareMathOperator{\blockdiag}{blockdiag}
+\DeclareMathOperator{\softplus}{softplus}
+\DeclareMathOperator{\MLP}{MLP}
+\DeclareMathOperator{\LN}{LN}
+\DeclareMathOperator{\clip}{clip}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{arg\,min}
+
+% a figure from figures/<name>.png at its natural size (300 dpi), never wider than the text
+\newcommand{\fig}[3]{%
+  \begin{figure}[tbp]\centering
+  \includegraphics[max width=\linewidth]{figures/#1.png}
+  \caption{#2}\label{fig:#3}
+  \end{figure}}
+
+\title{\textbf{Equivariant Reassembly of Fractured Objects}\\[4pt]
+  \large A technical description of the data, the network, the losses and the training procedure}
+\author{}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract}
+\noindent This report describes, from the raw data to the trained model, a two-stage method for reassembling fractured 3D objects. Stage one is a neural network that is \emph{equivariant} to rotations: given the fragments of a broken object, each turned by an unknown random rotation, it predicts the rotation that returns every fragment to its place, together with a rotation-invariant descriptor of every surface point. Stage two uses no learning: it matches descriptors across fragments and solves a small least-squares problem for the translations. Its vector stream is built entirely from vector neurons, and it alternates two kinds of attention layers: a graph-attention layer that runs along the edges of each fragment's own mesh, and a transformer-style layer that lets fragments exchange information through tokens sampled on their fracture surfaces, under a constraint that keeps each fragment's output equivariant to its own pose and invariant to the poses of the others. Every quantity is defined mathematically, every design decision is given its reason, and every claim of equivariance is proved and checked numerically. Throughout, the description follows the implementation of the sixth design iteration exactly; where a value was chosen for a particular training run, both the default and the value used are stated.
+\end{abstract}
+
+\tableofcontents
+\clearpage
+
+% =====================================================================
+\section{Overview}
+\label{sec:overview}
+
+\paragraph{The task.} An object has been broken into $F$ fragments. Each fragment is given as a triangle mesh, and each has been moved by an unknown rigid motion: a rotation and a translation. The goal is to recover, for every fragment, the motion that puts it back where it belongs, so that the fragments reassemble into the original object.
+
+\paragraph{The approach in one paragraph.} The problem is split into two stages (\cref{fig:pipeline}). \emph{Stage one} is a neural network that predicts only the rotation of every fragment. It is built so that rotating an input fragment rotates its prediction in exactly the corresponding way; this property, \emph{equivariance}, is guaranteed by construction rather than learned from augmented data. Besides one rotation per fragment, the network outputs a 32-dimensional, rotation-\emph{invariant} descriptor (an \emph{embedding}) for every vertex. \emph{Stage two} learns nothing: once every fragment is correctly oriented, placing the fragments is a linear least-squares problem. The descriptors of vertices on the fracture surfaces are matched across fragments, and the translations that make matched points coincide are solved for in closed form.
+
+\fig{fig_pipeline}{The two stages. The network sees each fragment centred at its own centroid and randomly rotated, and predicts one rotation per fragment ($\hat R_i$) and one rotation-invariant embedding per vertex ($\z_v$). Stage two applies the rotations, matches embeddings across fragments, and solves for the translations $\hat{\mathbf t}_i$. The labels used by the losses exist only during training.}{pipeline}
+
+\paragraph{Why two stages.} Rotation is the hard part of the problem, and it is the part where symmetry can be exploited: the correct answer for a fragment changes in a known way when the fragment is rotated, so a network that respects this needs no data to learn it. Translation is different. Once the orientations are known, the translations are determined by the requirement that the two sides of every fracture coincide, which is a quadratic energy with a closed-form minimiser. Learning it would spend data and capacity on something geometry already solves. This is the central bet of the design, and the reason the network never sees, and never predicts, a translation.
+
+\paragraph{The two kinds of layer.} The network alternates two layer types.
+\begin{itemize}
+  \item The \textbf{intra-fragment layer} is a graph-attention layer in the style of GAT~\cite{velickovic2018gat}, built from vector neurons~\cite{deng2021vn}. It passes messages along the edges of each fragment's own mesh, so information moves only within a fragment. In this report it is called the \emph{intra layer} or the \emph{VN graph-attention layer} (\cref{sec:intra}).
+  \item The \textbf{cross-fragment layer} is a transformer-style attention layer~\cite{vaswani2017attention}, also built from vector neurons. It connects \emph{tokens}, a fixed budget of vertices sampled on the fracture surfaces, across different fragments of the same object. It is called the \emph{cross layer} or the \emph{VN transformer layer} (\cref{sec:cross}).
+\end{itemize}
+Note the assignment: the graph-attention (GAT-style) layer is the \emph{intra} layer, and the transformer-style layer is the \emph{cross} layer.
+
+\paragraph{How to read this report.} \Cref{sec:notation} fixes notation. \Cref{sec:data,sec:inputs,sec:fracture} follow the data from the files on disk to the tensors the network receives, including how fracture surfaces are found. \Cref{sec:equivariance,sec:vn} give the theory of equivariance and the vector-neuron building blocks. \Cref{sec:intra,sec:cross,sec:model} describe the two layers and the whole network, including how its outputs become a rotation. \Cref{sec:anchor,sec:losses} define what the rotation is compared against and every loss term. \Cref{sec:stage2} solves for translations, \cref{sec:training} describes training, and \cref{sec:rationale} collects the design decisions and their reasons. The appendices contain derivations.
+
+% =====================================================================
+\section{Notation and conventions}
+\label{sec:notation}
+
+Vectors are bold lower case and are columns: a point is $\x\in\R^3$, and a rotation $Q\in\SO$ acts on it as $\x\mapsto Q\x$. A \emph{vector feature} with $C$ channels is a matrix $H\in\R^{C\times 3}$ whose rows $\mathbf h_1\T,\dots,\mathbf h_C\T$ are 3-vectors; rotating every channel gives $H\mapsto HQ\T$, because $(Q\mathbf h_c)\T=\mathbf h_c\T Q\T$. All other symbols are listed in \cref{tab:notation}.
+
+\begin{table}[htbp]
+\centering\small
+\caption{Notation.}
+\label{tab:notation}
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+symbol & meaning \\
+\midrule
+$S,\;F,\;N,\;E$ & scenes in a batch; fragments; vertices; directed mesh edges \\
+$f(v)$, $V_f$ & the fragment owning vertex $v$; the vertices of fragment $f$ \\
+$\x_v$ & position of vertex $v$ in the assembled object (world units) \\
+$\mathbf c_f$, $r_f$, $d$ & centroid and radius of fragment $f$; the scene divisor $d=\max_f r_f$ \\
+$\y_v=(\x_v-\mathbf c_{f(v)})/d$ & centred, scale-normalised position, assembled pose \\
+$Q_f$, $R_f=Q_f\T$ & random rotation applied to fragment $f$; its label, the rotation that undoes it \\
+$\tilde{\mathbf p}_v=Q_f\y_v$, $\tilde{\n}_v=Q_f\n_v$ & the network's input: perturbed position and normal ($f=f(v)$) \\
+$A_e\in\R^{3\times3}$ & edge features: two face normals and a relative position \\
+$s_f=\ln r_f$ & log-radius of fragment $f$, the only scalar input \\
+$H\in\R^{N\times C\times 3}$, $\mathbf h_v\in\R^{C\times3}$ & vector features of all vertices; of vertex $v$ \\
+$C$, $\mathcal H$, $d_h$, $d_k$ & channels; attention heads ($\mathcal H=4$); per-head size in the intra layer ($d_h=8$) and the cross layer ($d_k=16$) \\
+$\mathcal T$, $\mathcal P(i)$ & tokens; the tokens token $i$ attends to (same scene, other fragments) \\
+$M_f\in\SO$, $\hat R_f=M_f\T$ & the network's frame for fragment $f$ and its predicted rotation \\
+$a$, $\tilde R_f$ & the anchor fragment of a scene; a prediction aligned to the anchor \\
+$\z_v\in\R^{32}$ & the invariant embedding of vertex $v$ \\
+$\ip{\cdot}{\cdot}$, $\ip{\cdot}{\cdot}_F$ & Euclidean and Frobenius inner products \\
+$\iota_k(\cdot)$ & the invariant read-out with $k$ learned directions (\cref{sec:vn}) \\
+$\theta(A,B)$, $\angle(\mathbf u,\mathbf w)$ & geodesic angle between rotations; angle between vectors \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Colour code of the figures.} Colour always marks the \emph{type} of a quantity: \textcolor{vec}{\textbf{blue}} (solid arrows) is equivariant and rotates with its fragment, \textcolor{inv}{\textbf{orange}} (dashed arrows) is invariant and does not change under any rotation, \textcolor{att}{\textbf{green}} is attention or communication between elements, and \textcolor{outc}{\textbf{violet}} is an output of the network.
+
+% =====================================================================
+\section{The data}
+\label{sec:data}
+
+\subsection{The Breaking Bad dataset}
+All training and evaluation data come from Breaking Bad~\cite{sellan2022breakingbad}, a dataset of everyday objects and artefacts fractured by physically based simulation. For every object the dataset provides many \emph{break patterns} (also called fracture modes): different ways the same object breaks, into anywhere from two to about a hundred pieces. The experiments use the \emph{Everyday} subset with the official object split: 407 training objects and 91 validation objects are listed (405 of the training objects were found on disk in the reported run), in 20 categories such as bottles, bowls, mugs, vases and statues. The dataset ships no official test list, so the validation objects are the held-out set. Only the standard break patterns are used (the ones named \emph{fractured}); a second family of patterns stored alongside them is excluded, so that results stay comparable with published numbers.
+
+\subsection{How a break pattern becomes fragment meshes}
+\fig{fig_dataformat}{The compressed storage. An object is stored once as a fine mesh that is pre-cut into cells (a); a break pattern assigns every cell to a piece (b); each piece is the union of its cells, the walls between cells of the same piece cancel, and the walls between different pieces remain as fracture surfaces (c). Bottom: the operations that turn one pattern into fragment meshes.}{dataformat}
+
+The dataset is stored in a compressed form (\cref{fig:dataformat}). For each object there is
+\begin{itemize}
+  \item a \emph{fine mesh} with vertices $V\in\R^{n_v\times3}$ and triangles $F\in\mathbb N^{n_f\times3}$, which is the object pre-cut into $n_c$ small cells; every cell carries its own copy of its boundary triangles;
+  \item a sparse \emph{cell matrix} $M\in\{0,1\}^{n_v\times n_c}$ that assigns every fine vertex to its cell;
+  \item for every break pattern $k$, a label vector $\mathbf c^{(k)}\in\mathbb N^{n_c}$ that assigns every cell to a piece.
+\end{itemize}
+A break pattern is turned into fragment meshes in four steps.
+\begin{enumerate}
+  \item \textbf{Vertex labels.} $\boldsymbol\ell=M\,\mathbf c^{(k)}$ gives every fine vertex the piece label of its cell.
+  \item \textbf{Triangle labels.} Each triangle takes the label of its first vertex, $\lambda_t=\ell_{t_1}$; the three vertices of a triangle always belong to the same cell.
+  \item \textbf{Pieces.} Piece $p$ collects the triangles with $\lambda_t=p$.
+  \item \textbf{Clean-up.} Unreferenced vertices are dropped; vertices closer than $10^{-10}$ are welded into one; then faces that appear more than once are resolved by their winding. Among the faces sharing one vertex set, let $c$ be the number wound one way minus the number wound the other way. If $c=0$ the faces cancel; otherwise a single face is kept. Finally, vertices that are no longer used are dropped.
+\end{enumerate}
+The winding rule is what turns a union of cells into a solid piece. A wall between two cells of the \emph{same} piece is stored twice with opposite orientation and cancels; a wall between two \emph{different} pieces survives once in each piece. Those surviving walls are the fracture surfaces, and because both pieces inherit the same vertices, mating fracture surfaces coincide exactly in the assembled object. \Cref{sec:fracture} exploits this.
+
+The result is a list of fragment meshes, all in the \emph{assembled} pose: the coordinate frame in which the object is stored. Patterns that load as a single fragment are skipped (there is nothing to reassemble), as are patterns with non-finite coordinates. Optionally, patterns with more than a given number of pieces can be excluded; with a limit of 20, the benchmark setting used by GARF~\cite{li2025garf}, 26{,}444 of the 32{,}396 training patterns and 5{,}951 of the 7{,}280 validation patterns remain.
+
+\subsection{Items, epochs and sampling}
+One training \emph{item} is one (object, break pattern) pair. An object has about eighty patterns, and using all of them in every epoch would show the same shape eighty times in a row. Instead, each epoch draws a fixed number of patterns per object (by default 8), with a generator seeded by the object and the epoch, so successive epochs see different patterns of the same object while two runs with the same seed see the same ones.
+
+An epoch is defined as a fixed number of optimiser steps rather than as one pass over the items, because the number of items changes with the patterns drawn per object, the split, the piece-count limit and the number of GPUs, and an epoch is the unit in which validation, checkpoints and the learning-rate schedule are counted. The scenes of an epoch are drawn by concatenating seeded random permutations of the item list, so every item is drawn as evenly as possible.
+
+Category balancing is available but off by default. If it is switched on, item $i$ of object $o$ in category $c$ is drawn with probability proportional to
+\begin{equation}
+  w_i=\begin{cases} m_o^{-\tau} & \text{balance over objects,}\\ (K_c\,m_o)^{-\tau} & \text{balance over categories,}\end{cases}
+\end{equation}
+where $m_o$ is the number of items of object $o$, $K_c$ the number of objects of category $c$, and $\tau\in[0,1]$ interpolates between natural sampling ($\tau=0$) and full balance ($\tau=1$).
+
+The \emph{validation set} is fixed for the whole run: its patterns are drawn once, its random rotations are fixed by seeds derived from the scene name, and it is thinned, when requested, to an evenly spaced subset of scenes. A change in the validation numbers therefore reflects a change in the model, never a change in what is measured.
+
+\subsection{Size of the data}
+\Cref{tab:stats} gives an impression of the scale. These figures were measured over the whole dataset (all subsets and all pattern families), not over the Everyday training split alone, so they describe the order of magnitude rather than the exact training distribution.
+
+\begin{table}[htbp]
+\centering\small
+\caption{Measured sizes, over all subsets and break patterns of the dataset.}
+\label{tab:stats}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+quantity & median & mean & maximum \\
+\midrule
+vertices per fragment & 296 & 1{,}550 & 83{,}039 \\
+fragments per break pattern & 3 & 8 & 99 \\
+fracture vertices per fragment (exact labels) & 125 & 164 & 3{,}587 \\
+\midrule
+\multicolumn{4}{@{}l}{share of the surface that is fracture surface: 10.6\% of vertices, 6.2\% of faces, 7.6\% of edges}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{From a scene to the network's input}
+\label{sec:inputs}
+
+A \emph{scene} is one break pattern of one object: $F$ fragment meshes in the assembled pose. This section describes every transformation between that scene and the tensors the network receives.
+
+\subsection{Centring and normalisation}
+\label{sec:normalise}
+\fig{fig_normalise}{Centring, normalisation and perturbation on a two-dimensional cartoon of three fragments. (a) In the assembled object every fragment has a centroid $\mathbf c_i$ and a radius $r_i$; the largest radius is the scene divisor $d$. (b) Every fragment is moved to its own centroid and the whole scene is divided by the one number $d$, so the largest fragment just fits the unit circle and the others keep their relative size. (c) Every fragment is turned by its own random rotation $Q_i$; the label is the rotation that undoes it, $R_i=Q_i\T$.}{normalise}
+
+For every fragment $f$ the pipeline computes its centroid, its radius and the scene divisor,
+\begin{equation}
+  \mathbf c_f=\frac1{|V_f|}\sum_{v\in V_f}\x_v,\qquad
+  r_f=\max_{v\in V_f}\norm{\x_v-\mathbf c_f},\qquad
+  d=\max_{f}r_f,
+\end{equation}
+and replaces every vertex by its centred, normalised position
+\begin{equation}
+  \y_v=\frac{\x_v-\mathbf c_{f(v)}}{d}\qquad(\text{\cref{fig:normalise}b}).
+  \label{eq:normalise}
+\end{equation}
+The centroid is the plain mean of the mesh vertices.
+
+\paragraph{Why each fragment is centred on itself.} Centring removes the translation completely: whatever offset a fragment had, it is gone after \cref{eq:normalise}. This is deliberate, because stage one predicts rotations only, and translations are recovered in stage two (\cref{sec:stage2}), in world units, from the centroids $\mathbf c_f$ and the divisor $d$, which are kept for that purpose. It also makes the perturbation of \cref{sec:perturb} a rotation about the fragment's own centre, so rotating a fragment never moves its centroid.
+
+\paragraph{Why one divisor per scene.} Dividing every fragment by its own radius, as some methods do, would make every fragment the same size. Two mating fragments whose sizes differ by a factor of ten would then present fracture surfaces whose scales differ by a factor of ten, although in reality the two surfaces are the same surface. With one divisor per scene, the largest fragment just fits the unit ball, the relative sizes of all fragments are preserved, and mating surfaces keep the same size.
+
+\paragraph{Absolute size as a separate scalar.} Normalisation removes the absolute scale of the object, which is informative (a mug is not a vase). It is given back as one scalar per fragment,
+\begin{equation}
+  s_f=\ln r_f\qquad(\text{world units}),
+\end{equation}
+the only scalar the network receives. The logarithm is taken because fragment sizes are heavy-tailed: fragments range from 4 to 83{,}039 vertices, and a raw radius would dominate whatever it is combined with. How $s_f$ enters the network without breaking equivariance is described in \cref{sec:scalegate}.
+
+\subsection{The random rotations and the label}
+\label{sec:perturb}
+Every fragment receives its own, independent, uniformly random rotation $Q_f$. Uniform on $\SO$ means distributed according to the Haar measure, and it is sampled as follows~\cite{mezzadri2007random}:
+\begin{enumerate}
+  \item draw $G\in\R^{3\times3}$ with independent standard normal entries and take its QR decomposition $G=QR$;
+  \item fix the signs, $Q\leftarrow Q\,\mathrm{diag}\big(\operatorname{sgn}R_{11},\operatorname{sgn}R_{22},\operatorname{sgn}R_{33}\big)$, which makes $Q$ Haar-distributed on the orthogonal group $\mathrm O(3)$;
+  \item if $\det Q=-1$, flip one column, $Q\leftarrow Q\,\mathrm{diag}(-1,1,1)$, which maps the reflections onto the rotations and gives the Haar measure on $\SO$.
+\end{enumerate}
+The generator is seeded with a stable hash of the scene name, the epoch and the global seed. Consequently a training scene receives new rotations in every epoch, a validation scene keeps the same rotations for the whole run, and every process and every resumed session draws exactly the same numbers.
+
+The network receives the \emph{perturbed} positions and normals
+\begin{equation}
+  \tilde{\mathbf p}_v=Q_{f}\,\y_v,\qquad \tilde\n_v=Q_{f}\,\n_v\qquad (f=f(v)),
+\end{equation}
+and the label of fragment $f$ is the rotation that undoes its perturbation,
+\begin{equation}
+  R_f=Q_f\T,\qquad\text{so that}\qquad R_f\,\tilde{\mathbf p}_v=\y_v .
+  \label{eq:label}
+\end{equation}
+No translation is applied, because centring would remove it again. The divisor $d$ is unchanged by rotations, so normalising and perturbing commute exactly.
+
+\subsection{Node features}
+\fig{fig_features}{The input features. (a) A vertex carries two vectors: its position relative to the fragment centroid and its normal. (b) A directed edge $u\to v$ carries three vectors: the normals of its two faces, in an order fixed by the geometry, and the offset $\boldsymbol\delta$ from the destination to the source. (c) What the network receives per vertex, per edge and per fragment.}{features}
+
+Every vertex $v$ carries two vectors, stacked as the rows of a $2\times3$ matrix:
+\begin{equation}
+  X_v=\begin{bmatrix}\tilde{\mathbf p}_v\T\\ \tilde\n_v\T\end{bmatrix}\in\R^{2\times3}.
+\end{equation}
+The normal is the area-weighted average of the normals of the faces around the vertex,
+\begin{equation}
+  \n_v=\frac{\sum_{t\ni v}(\x_{t_2}-\x_{t_1})\times(\x_{t_3}-\x_{t_1})}{\big\lVert\sum_{t\ni v}(\x_{t_2}-\x_{t_1})\times(\x_{t_3}-\x_{t_1})\big\rVert},
+\end{equation}
+since the cross product of two edges of a triangle has twice the triangle's area as its length. A vertex whose faces are all degenerate receives the zero vector, which every later operation handles without producing invalid numbers.
+
+There are no scalar node features. Every scalar the network uses, such as a distance or an angle, it derives itself, from inner products of vectors, in a way that is invariant by construction (\cref{sec:vn}).
+
+\subsection{Edge features}
+\label{sec:edges}
+Every fragment's mesh is its graph: the vertices are the nodes and every mesh edge appears twice, once in each direction. A directed edge $e=(u\to v)$ has a \emph{source} $u$ and a \emph{destination} $v$; messages travel from source to destination. It carries three vectors (\cref{fig:features}b):
+\begin{equation}
+  A_e=\begin{bmatrix}\n_1\T\\ \n_2\T\\ \boldsymbol\delta\T\end{bmatrix}\in\R^{3\times3},\qquad
+  \boldsymbol\delta=\x_u-\x_v ,
+\end{equation}
+with all positions in the normalised coordinates of \cref{eq:normalise}. Here $\n_1$ and $\n_2$ are the unit normals $\mathbf m_a,\mathbf m_b$ of the two faces that share the edge, in the order fixed by
+\begin{equation}
+  (\n_1\times\n_2)\cdot(\x_v-\x_u)\ \ge\ 0 .
+  \label{eq:canonical}
+\end{equation}
+For the reverse edge $v\to u$ the two normals swap places and $\boldsymbol\delta$ changes sign, which satisfies \cref{eq:canonical} for that direction as well. An edge on the boundary of a fragment has one face, whose normal fills both slots.
+
+\paragraph{Why the order of the two normals is fixed.} The two faces of an edge come in no particular order: face numbering has no geometric meaning, and the clean-up of \cref{sec:data} reorders faces. A learned linear map treats its input slots differently, so a slot assignment that depended on numbering would feed the network noise. The sign of the triple product in \cref{eq:canonical} is a geometric property of the edge, and it is unchanged by every rotation, because a rotation preserves cross products and inner products ($\det Q=+1$). The same physical face therefore occupies the same slot in every pose. The sign would flip under a reflection, which is not one of the motions considered.
+
+\paragraph{Why the edge carries the offset $\boldsymbol\delta$.} In the intra layer (\cref{sec:intra}), the message that a destination receives is a linear function of the source's features and the edge's features. Without $\boldsymbol\delta$, a message could describe what the neighbour looks like but not in which direction it lies. The raw difference is used rather than a unit direction, because its length, the edge length, is an invariant the network can read through a norm, and normalising would discard it for nothing.
+
+\subsection{How the perturbed copy is formed}
+All geometry is computed once, on the assembled copy: normals, edge features, fracture labels, tokens and coincidence clusters. The perturbed copy is then obtained by rotating it,
+\begin{equation}
+  \big(\tilde{\mathbf p}_v,\ \tilde\n_v,\ \tilde A_e\big)=\big(Q_f\y_v,\ Q_f\n_v,\ A_eQ_f\T\big),
+\end{equation}
+rather than by recomputing normals from rotated vertices. The two copies are therefore exact rotations of each other, and cannot differ by round-off in quantities the losses compare directly. In practice only the assembled copy and the labels are transferred to the GPU, and the rotation is applied there.
+
+\subsection{What the network does and does not receive}
+\begin{itemize}
+  \item \textbf{Inputs:} $X_v\in\R^{2\times3}$ for every vertex, $A_e\in\R^{3\times3}$ for every directed mesh edge, and $s_f\in\R$ for every fragment. The first two are equivariant: rotating fragment $f$ by $Q$ turns them into $X_vQ\T$ and $A_eQ\T$. The third is invariant.
+  \item \textbf{Index structures:} which vertices are tokens and which token pairs may attend to each other (\cref{sec:tokens}). They decide which vertices the cross layers connect, but carry no numbers.
+  \item \textbf{Training labels only:} the rotations $R_f$, the assembled geometry ($\y_v$, $\n_v$, assembled edge normals) and the coincidence clusters (\cref{sec:coincidence}).
+\end{itemize}
+Scenes in a batch are concatenated; mesh edges never cross fragments and token pairs never cross scenes. In practice one scene is processed per forward pass, because a single scene can hold tens of thousands of vertices.
+
+% =====================================================================
+\section{Fracture surfaces: identification and use}
+\label{sec:fracture}
+
+\fig{fig_fracture}{(a) The dihedral rule on a cross-section of one fragment: each segment plays the role of a face and its arrow is the face normal. Adjacent faces whose normals differ by more than $25.8^\circ$ form a sharp pair (orange dots); faces touching a sharp pair are labelled (bold). The rule finds the jagged fracture surface, plus the two faces at the rims where it meets the intact surface. (b) Exact labels from coincidence: in the assembled object, the two sides of every fracture share their vertices. (c) Tokens: a fixed budget per scene, divided between fragments by fracture area and spread over each fragment's labelled surface by farthest-point sampling; every pair of tokens from different fragments may attend to each other.}{fracture}
+
+The fracture surfaces are where fragments meet, so they are where information should pass between fragments and where stage two looks for correspondences. Two labellings exist: a geometric heuristic that works on one fragment alone, and an exact labelling that needs the assembled object.
+
+\subsection{The dihedral rule}
+\label{sec:dihedral}
+Fracture surfaces produced by brittle fracture are rough, while the intact surface of a manufactured object is mostly smooth. The dihedral rule turns this into a test on the angles between neighbouring faces. Two faces $f$ and $g$ are \emph{adjacent} if they share an edge, and with unit face normals $\mathbf m_f,\mathbf m_g$ the pair is called \emph{sharp} if
+\begin{equation}
+  |\mathbf m_f\cdot\mathbf m_g|<\tau,\qquad\tau=0.9,
+  \label{eq:sharp}
+\end{equation}
+that is, if their normals are between $\arccos 0.9=25.8^\circ$ and $154.2^\circ$ apart. Because of the absolute value, nearly opposite normals count as smooth. For face $f$ let $k_f$ be its number of adjacent faces and $\sigma_f$ the number of sharp pairs it is in. Face $f$ is labelled as fracture surface if
+\begin{equation}
+  \text{(i) every vertex of $f$ lies on some face $g$ with $\sigma_g>0$,}\qquad\text{and}\qquad
+  \text{(ii) }\big\lfloor k_f/2\big\rfloor\le\sigma_f .
+\end{equation}
+On a closed manifold mesh every face has $k_f=3$ neighbours, so (ii) asks for at least one sharp neighbour, and (ii) then implies (i). In effect a face is labelled when it touches at least one sharp edge. A face of zero area has a zero normal, so all its pairs count as sharp.
+
+\paragraph{Fallback.} A fragment can come out with no labelled face, for instance a very smooth piece of a thin shell. The threshold is then raised step by step for that fragment alone: $\tau$ is set just above the $q$-quantile of the fragment's own values $|\mathbf m_f\cdot\mathbf m_g|$, for $q=0.25,0.5,0.75,1$ in turn, until at least one face is labelled. The vertex mask of a fragment is the set of vertices of its labelled faces.
+
+\paragraph{Properties.} The rule is computed on each fragment by itself, from absolute inner products of normals, so it is invariant to rotation and needs nothing that would be missing at inference: training and testing see exactly the same labelling. It is also generous. Measured against the exact labels of \cref{sec:coincidence}, it finds 93\% of the true fracture faces (recall 0.93) but only 24\% of the faces it labels are true fracture faces (precision 0.24), so it over-labels by a factor of about 3.9. The false positives sit where the intact surface itself is sharp: rims, handles, feet and the edges where fracture and intact surfaces meet (\cref{fig:fracture}a shows two such rim faces).
+
+\subsection{Exact labels from coincidence}
+\label{sec:coincidence}
+In the assembled object, the two sides of every fracture share vertices (\cref{sec:data}), so a vertex lies on a fracture surface exactly when another fragment has a vertex at the same position (\cref{fig:fracture}b). Coincidence is found in two passes over the assembled scene: first, coordinates rounded to six decimals are grouped, and every group that spans at least two fragments is marked; second, among the remaining vertices, pairs from different fragments closer than a small tolerance are found with a k-d tree. Joining every coincident pair with a union--find structure groups the vertices into \emph{coincidence clusters}: sets of vertices, from at least two fragments, that occupy one point of the assembled object (where three pieces meet, a cluster has three members).
+
+This labelling is exact, but it needs the assembled object: after the perturbation nothing coincides. It is therefore used only as \emph{supervision} for the embedding (\cref{sec:infonce}), never as an input.
+
+\subsection{How the labels are used}
+The fracture labels are not fed to the network as a feature. Every vertex remains a node and every mesh edge an edge, whatever its label. The dihedral labels are used in exactly two places: they decide which vertices are eligible to become cross-fragment tokens, and in stage two they decide which vertices are candidates for matching (\cref{sec:stage2}).
+
+\subsection{Tokens}
+\label{sec:tokens}
+The cross layers do not connect all vertices of different fragments, which would be quadratic in the number of vertices. They connect a fixed budget of \emph{tokens}: $T=2048$ vertices per scene, chosen on the labelled fracture surfaces.
+
+\paragraph{Dividing the budget.} Let $\mathcal M_f$ be the eligible (labelled) vertices of fragment $f$, $c_f=|\mathcal M_f|$ its capacity, and $A_f$ the area of its labelled faces whose three vertices are all eligible. The ideal share is proportional to fracture area,
+\begin{equation}
+  \hat t_f=\frac{T\,A_f}{\sum_g A_g},\qquad
+  t_f=\min\!\Big(c_f,\ \max\big(1,\lfloor\hat t_f\rfloor\big)\Big)\quad(c_f>0),
+\end{equation}
+so every fragment with an eligible vertex receives at least one token and none receives more than it has. The tokens left over, $T-\sum_f t_f$, are handed to fragments in order of decreasing fractional part $\hat t_f-\lfloor\hat t_f\rfloor$, each fragment taking as many of them as its capacity allows. If the floors over-spend the budget, the largest allocations are reduced; if the budget is smaller than the number of fragments, the fragments with the largest fracture area receive one token each. The scene receives $\min(T,\sum_fc_f)$ tokens.
+
+\paragraph{Choosing the tokens.} Within each fragment, the $t_f$ tokens are chosen by farthest-point sampling with geodesic distances: shortest-path distances along the mesh edges whose two ends are eligible, weighted by edge length. The first token is the eligible vertex farthest from the centroid of the eligible vertices; each subsequent token is the eligible vertex whose distance to the nearest chosen token is largest, ties going to the lowest index. Separate fracture patches are at infinite geodesic distance from each other, so every patch receives a token before any patch receives a second. Geodesic rather than straight-line distance prevents two tokens from counting as far apart merely because the surface folds back on itself.
+
+\paragraph{Why it is done this way.} Sampling is done per fragment and from distances alone, so the chosen vertices do not depend on the perturbation; a single farthest-point pass over the whole scene would depend on where the randomly rotated fragments happen to lie. The selection is deterministic, and it is computed on the assembled copy, but it would choose the same vertices on any rotated copy. Splitting by area gives a fragment with four times the fracture surface four times the tokens.
+
+\paragraph{Pairs.} Token $i$ may attend to every token $j$ of the same scene that belongs to a different fragment:
+\begin{equation}
+  \mathcal P(i)=\{\,j\in\mathcal T:\ \operatorname{scene}(j)=\operatorname{scene}(i),\ f(j)\ne f(i)\,\}.
+\end{equation}
+Tokens of the same fragment are excluded, because the mesh edges already connect them; tokens of other scenes are excluded, because a batch can hold unrelated objects. The number of ordered pairs in a scene is $\big(\sum_ft_f\big)^2-\sum_ft_f^2<T^2$, about four million at most, whatever the number of fragments: the token budget alone bounds the cost of a cross layer.
+
+% =====================================================================
+\section{Equivariance}
+\label{sec:equivariance}
+
+\subsection{Definition}
+A map $f$ is \emph{equivariant} to a group if transforming the input transforms the output in a corresponding way:
+\begin{equation}
+  f\big(\rho_{\mathrm{in}}(Q)\,X\big)=\rho_{\mathrm{out}}(Q)\,f(X)\qquad\text{for every }Q\in\SO,
+  \label{eq:equivariance}
+\end{equation}
+where $\rho_{\mathrm{in}}$ and $\rho_{\mathrm{out}}$ say how a rotation acts on the input and on the output. When the output does not change at all ($\rho_{\mathrm{out}}(Q)$ is the identity), $f$ is \emph{invariant}. In this work, a rotation acts on a single vector as $\x\mapsto Q\x$, on a stack of vectors $H\in\R^{C\times3}$ as $H\mapsto HQ\T$, and on a scalar not at all.
+
+The familiar form $L(Q\cdot\x)=Q\cdot L(\x)$ is \cref{eq:equivariance} with the same action on both sides. It holds for the network's vector features and for its frame, but not for every output: \cref{tab:transform} lists how each quantity responds when one fragment is rotated by $Q$, and \cref{fig:equivariance} shows the three cases as commutative diagrams.
+
+\begin{table}[htbp]
+\centering\small
+\caption{How every quantity responds when a fragment is rotated by $Q$.}
+\label{tab:transform}
+\begin{tabularx}{\linewidth}{@{}Xlll@{}}
+\toprule
+quantity & symbol & response & kind \\
+\midrule
+input vectors & $X_v,\ A_e$ & $X_vQ\T,\ A_eQ\T$ & equivariant \\
+vector features of every layer & $\mathbf h_v\in\R^{C\times 3}$ & $\mathbf h_vQ\T$ & equivariant \\
+read-outs, attention scores and weights, gates & $\iota_k(\mathbf h_v)$, $\lambda$, $\alpha$, $\mathbf g$ & unchanged & invariant \\
+frame & $M_f=[\mathbf e_1\ \mathbf e_2\ \mathbf e_3]$ & $QM_f$ & equivariant \\
+predicted rotation & $\hat R_f=M_f\T$ & $\hat R_fQ\T$ & equivariant (from the right) \\
+embedding & $\z_v$ & unchanged & invariant \\
+label & $R_f=Q_f\T$ & $R_fQ\T$ & --- \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\fig{fig_equivariance}{Equivariance in diagrams. (a) Every layer, and therefore the backbone, commutes with rotation. (b) The embedding is unchanged by rotation. (c) The frame rotates and the predicted rotation is multiplied by $Q\T$ from the right. (d) With several fragments, each fragment's output follows its own rotation and ignores the others'. (e) Because prediction and label transform the same way, the error does not depend on the random rotation at all.}{equivariance}
+
+\subsection{Why the network should be equivariant}
+\label{sec:whyequi}
+The last row of \cref{tab:transform} is the reason. If the perturbation of a fragment is composed with a further rotation $Q$, the label becomes $(QQ_f)\T=R_fQ\T$: it is multiplied by $Q\T$ from the right, exactly like an equivariant prediction. The two therefore move together, and the error is independent of the perturbation. Formally, let $\x$ be an assembled fragment and $Q\cdot\x$ its perturbed copy. Then
+\begin{equation}
+  \theta\big(\hat R(Q\cdot\x),\,R\big)
+  =\theta\big(\hat R(\x)\,Q\T,\ I\,Q\T\big)
+  =\theta\big(\hat R(\x),\,I\big),
+  \label{eq:cancel}
+\end{equation}
+because the geodesic angle $\theta(A,B)$, defined in \cref{sec:rotloss}, depends only on $A\T B$, and the product $(AQ\T)\T(BQ\T)$, which equals $Q(A\T B)Q\T$, has the same rotation angle as $A\T B$. The consequences are strong.
+\begin{itemize}
+  \item The prediction is correct for \emph{every} rotation of a fragment if and only if it is correct for the assembled fragment itself. There is nothing to learn about the perturbation and no need for rotation augmentation.
+  \item The training error of a fragment is a function of its assembled geometry only. The random rotations change the inputs the network sees, but not its loss.
+  \item The network generalises to rotations it has never seen, because there are none it has not, in effect, already seen.
+\end{itemize}
+What the network has to learn is a \emph{canonical frame}: a map from an assembled fragment $\x$ to a frame $M(\x)$. \Cref{sec:convention,sec:anchor} show exactly which frame the losses ask for.
+
+\subsection{Several fragments}
+\label{sec:multi}
+A scene has $F$ fragments, each with its own perturbation. Fragment $i$'s label, $Q_i\T$, does not depend on the perturbation $Q_j$ of any other fragment, so a correct output for fragment $i$ cannot depend on $Q_j$ either. The requirement for the vector features $H_i$ of fragment $i$ is therefore
+\begin{equation}
+  \begin{aligned}
+  H_i(\dots,X_iA_i\T,\dots)&=H_i(\dots,X_i,\dots)\,A_i\T &&\text{(equivariant to its own pose),}\\
+  H_i(\dots,X_jA_j\T,\dots)&=H_i(\dots,X_j,\dots) &&\text{(invariant to the pose of every $j\ne i$),}
+  \end{aligned}
+  \label{eq:multi}
+\end{equation}
+which is equation~7 of Wu et al.~\cite{wu2023leveraging}. A network that could see $Q_j$ would have to learn to ignore it, from data, and $Q_j$ is not weak signal but pure noise injected by the perturbation. \Cref{eq:multi} makes ignoring it structural. Its practical consequence is a rule for every operation that combines two fragments: only invariant quantities may pass from one fragment to another. An inner product of vector features from two fragments, $\ip{A_i\mathbf a}{A_j\mathbf b}$, is not allowed, because it depends on the relative rotation $A_i\T A_j$. \Cref{sec:cross} shows how the cross layer respects this.
+
+\subsection{Rules for building equivariant layers}
+\label{sec:rules}
+Every layer of the network is assembled from operations that obey five rules.
+\begin{enumerate}
+  \item A composition of equivariant maps is equivariant, so a network of equivariant layers is equivariant.
+  \item A sum of equivariant features is equivariant.
+  \item An inner product of two vectors that rotate together is invariant: $\ip{Q\mathbf a}{Q\mathbf b}=\ip{\mathbf a}{\mathbf b}$. So is a norm.
+  \item Any function of invariant scalars, including an ordinary neural network with biases and nonlinearities, is invariant.
+  \item An invariant scalar times an equivariant vector is equivariant: $s(\x)\,\mathbf h(\x)Q\T$.
+\end{enumerate}
+Three ordinary habits break equivariance and are therefore absent from the vector stream: a \emph{bias} (a fixed vector does not rotate), a \emph{pointwise nonlinearity} on coordinates (it depends on the axes of the coordinate system), and any \emph{normalisation per coordinate} (dividing the $x$, $y$ and $z$ components by different numbers is a shear).
+
+\paragraph{Numerical check.} The property was verified in double precision on synthetic scenes, by applying an additional random rotation to each fragment and comparing outputs, with the layer schedule of the reported run. The largest deviations were $1.9\times10^{-14}$ for the frame and the rotation, $6.9\times10^{-14}$ for the backbone's vector features and $1.3\times10^{-14}$ for the embedding. When only one fragment was rotated, the other fragments' embeddings and frames changed by at most $2.7\times10^{-15}$ and $7.0\times10^{-15}$, confirming \cref{eq:multi}. The geodesic error changed by at most $1.8\times10^{-14}$, confirming \cref{eq:cancel}, and the frames were orthonormal to $2.2\times10^{-16}$ with determinant exactly~1. These are round-off levels: the properties hold exactly, as algebraic identities.
+
+% =====================================================================
+\section{Vector-neuron building blocks}
+\label{sec:vn}
+
+Vector neurons~\cite{deng2021vn} replace every scalar feature of an ordinary network with a 3-vector. Other equivariant networks, such as tensor field networks~\cite{thomas2018tfn} and e3nn~\cite{geiger2022e3nn}, carry features of several orders built from spherical harmonics; vector neurons restrict themselves to plain 3-vectors, so that every operation remains a matrix product or an inner product. A layer maps a stack $H\in\R^{C\times3}$ to a stack $H'\in\R^{C'\times3}$, acting on the channel axis and leaving the spatial axis to the rotation. \Cref{fig:vn} shows the five blocks used here.
+
+\fig{fig_vn}{The vector-neuron building blocks. (a) A linear map mixes channels and commutes with rotation. (b) The nonlinearity: a learned direction $\mathbf d$ splits space; a vector on its negative side has its component along $\mathbf d$ shrunk by $a=0.2$, one on its positive side passes. (c) Normalisation divides all channels by one invariant number. (d) The invariant read-out: inner products with learned directions, and norms. (e) The scale gate: an invariant, positive gain per channel computed from invariants and the log-radius.}{vn}
+
+\subsection{VN-Linear}
+A VN-Linear layer with weight $W\in\R^{C'\times C}$ computes
+\begin{equation}
+  H'=WH,\qquad\text{i.e.}\qquad \mathbf h'_c=\sum_kW_{ck}\,\mathbf h_k .
+\end{equation}
+It is equivariant because $W$ acts on the channel axis and $Q$ on the spatial axis: $W(HQ\T)=(WH)Q\T$. It has no bias. Weights are initialised uniformly in $\pm1/\sqrt{C}$, the spatial axis not counting towards the fan-in because it is carried along, not summed over. A wide map applied to stacked inputs can be split exactly into several narrow ones, $W[H_1;H_2;H_3]=W_1H_1+W_2H_2+W_3H_3$, because there is no bias; the intra layer uses this.
+
+\subsection{VN-LeakyReLU}
+A pointwise ReLU is not equivariant, because it clips coordinates. The vector-neuron nonlinearity instead learns, for every channel $c$, a direction $\mathbf d_c=(W_dH)_c$ and uses the plane orthogonal to it as the decision boundary:
+\begin{equation}
+  \mathbf h'_c=\begin{cases}
+    \mathbf h_c & \text{if }\ip{\mathbf h_c}{\mathbf d_c}\ge0,\\[2pt]
+    \mathbf h_c-(1-a)\,\dfrac{\ip{\mathbf h_c}{\mathbf d_c}}{\norm{\mathbf d_c}^2}\,\mathbf d_c & \text{otherwise,}
+  \end{cases}
+  \qquad a=0.2 .
+\end{equation}
+On the negative side the component of $\mathbf h_c$ along $\mathbf d_c$ is scaled by $a$; with $a=0$ it would be projected onto the plane, with $a=1$ nothing would happen. The decision is invariant, because $\ip{Q\mathbf h}{Q\mathbf d}=\ip{\mathbf h}{\mathbf d}$, so the same branch is taken in every pose, and the output is a combination of $\mathbf h_c$ and $\mathbf d_c$ with invariant coefficients, hence equivariant (rules 3 and 5).
+
+\subsection{VN-LayerNorm}
+Normalisation divides every channel of a vertex by one invariant number, the root mean square of the channel norms, and multiplies by a learned gain per channel:
+\begin{equation}
+  \rho=\Big(\frac1C\sum_{c=1}^C\norm{\mathbf h_c}^2+\epsilon\Big)^{1/2},\qquad
+  \mathbf h'_c=\gamma_c\,\frac{\mathbf h_c}{\rho}.
+\end{equation}
+Because $\rho$ is invariant this is an invariant scalar times an equivariant vector. Unlike an ordinary layer normalisation it subtracts no mean and has no bias, and it can never reverse the direction of a channel.
+
+\subsection{The invariant read-out}
+The bridge from vectors to ordinary scalars learns $k$ directions $D=W_dH\in\R^{k\times3}$ and returns every inner product of a channel with a direction, followed by the channel norms:
+\begin{equation}
+  \iota_k(H)=\Big[\ip{\mathbf h_c}{\mathbf d_j}\Big]_{c=1..C,\ j=1..k}\ \oplus\ \Big[\norm{\mathbf h_c}\Big]_{c=1..C}\ \in\R^{Ck+C}.
+  \label{eq:readout}
+\end{equation}
+Both parts are invariant (rule 3). With $k=3$ the directions form a learned local frame and the inner products are the coordinates of every channel in that frame; the norms are appended because the inner products recover them only when the directions span space. The network uses $k=3$ in the scale gate and $k=4$ in the cross layer and the embedding head.
+
+\subsection{The scale gate}
+\label{sec:scalegate}
+The log-radius $s_f$ has no direction, so it cannot be appended to a stack of 3-vectors: there is no legal place to put it. It enters through a gate instead. The invariant description of the vertex and the log-radius of its fragment produce a positive gain per channel:
+\begin{equation}
+  \mathbf g=\softplus\Big(\MLP\big[\iota_3(\mathbf h_v);\,s_{f(v)}\big]\Big)\in\R^{C}_{>0},\qquad
+  \mathbf h'_{v,c}=g_c\,\mathbf h_{v,c},
+\end{equation}
+where the MLP is a linear layer from $4C+1$ to 64 units, a layer normalisation, a GELU, and a linear layer from 64 to $C$ units. The gain is positive, so the gate can attenuate or amplify a channel but never reflect it. The last layer is initialised with small weights and a bias of $0.5413$, for which $\softplus(0.5413)=1$: an untrained gate is close to the identity. The weights are small rather than zero, because a zero weight would make the gate's output constant and cut off the gradient of everything that feeds it.
+
+\paragraph{Ordinary layers on invariants.} Linear layers with biases, layer normalisation, GELU and softmax appear in the network, but only ever on invariant scalars, where rule 4 allows them.
+
+% =====================================================================
+\section{The intra layer: vector-neuron graph attention}
+\label{sec:intra}
+
+The intra layer passes information along the edges of each fragment's own mesh (\cref{fig:intra}). It combines the attention mechanism of graph attention networks with vector neurons: the \emph{score}, which decides how much a vertex listens to each neighbour, is built from invariant inner products; the \emph{message}, which is what it hears, is an equivariant linear map.
+
+\fig{fig_intra}{The intra layer. (a) A vertex $v$ listens to the vertices $u$ at the other end of its incoming mesh edges $\mathrm{in}(v)$. (b) The computation for one destination $v$: equivariant projections (blue), an invariant attention score per edge and head (orange), a softmax over the incoming edges (green), an attention-weighted sum of equivariant messages, a self-loop, a vector-neuron output transform and a residual connection.}{intra}
+
+\subsection{From GAT to vector-neuron graph attention}
+A graph attention network~\cite{velickovic2018gat} updates a node with scalar features $\mathbf h_v$ as
+\begin{equation}
+  e_{uv}=\operatorname{LeakyReLU}\big(\mathbf w\T[W\mathbf h_u\,\|\,W\mathbf h_v]\big),\quad
+  \alpha_{uv}=\softmax_{u\in\mathcal N(v)}e_{uv},\quad
+  \mathbf h'_v=\sigma\Big(\sum_{u\in\mathcal N(v)}\alpha_{uv}\,W\mathbf h_u\Big).
+\end{equation}
+Three of its parts are not equivariant when the features are vectors: the scalar score $\mathbf w\T[\cdot]$ reads coordinates, the LeakyReLU clips coordinates, and the nonlinearity $\sigma$ acts on coordinates. The layer used here keeps GAT's structure (a score per edge, a softmax over the incoming edges of a node, a weighted sum of messages) but builds the score from inner products, in the manner of dot-product attention~\cite{vaswani2017attention}, and the update from vector-neuron operations.
+
+\subsection{The equations}
+Let $\mathbf h_v\in\R^{C\times3}$ be the features of vertex $v$ and $A_e$ the features of edge $e=(u\to v)$. With $\mathcal H=4$ heads of $d_h=8$ vectors each, the layer computes the following.
+
+\paragraph{Query and key.} The query is a projection of the destination, and the key mixes the source, the destination and the edge:
+\begin{align}
+  \mathbf q_v&=W_q\,\mathbf h_v &&\in\R^{(\mathcal Hd_h)\times3},\\
+  \mathbf k_e&=W_{ks}\,\mathbf h_u+W_{kd}\,\mathbf h_v+W_{ke}\,A_e &&\in\R^{(\mathcal Hd_h)\times3}.
+\end{align}
+All four maps are VN-Linear. The sum equals one VN-Linear map applied to the stacked input $[\mathbf h_u;\mathbf h_v;A_e]$, because there is no bias; computing it in pieces avoids building that stack for every edge.
+
+\paragraph{Score.} Head $\eta$ owns rows $(\eta-1)d_h+1,\dots,\eta d_h$ of the query and key, written $\mathbf q_v^\eta,\mathbf k_e^\eta\in\R^{d_h\times3}$. Its score is their Frobenius inner product, scaled by the number of terms:
+\begin{equation}
+  \lambda_e^\eta=\frac{\ip{\mathbf q_v^\eta}{\mathbf k_e^\eta}_F}{\sqrt{3d_h}}
+  =\frac1{\sqrt{3d_h}}\sum_{r=1}^{d_h}\ip{\mathbf q_{v,r}^\eta}{\mathbf k_{e,r}^\eta}.
+\end{equation}
+It is invariant: both factors rotate with the fragment, so each inner product does not (rule 3). The scale $1/\sqrt{3d_h}$ keeps the logits of order one, as in dot-product attention, since the inner product sums $3d_h$ products.
+
+\paragraph{Attention weights.} For every head, the scores of the edges arriving at $v$ are normalised by a softmax,
+\begin{equation}
+  \alpha_e^\eta=\frac{\exp\lambda_e^\eta}{\sum_{e'\in\mathrm{in}(v)}\exp\lambda_{e'}^\eta}\qquad(e\in\mathrm{in}(v)),
+\end{equation}
+computed after subtracting the largest score, which leaves the result unchanged and prevents overflow.
+
+\paragraph{Message and aggregation.} The message from the source along the edge, and the attention-weighted sum at the destination, are
+\begin{align}
+  \mathbf m_e&=W_{vs}\,\mathbf h_u+W_{ve}\,A_e &&\in\R^{C\times3},\\
+  \mathbf a_{v,c}&=\sum_{e\in\mathrm{in}(v)}\alpha_e^{\eta(c)}\,\mathbf m_{e,c}, && c=1,\dots,C,
+\end{align}
+where the channels are split into $\mathcal H$ contiguous blocks of $C/\mathcal H$ and $\eta(c)$ is the head that owns channel $c$. The heads differ in their scores, and each head's weights scale its own block of message channels; the message map itself is shared, which keeps the parameter count close to that of a plain vector-neuron layer.
+
+\paragraph{Update.} The vertex's own features enter through a self-loop outside the softmax; the result passes a VN-Linear map, VN-LayerNorm and VN-LeakyReLU; and the layer is residual:
+\begin{equation}
+  \mathbf o_v=\operatorname{VN\text{-}LeakyReLU}\Big(\operatorname{VN\text{-}LN}\big(W_o(\mathbf a_v+W_s\,\mathbf h_v)\big)\Big),\qquad
+  \mathbf h'_v=\mathbf h_v+\mathbf o_v .
+\end{equation}
+
+\subsection{Why each part is there}
+\begin{itemize}
+  \item \textbf{Invariant scores, equivariant messages.} The two halves of attention have different jobs. The score decides how much to listen and must not change when the fragment turns; the message is what is heard and must turn with the fragment. An invariant weight times an equivariant message is equivariant, and so is the sum over edges.
+  \item \textbf{The edge enters both the key and the message.} The key can then score a neighbour by the shape of the surface between the two vertices (the two face normals) and by where the neighbour lies ($\boldsymbol\delta$); the message can carry the same information.
+  \item \textbf{Self-loop outside the softmax.} A vertex with no incident edges, which occurs in real meshes after clean-up, still produces an output, rather than dividing by an empty sum; and the layer can learn to ignore the neighbourhood entirely.
+  \item \textbf{Residual connection and normalisation.} They keep a deep stack of layers trainable and the feature magnitudes controlled, without a bias anywhere in the vector stream.
+\end{itemize}
+
+\begin{proposition}
+The intra layer is equivariant: replacing every $\mathbf h_v$ by $\mathbf h_vQ\T$ and every $A_e$ by $A_eQ\T$ replaces every $\mathbf h'_v$ by $\mathbf h'_vQ\T$.
+\end{proposition}
+\begin{proof}
+Queries, keys and messages are VN-Linear images of rotated inputs, so they are rotated (VN-Linear commutes with $Q$). The scores are inner products of two rotated stacks, hence unchanged; so are the softmax weights. The aggregate is a sum of rotated messages with unchanged weights, hence rotated, and so is $\mathbf a_v+W_s\mathbf h_v$. VN-Linear, VN-LayerNorm and VN-LeakyReLU are equivariant (\cref{sec:vn}), and the residual sum of two rotated stacks is rotated.
+\end{proof}
+
+\paragraph{Size.} The layer has $3C\mathcal Hd_h+3\mathcal Hd_h+4C^2+4C$ parameters (query and the two node keys; the edge key; the source message, self-loop, output map and nonlinearity directions; the edge message and the normalisation gains). At $C=128$ this is 78{,}432 per layer.
+
+% =====================================================================
+\section{The cross layer: vector-neuron transformer attention}
+\label{sec:cross}
+
+The cross layer lets fragments learn about each other. It is a transformer-style attention layer on the tokens of \cref{sec:tokens}: every token attends to all tokens of the other fragments of its scene (\cref{fig:cross}). It takes vector features and returns vector features, and it is constrained by \cref{eq:multi}: a token's output must be equivariant to its own fragment's pose and invariant to every other fragment's pose.
+
+\fig{fig_cross}{The cross layer for one receiving token $i$. Every quantity that crosses from the sending fragments (right) to the receiving fragment (left) is invariant (orange); the senders' vectors never cross. The message that token $i$ receives is a matrix built from invariants, applied to $i$'s own equivariant features.}{cross}
+
+\subsection{The equations}
+Let $\mathbf h_i\in\R^{C\times3}$ be the features of token $i$ (the features of its vertex), with $\mathcal H=4$ heads of size $d_k=16$.
+
+\paragraph{Invariant descriptions.} Each token is first described by invariants, using the read-out of \cref{eq:readout} with four directions:
+\begin{equation}
+  \mathbf s_i=\iota_4(\mathbf h_i)\in\R^{5C}.
+\end{equation}
+
+\paragraph{Scaled dot-product attention on the invariants.} Queries, keys and values are ordinary affine maps of the invariant descriptions,
+\begin{equation}
+  \mathbf q_i=W_Q\mathbf s_i+\mathbf b_Q,\qquad
+  \mathbf k_j=W_K\mathbf s_j+\mathbf b_K,\qquad
+  \mathbf v_j=W_V\mathbf s_j+\mathbf b_V\qquad\in\R^{\mathcal Hd_k},
+\end{equation}
+and every head $\eta$ attends over the partners $\mathcal P(i)$:
+\begin{equation}
+  \lambda_{ij}^\eta=\frac{\ip{\mathbf q_i^\eta}{\mathbf k_j^\eta}}{\sqrt{d_k}},\qquad
+  \alpha_{ij}^\eta=\frac{\exp\lambda_{ij}^\eta}{\sum_{j'\in\mathcal P(i)}\exp\lambda_{ij'}^\eta},\qquad
+  \mathbf c_i=\Big[\sum_{j\in\mathcal P(i)}\alpha_{ij}^\eta\,\mathbf v_j^\eta\Big]_{\eta=1}^{\mathcal H}\in\R^{\mathcal Hd_k}.
+\end{equation}
+Up to this point the layer is exactly the attention of a transformer, applied to invariant token descriptions. The biases are allowed because everything here is invariant.
+
+\paragraph{A matrix-valued message.} The attended context $\mathbf c_i$ and the token's own description $\mathbf s_i$ produce one mixing matrix per head,
+\begin{equation}
+  G_i=\operatorname{reshape}\Big(\MLP_G\big[\mathbf c_i;\,\mathbf s_i\big]\Big)\in\R^{\mathcal H\times\frac C{\mathcal H}\times\frac C{\mathcal H}},
+\end{equation}
+where $\MLP_G$ is a linear layer from $\mathcal Hd_k+5C$ to $2\mathcal Hd_k$ units, a layer normalisation, a GELU and a linear layer to $\mathcal H(C/\mathcal H)^2$ outputs. Head $\eta$'s matrix mixes head $\eta$'s block of channels of the token's \emph{own} features:
+\begin{equation}
+  \boldsymbol\mu_i=\blockdiag\big(G_i^1,\dots,G_i^{\mathcal H}\big)\,\mathbf h_i\in\R^{C\times3}.
+\end{equation}
+\paragraph{Update.} A VN-Linear projection, a residual connection and VN-LayerNorm complete the layer,
+\begin{equation}
+  \mathbf h'_i=\operatorname{VN\text{-}LN}\big(\mathbf h_i+W_P\,\boldsymbol\mu_i\big),
+\end{equation}
+and $\mathbf h'_i$ is written back to the token's vertex. Vertices that are not tokens are not changed by a cross layer.
+
+\subsection{Why it is built this way}
+\begin{itemize}
+  \item \textbf{Scores from invariants.} The natural vector-neuron score, an inner product of vector features of two tokens, would be $\ip{A_i\mathbf a}{A_j\mathbf b}=\ip{\mathbf a}{A_i\T A_j\mathbf b}$ after independent rotations $A_i,A_j$ of the two fragments: it depends on their \emph{relative} rotation, which is exactly the noise that \cref{eq:multi} excludes. Scores built from the invariant descriptions $\mathbf s_i,\mathbf s_j$ are independent of both poses.
+  \item \textbf{Shape crosses the gap, pose does not.} The sender contributes only invariant quantities: its keys and values. It therefore tells the receiver what the other fragments \emph{look like}, never how they are oriented. Nothing is lost: the relative pose of two randomly rotated fragments is the perturbation, not information about the object.
+  \item \textbf{A matrix, not a vector, as the message.} The sender cannot contribute a direction of its own, because a direction would carry its orientation. The most it can contribute is an operator on the receiver's own vectors. An invariant matrix times the receiver's equivariant features is equivariant to the receiver's pose and invariant to everyone else's. This is the construction of the correlation module of Wu et al.~\cite{wu2023leveraging}, $C_{ij}=G_jF_i$ with $G_j$ an invariant matrix describing the sender and $F_i$ the receiver's equivariant features. Here the matrix is a full $(C/\mathcal H)\times(C/\mathcal H)$ block per head, so the sender can re-mix the receiver's channels arbitrarily.
+  \item \textbf{Pool first, then build the matrix.} The context is pooled over the partners before the matrix is built, so one set of matrices is computed per receiving token rather than per pair. A scene can have millions of pairs, and a matrix per pair would not fit in memory.
+  \item \textbf{Near-identity start.} The last layer of $\MLP_G$ is initialised with small weights and zero bias, so an untrained cross layer sends almost no message and passes the token features through, apart from the normalisation, instead of injecting noise into a network that is already doing something. Small rather than zero weights keep the gradient flowing to the attention.
+\end{itemize}
+
+\begin{proposition}
+The cross layer satisfies \cref{eq:multi}: rotating token $i$'s fragment by $A_i$ multiplies $\mathbf h'_i$ by $A_i\T$ from the right, and rotating any other fragment leaves $\mathbf h'_i$ unchanged.
+\end{proposition}
+\begin{proof}
+The descriptions $\mathbf s_j$ of all tokens are invariant to every rotation, so the scores, the weights, the context $\mathbf c_i$ and the matrices $G_i$ do not change under any of the rotations. The receiver's features enter only through $\boldsymbol\mu_i=\blockdiag(G_i)\,\mathbf h_i$ and the residual term, both linear in $\mathbf h_i$ with invariant coefficients: rotating fragment $f(i)$ multiplies them by $A_i\T$ from the right, and VN-Linear and VN-LayerNorm preserve this. Rotating another fragment changes neither $\mathbf h_i$ nor any invariant, so $\mathbf h'_i$ is unchanged.
+\end{proof}
+
+\paragraph{Size and cost.} The layer has $4C$ parameters for the read-out directions, $3(5C\cdot\mathcal Hd_k+\mathcal Hd_k)$ for the queries, keys and values, $(\mathcal Hd_k+5C)\,2\mathcal Hd_k+2\mathcal Hd_k+4\mathcal Hd_k+2\mathcal Hd_k\cdot\mathcal H(C/\mathcal H)^2+\mathcal H(C/\mathcal H)^2$ for $\MLP_G$, $C^2$ for the projection and $C$ for the normalisation. At $C=128$ this is 758{,}976 per layer, 70\% of it in the last layer of $\MLP_G$. The work is proportional to the number of pairs, at most $T^2$ per scene (\cref{sec:tokens}); during training the gathered per-pair quantities are recomputed in the backward pass instead of being stored, which reduces the memory per pair by an order of magnitude at almost no cost in time.
+
+% =====================================================================
+\section{The whole network}
+\label{sec:model}
+
+\fig{fig_model}{The network as configured for the reported run: an input VN-Linear layer and the scale gate, eight attention layers in the order intra, intra, cross, intra, cross, intra, cross, intra, and two heads. The edge features feed every intra layer and the tokens and pairs feed every cross layer. The rotation head pools each fragment's vertices into one frame; the embedding head reads out an invariant descriptor for every vertex.}{model}
+
+\subsection{From input to output}
+\begin{enumerate}
+  \item \textbf{Lift.} A VN-Linear map lifts the two input vectors of every vertex to $C$ channels, $\mathbf h_v=W_{\mathrm{in}}X_v\in\R^{C\times3}$.
+  \item \textbf{Scale.} The scale gate of \cref{sec:scalegate} conditions every vertex on the log-radius of its fragment.
+  \item \textbf{Attention layers.} A sequence of intra and cross layers. The default sequence is five intra layers, three cross layers and one more intra layer; the reported run interleaves them as intra, intra, cross, intra, cross, intra, cross, intra.
+  \item \textbf{Heads.} The final features feed the rotation head and the embedding head (\cref{sec:rothead,sec:embhead}).
+\end{enumerate}
+
+\paragraph{Why intra layers must follow cross layers.} A cross layer changes only the token vertices; the rotation head averages over \emph{all} vertices of a fragment. Information that arrives at the tokens therefore reaches the rest of the fragment only through intra layers that come after the cross layers, each extending its reach by one ring of mesh neighbours. With the default 2{,}048 tokens against a median 9{,}149 vertices per scene, about 78\% of the pooled signal would come from vertices that never heard from another fragment if no intra layer followed the last cross layer. On synthetic scenes the fraction of vertices reached by cross-fragment information was 9\%, 51\%, 81\% and 93\% with zero to three intra layers after the last cross layer. Interleaving the two kinds, as in the reported run, also lets every cross layer work with features that already carry the previous cross layer's information spread over the surface.
+
+\subsection{The rotation head}
+\label{sec:rothead}
+For every fragment $f$ the head computes
+\begin{align}
+  \mathbf m_f&=\frac1{|V_f|}\sum_{v\in V_f}W_{\mathrm{pool}}\,\mathbf h_v\in\R^{C\times3} &&\text{(VN-Linear, then mean over the fragment)},\\
+  \begin{bmatrix}\mathbf a_f\T\\ \mathbf b_f\T\end{bmatrix}&=W_{\mathrm{head}}\,\mathbf m_f\in\R^{2\times3} &&\text{(VN-Linear, $C\to2$)},
+\end{align}
+and turns the two vectors into a rotation by Gram--Schmidt orthogonalisation (\cref{fig:gramschmidt}a):
+\begin{equation}
+  \mathbf e_1=\frac{\mathbf a_f}{\norm{\mathbf a_f}},\qquad
+  \mathbf e_2=\frac{\mathbf b_f-\ip{\mathbf b_f}{\mathbf e_1}\mathbf e_1}{\norm{\mathbf b_f-\ip{\mathbf b_f}{\mathbf e_1}\mathbf e_1}},\qquad
+  \mathbf e_3=\mathbf e_1\times\mathbf e_2,\qquad
+  M_f=\big[\mathbf e_1\ \mathbf e_2\ \mathbf e_3\big].
+  \label{eq:gs}
+\end{equation}
+The predicted rotation is the transpose of this frame,
+\begin{equation}
+  \hat R_f=M_f\T .
+  \label{eq:rhat}
+\end{equation}
+
+\fig{fig_gramschmidt}{(a) Gram--Schmidt turns two equivariant vectors into a frame: $\mathbf e_1$ along $\mathbf a$, $\mathbf e_2$ the normalised part of $\mathbf b$ orthogonal to $\mathbf e_1$, $\mathbf e_3$ their cross product. (b) The frame of a perturbed fragment is the rotated frame of the assembled fragment, so its transpose undoes the perturbation once the network maps assembled fragments to a common frame.}{gramschmidt}
+
+\paragraph{Why this parameterisation.} The frame is orthonormal with determinant $+1$ by construction: the cross product fixes the handedness without a sign test. It is the six-dimensional representation of Zhou et al.~\cite{zhou2019continuity}, which, unlike quaternions or Euler angles, is continuous, and it fits vector features naturally. Rotating the input rotates $\mathbf a_f$ and $\mathbf b_f$, hence every column of $M_f$: $M_f\mapsto QM_f$. A quaternion's four numbers are coordinates in a fixed basis, and no fixed linear map from vector features can produce them equivariantly. The construction degenerates only when $\mathbf a_f$ and $\mathbf b_f$ are parallel; the mean of $|\cos\angle(\mathbf a_f,\mathbf b_f)|$ is logged during training to detect it (0.5 for random directions, near 1 when the frame's second axis is decided by numerical noise).
+
+\subsection{The rotation convention}
+\label{sec:convention}
+Why the prediction is $M\T$ and not $M$ follows from equivariance (\cref{fig:gramschmidt}b). Let $\x$ be an assembled fragment and $Q\cdot\x$ its perturbed copy, and write $M(\x)$ for the frame the network assigns to the assembled fragment. Then
+\begin{equation}
+  M(Q\cdot\x)=Q\,M(\x)\qquad\Longrightarrow\qquad
+  \hat R=M(Q\cdot\x)\T=M(\x)\T\,Q\T .
+  \label{eq:convention}
+\end{equation}
+The label is $R=Q\T$ (\cref{eq:label}). So the prediction is exactly right, for every perturbation, if the network maps assembled fragments to the identity frame, $M(\x)=I$, and then $\hat R\,\tilde{\mathbf p}_v=\y_v$ returns every vertex to its assembled position. In general the error is
+\begin{equation}
+  \theta\big(\hat R,R\big)=\theta\big(M(\x)\T Q\T,\,Q\T\big)=\theta\big(M(\x),\,I\big),
+  \label{eq:abserror}
+\end{equation}
+the angle by which the network's frame for the assembled fragment misses the identity. This is \cref{eq:cancel} made concrete: the perturbation has disappeared. \Cref{sec:anchor} shows that the loss actually used asks for something weaker and more sensible than $M(\x)=I$.
+
+\subsection{The embedding head}
+\label{sec:embhead}
+For every vertex the head reads out invariants and maps them to a 32-dimensional embedding,
+\begin{equation}
+  \z_v=W_2\,\operatorname{GELU}\Big(\LN\big(W_1\,\iota_4(\mathbf h_v)+\mathbf b_1\big)\Big)\in\R^{32},
+\end{equation}
+with $W_1\in\R^{64\times5C}$ and $W_2\in\R^{32\times64}$. It is invariant, because the vertices it will be compared with lie on other fragments, each under its own unknown rotation: equivariant features of two fragments live in unrelated frames and cannot be compared, while invariant ones can. The last layer has no bias, because a constant added to every embedding changes no distance between embeddings and so could never be learned. The embedding is supervised only by the correspondence loss of \cref{sec:infonce}, and used only by stage two.
+
+\subsection{What the network outputs}
+\begin{itemize}
+  \item a rotation $\hat R_f\in\SO$ per fragment, the transpose of its frame $M_f$, mapping the perturbed fragment towards its assembled orientation; it is used by the losses after alignment to the anchor (\cref{sec:anchor}) and by stage two;
+  \item an invariant embedding $\z_v\in\R^{32}$ per vertex, used by the correspondence loss and by stage two;
+  \item the final vector features $\mathbf h_v\in\R^{C\times3}$ and the head's two vectors $\mathbf a_f,\mathbf b_f$, kept for diagnostics.
+\end{itemize}
+The network never outputs a translation.
+
+\begin{proposition}
+The whole network is equivariant in the sense of \cref{eq:multi}: rotating fragment $i$ by $A$ maps $\mathbf h_v\mapsto\mathbf h_vA\T$ for $v\in V_i$, $M_i\mapsto AM_i$ and $\hat R_i\mapsto\hat R_iA\T$, and leaves every embedding unchanged and every other fragment's outputs unchanged.
+\end{proposition}
+\begin{proof}
+The lift is VN-Linear and the scale gate multiplies by an invariant gain. Intra layers connect vertices of one fragment only and are equivariant; cross layers satisfy \cref{eq:multi}; by induction every layer's output satisfies it. The pooling is a VN-Linear map followed by a mean over one fragment's vertices, hence equivariant to that fragment's pose only; the head is VN-Linear; Gram--Schmidt maps $(A\mathbf a,A\mathbf b)$ to $AM$ because inner products and norms are invariant and $(A\mathbf u)\times(A\mathbf w)=A(\mathbf u\times\mathbf w)$ for a rotation. The embedding is a function of invariants.
+\end{proof}
+
+\subsection{Size}
+\Cref{tab:params} counts the parameters. Almost all of them sit in the cross layers, in the network that builds the mixing matrices.
+
+\begin{table}[htbp]
+\centering\small
+\caption{Parameters, with $\mathcal H=4$, $d_h=8$, $d_k=16$ and a 32-dimensional embedding.}
+\label{tab:params}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+component & $C=128$ & count in the reported run \\
+\midrule
+input lift (VN-Linear $2\to C$) & 256 & 256 \\
+scale gate & 41{,}728 & 41{,}728 \\
+intra layer, each & 78{,}432 & $5\times$ 78{,}432 \\
+cross layer, each & 758{,}976 & $3\times$ 758{,}976 \\
+rotation head (pooling map and $C\to2$ map) & 16{,}640 & 16{,}640 \\
+embedding head & 43{,}712 & 43{,}712 \\
+\midrule
+total & & 2{,}771{,}424 \\
+\midrule
+\multicolumn{3}{@{}l}{for comparison: default sequence (6 intra, 3 cross) at $C=128$: 2{,}849{,}856; at the default $C=64$: 928{,}640}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{What a prediction is compared against: the anchor}
+\label{sec:anchor}
+
+\fig{fig_anchor}{The anchor protocol on the cartoon. (a) True orientations; the anchor is the fragment of largest radius. (b) A prediction that is off mostly by one turn shared by all fragments, which no input can reveal for an unseen, round object. (c) Applying the one rotation $C_s$ that makes the anchor exact removes the shared turn; what remains is each fragment's error relative to the anchor.}{anchor}
+
+\subsection{Why the absolute rotation is the wrong target}
+The label $R_i$ is the rotation back into the frame in which the object happens to be stored. For an object the network has never seen, that frame cannot be read off the input. Most everyday objects are round, and how far a stored bottle is turned about its own axis is arbitrary: nothing in the fragments reveals it. A network asked for $R_i$ itself can lower that loss on training objects only by remembering how each of them is stored, which does not transfer to new objects. By \cref{eq:abserror}, the absolute target asks for $M(\x_i)=I$: every assembled fragment must be mapped to the dataset's stored frame.
+
+What the input does determine is how the fragments sit \emph{relative to one another}. The benchmark protocol therefore fixes one fragment at its true pose and scores the others relative to it~\cite{li2025garf,wang2025puzzlefusionpp}.
+
+\subsection{The anchor and the alignment}
+In every scene the \emph{anchor} $a$ is the fragment with the largest radius $r_f$ (ties go to the first). It is the same fragment whose radius sets the scene divisor $d$, its radius is invariant and known at inference, and GARF reports that a random anchor works as well as the largest~\cite{li2025garf}, so the choice is a convention rather than a lever. One rotation per scene is applied on the left of every prediction:
+\begin{equation}
+  C_s=R_a\,\hat R_a\T,\qquad \tilde R_i=C_s\,\hat R_i\qquad\text{for every fragment $i$ of scene $s$.}
+  \label{eq:anchor}
+\end{equation}
+Then $\tilde R_a=R_a$ exactly, and, because the geodesic angle is invariant under multiplication from either side,
+\begin{equation}
+  \theta\big(\tilde R_i,R_i\big)=\theta\big(\hat R_a\T\hat R_i,\ R_a\T R_i\big):
+  \label{eq:relative}
+\end{equation}
+the error of fragment $i$ is the error of its orientation \emph{relative to the anchor}. The rotation is applied on the left because, in this convention, a prediction maps the perturbed fragment into the assembled frame, and a global rotation of the assembled result multiplies it on the left. If every prediction in a scene is off by the same global rotation $G$, so that $\hat R_i=GR_i$, then $C_s=G\T$ and every aligned prediction is exact: the one thing no input determines is removed, and nothing else is. The anchor itself is excluded from every average, since its aligned error is zero by construction; counting it would give every scene a free perfect fragment, a third of the score of a three-fragment scene.
+
+\subsection{What the anchor target asks of the network}
+Combining \cref{eq:anchor} with the convention \cref{eq:convention} gives a remarkably simple picture. Write $M_i=M(\x_i)$ for the frame of the assembled fragment $i$. Then $\hat R_i=M_i\T Q_i\T$, so
+\begin{equation}
+  C_s=Q_a\T\big(M_a\T Q_a\T\big)\T=M_a,\qquad
+  \tilde R_i=M_aM_i\T Q_i\T,\qquad
+  \theta\big(\tilde R_i,R_i\big)=\theta\big(M_aM_i\T,\,I\big)=\theta\big(M_i,\,M_a\big).
+  \label{eq:anchorerror}
+\end{equation}
+The anchor-relative error of fragment $i$ is exactly the angle between the frames the network assigns to the assembled fragment $i$ and to the assembled anchor. No perturbation appears. The network is no longer asked to reproduce the dataset's stored frame, $M_i=I$; it is asked only that \emph{all fragments of one object be mapped to the same frame}, whichever frame that is. Agreeing on a common frame is something the fragments' shapes, and the information exchanged by the cross layers, can determine for an object never seen before.
+
+\subsection{Where the protocol is used}
+By default the four rotation-dependent losses of \cref{sec:losses} compare $\tilde R_i$, not $\hat R_i$, with $R_i$, and skip the anchors. The alignment is differentiable, including through the anchor's own prediction, which is therefore trained by every other fragment of its scene. The validation metrics always use the protocol, whatever the training target, with the absolute error reported beside them. The chance level is unchanged, because the relative rotation of two independent uniformly random rotations is itself uniformly random (\cref{app:chance}).
+
+% =====================================================================
+\section{The losses}
+\label{sec:losses}
+
+\fig{fig_losses}{The five loss terms. (a) The geodesic angle between the predicted and the true rotation. (b) The distance between every predicted and true vertex position (orange), and the angle between predicted and true normals. (c) The angles between the predicted and true normals of the two faces of every edge. (d) The correspondence loss pulls together the embeddings of vertices that coincide in the assembled object and pushes apart all others.}{losses}
+
+\subsection{Averaging per fragment}
+Every rotation-dependent term is first computed per fragment and then averaged over the scored fragments: all fragments under the absolute target, all but the anchors under the anchor target. With $\kappa_f\in\{0,1\}$ marking the scored fragments,
+\begin{equation}
+  \operatorname{FM}_\kappa(\ell)=\frac{\sum_f\kappa_f\,\ell_f}{\max\big(1,\sum_f\kappa_f\big)}.
+\end{equation}
+Terms defined on vertices or edges are first averaged within each fragment, written $\langle\cdot\rangle_{v\in f}$ or $\langle\cdot\rangle_{e\in f}$, so a fragment of 83{,}039 vertices counts as much as one of 4. In the formulas below, $\tilde R_f$ stands for the prediction actually compared: the anchor-aligned one by default, the raw $\hat R_f$ under the absolute target.
+
+\subsection{Rotation: the geodesic angle}
+\label{sec:rotloss}
+The distance between two rotations is the angle of the rotation that takes one to the other. With $E=\tilde R\T R$,
+\begin{equation}
+  \mathbf a(E)=\begin{bmatrix}E_{32}-E_{23}\\ E_{13}-E_{31}\\ E_{21}-E_{12}\end{bmatrix},\qquad
+  \theta(\tilde R,R)=\atantwo\big(\norm{\mathbf a(E)},\ \tr E-1\big),\qquad
+  \mathcal L_{\mathrm{rot}}=\operatorname{FM}_\kappa\big(\theta(\tilde R_f,R_f)\big),
+\end{equation}
+which is correct because $\norm{\mathbf a(E)}=2\sin\theta$ and $\tr E-1=2\cos\theta$ for a rotation by $\theta\in[0,\pi]$. The angle is in radians in the loss and is reported in degrees. The obvious formula, $\arccos\big((\tr E-1)/2\big)$, is not used: its derivative is infinite at $\theta=0$, exactly where a converging model operates, so its gradient explodes as the fit improves, and clamping its argument to avoid the singularity creates an error floor instead. The two-argument arctangent is smooth at both ends of its range; its derivative at $\theta=0$ is $1/2$. The norm is computed with a floor of $10^{-20}$ on its square, which keeps its gradient finite at a perfect prediction without adding a measurable error. For a uniformly random prediction the expected angle is $\pi/2+2/\pi$ radians, $126.5^\circ$ (\cref{app:chance}).
+
+\subsection{Position}
+The predicted rotation is applied to the perturbed positions, and the result is compared with the assembled positions:
+\begin{equation}
+  \mathcal L_{\mathrm{pos}}=\operatorname{FM}_\kappa\Big(\big\langle\,\norm{\tilde R_f\tilde{\mathbf p}_v-\y_v}\,\big\rangle_{v\in f}\Big).
+\end{equation}
+The distance is not squared, and it is measured in the normalised units of \cref{eq:normalise}. Because $\tilde{\mathbf p}_v=Q_f\y_v$, the residual is $(\tilde R_fQ_f-I)\y_v$, and if the error rotation $\tilde R_fQ_f=\tilde R_fR_f\T$ turns by $\theta_f$ about the unit axis $\mathbf u_f$,
+\begin{equation}
+  \norm{\tilde R_f\tilde{\mathbf p}_v-\y_v}=2\sin\tfrac{\theta_f}2\,\big\lVert\y_v-(\y_v\cdot\mathbf u_f)\mathbf u_f\big\rVert
+\end{equation}
+(\cref{app:closed}). The term is the rotation error weighted by how far the vertices lie from the error axis: a turn about an axis along which the fragment is thin moves little and costs little. It has no universal chance level; for points on the unit sphere and a uniformly random rotation it is $4/3$.
+
+\subsection{Normals}
+\begin{equation}
+  \mathcal L_{\mathrm{nrm}}=\operatorname{FM}_\kappa\Big(\big\langle\,1-\cos\angle\big(\tilde R_f\tilde\n_v,\ \n_v\big)\big\rangle_{v\in f}\Big),\qquad
+  1-\cos\angle=2\sin^2\tfrac{\theta_f}2\,\big(1-(\n_v\cdot\mathbf u_f)^2\big).
+\end{equation}
+Both vectors are normalised before the cosine is taken. A random prediction scores 1 on average.
+
+\subsection{Face normals}
+Every directed edge carries the normals of its two faces (\cref{sec:edges}). Both are rotated by the prediction and compared with the assembled ones; the third edge vector, $\boldsymbol\delta$, is not part of this term, because its length is information and normalising it would be wrong:
+\begin{equation}
+  \mathcal L_{\mathrm{face}}=\operatorname{FM}_\kappa\Big(\Big\langle\,\sum_{k=1}^{2}\Big(1-\cos\angle\big(\tilde R_f\tilde\n_{e,k},\ \n_{e,k}\big)\Big)\Big\rangle_{e\in f}\Big).
+\end{equation}
+Both directions of every edge are included; the reverse copy holds the same pair in swapped order, so this equals the mean over undirected edges. A random prediction scores 2.
+
+\paragraph{Why four terms that measure the same rotation.} All four depend on the same predicted rotation, so they share their minimiser. They differ in how they weight an error: the geodesic angle counts every error equally, while the position, normal and face terms weight it by the fragment's geometry, so their gradients emphasise the rotations that visibly move the surface. They also have different profiles near the optimum: the position term behaves like $|\theta|$, the normal and face terms like $\theta^2$.
+
+\subsection{The correspondence loss}
+\label{sec:infonce}
+The embedding is trained so that vertices which coincide in the assembled object, and only those, have similar embeddings. The positives come from the coincidence clusters of \cref{sec:coincidence}. In every forward pass, a set $\mathcal A$ of at most 1{,}024 clustered vertices is drawn at random as anchors. With unit-normalised embeddings $\hat\z=\z/\norm{\z}$, a temperature $\tau=0.1$, and $\mathrm{pos}(i)$ the other members of $i$'s cluster in $\mathcal A$,
+\begin{equation}
+  s_{ik}=\frac{\ip{\hat\z_i}{\hat\z_k}}{\tau},\qquad
+  \mathcal L_{\mathrm{emb}}=\frac1{|\mathcal A'|}\sum_{i\in\mathcal A'}\Big[\log\!\!\sum_{k\in\mathcal A\setminus\{i\}}\!e^{s_{ik}}-\log\!\!\sum_{p\in\mathrm{pos}(i)}\!e^{s_{ip}}\Big],
+\end{equation}
+where $\mathcal A'$ are the anchors with at least one positive in the sample. This is InfoNCE~\cite{oord2018cpc} with several positives inside the logarithm. The negatives are all other sampled clustered vertices, which come from the same scene when a forward pass holds one scene: exactly the vertices that stage two will have to tell apart.
+
+\paragraph{Why a contrastive loss.} A loss that only pulls coincident vertices together, such as the variance of each cluster about its mean, is minimised by giving every vertex the same embedding. That collapse was observed in practice and is useless for matching, where every distance would then tie. The denominator of InfoNCE pushes non-matching vertices apart and makes collapse expensive. A collapsed embedding scores $\log(|\mathcal A|-1)-\log|\mathrm{pos}(i)|$; an untrained one scores higher still, because the spread of random similarities inflates the denominator, so a falling value early in training is ambiguous. The fraction of anchors whose most similar vertex is a positive, \emph{match@1}, resolves the ambiguity: it is near zero for a collapsed or random embedding and 1 for a perfect one.
+
+\subsection{The total loss}
+\begin{equation}
+  \mathcal L=\mathcal L_{\mathrm{rot}}+\mathcal L_{\mathrm{pos}}+\mathcal L_{\mathrm{nrm}}+\mathcal L_{\mathrm{face}}+\mathcal L_{\mathrm{emb}} .
+\end{equation}
+All weights are 1 and untuned: the terms have different natural units (radians, cosines, normalised distances), and choosing weights before seeing how each term moves would be guesswork. Each term is reported separately so that their scales can be measured. No other regulariser is used besides the optimiser's weight decay.
+
+% =====================================================================
+\section{Metrics}
+\label{sec:metrics}
+
+\begin{itemize}
+  \item \textbf{Geodesic error}, the main number: the mean (and median) of $\theta(\tilde R_i,R_i)$ in degrees over all non-anchor validation fragments. The absolute error $\theta(\hat R_i,R_i)$ over all fragments is reported beside it.
+  \item \textbf{Accuracy at a threshold}: the fraction of scored fragments with an error below $5^\circ$, $10^\circ$ and $30^\circ$.
+  \item \textbf{Euler-angle error}, for comparison with published tables: the root mean square of the three Euler angles of the residual $\tilde R\T R$ (rotations about the fixed $x$, $y$ and $z$ axes in turn), averaged over fragments. It is computed on the residual rather than as a difference of Euler angles, which is not a metric on rotations. A $30^\circ$ error about one axis is $30^\circ$ geodesic but $17.3^\circ$ by this measure, so the two must never be confused.
+  \item \textbf{Embedding quality}: match@1 (\cref{sec:infonce}).
+  \item \textbf{Frame health}: the mean $|\cos\angle(\mathbf a_f,\mathbf b_f)|$ of the head's two vectors (\cref{sec:rothead}).
+  \item \textbf{Per-category errors}: the geodesic error by object category, on a validation set that is never reweighted.
+  \item \textbf{Assembly}, after stage two: the translation error, the Chamfer distance and the part accuracy (\cref{sec:assemblymetrics}).
+\end{itemize}
+
+\begin{table}[htbp]
+\centering\small
+\caption{Reference values for a uniformly random prediction, the level every term starts near.}
+\label{tab:chance}
+\begin{tabularx}{\linewidth}{@{}llX@{}}
+\toprule
+quantity & chance & how it is obtained \\
+\midrule
+geodesic error & $126.5^\circ$ ($\pi/2+2/\pi$ rad), s.d.\ $37.0^\circ$ & analytic (\cref{app:chance}) \\
+geodesic error, anchor protocol & $126.5^\circ$ & relative of two uniform rotations is uniform \\
+axis right, angle about it uniform & $90^\circ$ & analytic; a landmark, not a floor \\
+Euler-angle error & $83.2^\circ$ & Monte Carlo \\
+normal term / face term & 1 / 2 & $\mathbb E[\cos]=0$ for a uniformly rotated unit vector \\
+position term & $4/3$ for points on the unit sphere & depends on the fragment's shape \\
+match@1 & $\approx|\mathrm{pos}(i)|/(|\mathcal A|-1)$ & a random nearest neighbour \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% =====================================================================
+\section{Stage two: solving for the translations}
+\label{sec:stage2}
+
+\fig{fig_stage2}{Stage two. (a) With the predicted rotations applied, every fragment still sits at its own centroid. Fracture vertices of different fragments are matched where their embeddings are mutual nearest neighbours; a few matches are wrong. (b) The translations that make matched points coincide solve a least-squares problem on the graph whose nodes are fragments; robust reweighting suppresses wrong matches. (c) The placed fragments.}{stage2}
+
+The network predicts orientations only. Once every fragment is correctly oriented, placing it is a well-posed least-squares problem, which this stage solves without learning (\cref{fig:stage2}). It runs at evaluation, not during training, and works in world units, because the benchmark's thresholds are defined there.
+
+\subsection{Inputs}
+For every vertex $v$ of fragment $f$, with $\tilde R_f$ the anchor-aligned predicted rotation,
+\begin{equation}
+  \mathbf p_v=d\,\tilde R_f\,\tilde{\mathbf p}_v,\qquad \hat\n_v=\tilde R_f\,\tilde\n_v,\qquad \z_v .
+\end{equation}
+If the rotation is exact, $\mathbf p_v=\x_v-\mathbf c_f$: the fragment is correctly oriented but still centred on its own centroid. Only the translations $\mathbf t_f$ are unknown.
+
+\subsection{Matching}
+\paragraph{Candidates.} The candidates of a fragment are its dihedral-labelled vertices (\cref{sec:dihedral}), at most 2{,}048 per fragment, chosen by even striding over the vertex order so that repeated evaluations agree; a fragment with no labelled vertex uses all of its vertices.
+
+\paragraph{Mutual nearest neighbours.} For every candidate $i$, its nearest candidate on any \emph{other} fragment in embedding space is
+\begin{equation}
+  \nu(i)=\argmin_{j:\ f(j)\ne f(i)}\norm{\z_i-\z_j},
+\end{equation}
+and $(i,j)$ is a match if $\nu(i)=j$ and $\nu(j)=i$. Each point has at most one match; there is no distance threshold. Because the embedding is invariant, the matches do not depend on the predicted rotations at all: the two sides of a fracture can be recognised while the fragments are still apart.
+
+\paragraph{Weights.} The two sides of a true interface face each other, so their normals point in opposite directions. Every match $m=(i,j)$ receives the weight
+\begin{equation}
+  b_m=\clip_{[0,1]}\Big(\tfrac12\big(1-\cos\angle(\hat\n_i,\hat\n_j)\big)\Big),
+\end{equation}
+1 for exactly opposed normals and 0 for aligned ones. This is where the predicted rotations enter the matching.
+
+\subsection{Least squares on the fragment graph}
+With the rotations fixed, the translations that make matched points coincide minimise
+\begin{equation}
+  E(\mathbf t)=\sum_m w_m\big\lVert(\mathbf p_{i_m}+\mathbf t_{a_m})-(\mathbf p_{j_m}+\mathbf t_{b_m})\big\rVert^2
+  =\sum_m w_m\big\lVert\mathbf t_{a_m}-\mathbf t_{b_m}-\mathbf d_m\big\rVert^2,\qquad \mathbf d_m=\mathbf p_{j_m}-\mathbf p_{i_m},
+\end{equation}
+where $a_m$ and $b_m$ are the fragments of the two matched points. Collecting the translations in $T\in\R^{F\times3}$ and setting the gradient to zero gives the normal equations
+\begin{equation}
+  L\,T=B,\qquad
+  L=\sum_m w_m(\mathbf e_{a_m}-\mathbf e_{b_m})(\mathbf e_{a_m}-\mathbf e_{b_m})\T,\qquad
+  B=\sum_m w_m(\mathbf e_{a_m}-\mathbf e_{b_m})\,\mathbf d_m\T,
+\end{equation}
+with $\mathbf e_f$ the $f$-th unit vector. $L$ is the weighted Laplacian of the graph whose nodes are fragments and whose edges are matches. It is singular, because adding one constant vector to every translation changes nothing; this \emph{gauge} freedom is removed by solving
+\begin{equation}
+  \Big(L+\rho I+\tfrac1F\mathbf 1\mathbf 1\T\Big)\,T=B,\qquad \rho=10^{-6},
+\end{equation}
+and subtracting the mean translation. Since $\mathbf 1\T L=0$ and $\mathbf 1\T B=0$, the solution has zero mean and is the least-squares solution of minimal norm, up to the tiny ridge $\rho$, which also covers fragments that no match reaches. The system is solved in double precision, because the normal equations of a sparsely connected assembly are ill-conditioned and single precision loses the small fragments first.
+
+\paragraph{Robustness.} Some matches are wrong, and a single wrong match can drag a fragment far away. The solve is therefore repeated with weights recomputed from the residuals, a Huber-type iteratively reweighted least-squares scheme~\cite{huber1964robust}:
+\begin{equation}
+  w_m^{(0)}=b_m,\qquad r_m=\big\lVert\mathbf t_{a_m}-\mathbf t_{b_m}-\mathbf d_m\big\rVert,\qquad
+  w_m\leftarrow b_m\,\min\!\big(1,\ \delta/r_m\big),\qquad\delta=0.05,
+\end{equation}
+for five solves in total. Matches with residuals below $\delta$ keep their weight; matches far off are down-weighted in proportion to their residual, which approximately minimises the Huber loss of the residuals instead of their squares.
+
+\paragraph{Why the normals are not part of the energy.} Normals do not change under translation, so any energy term in the normals would have zero gradient with respect to $\mathbf t$. What they do measure is whether a match is plausible, which is how they are used.
+
+\paragraph{Gauge and final pose.} The translations are reported relative to the anchor, $\hat{\mathbf t}_f-\hat{\mathbf t}_a$, and compared with the true offsets $\mathbf c_f-\mathbf c_a$. The predicted world position of vertex $v$ is $\mathbf p_v+\hat{\mathbf t}_{f(v)}-\hat{\mathbf t}_a$, against the true $\x_v-\mathbf c_a$.
+
+\paragraph{Special cases.} With no match, every translation is zero. If the match graph falls into several connected pieces, each piece is solved with zero mean on its own and the pieces end up superimposed; the number of matches is reported with every assembly so that a weakly supported result can be recognised. An optional step that pushes apart fragments whose bounding spheres overlap exists but is off, because mating fragments' bounding spheres overlap even in a correct assembly, so it can only trade interface alignment for visual plausibility.
+
+\subsection{Assembly metrics}
+\label{sec:assemblymetrics}
+Per scene, over the non-anchor fragments:
+\begin{itemize}
+  \item the translation error $\mathrm{RMSE}(T)=\mean_f\sqrt{\tfrac13\norm{\hat{\mathbf t}_f-\mathbf t_f}^2}$, in world units;
+  \item the symmetric Chamfer distance, with squared distances,
+  \begin{equation}
+    \mathrm{CD}(\mathcal X,\mathcal Y)=\frac1{|\mathcal X|}\sum_{\x\in\mathcal X}\min_{\y\in\mathcal Y}\norm{\x-\y}^2+\frac1{|\mathcal Y|}\sum_{\y\in\mathcal Y}\min_{\x\in\mathcal X}\norm{\x-\y}^2,
+  \end{equation}
+  between predicted and true point sets of at most 2{,}048 evenly spaced vertices per fragment, for the whole object (anchor included) and for every part;
+  \item the part accuracy: the fraction of parts whose own Chamfer distance is below $0.01$.
+\end{itemize}
+Every metric is computed per scene and then averaged over scenes.
+
+% =====================================================================
+\section{Training}
+\label{sec:training}
+
+\fig{fig_training}{The training procedure: micro-batches of one scene, accumulated into one optimiser step with every fragment weighted equally, and a fixed number of steps per epoch followed by validation and checkpointing.}{training}
+
+\subsection{Micro-batches and fragment-weighted accumulation}
+One forward pass processes one scene, a \emph{micro-batch}; a scene is a whole set of graphs, often tens of thousands of vertices, and memory is the binding constraint. One optimiser step accumulates $K$ micro-batches. Every loss term is a mean over the $n_b$ scored fragments of micro-batch $b$, so the backward pass is run on $n_b\mathcal L_b$, which turns the mean back into a sum, and the accumulated gradient is divided by the total number of fragments:
+\begin{equation}
+  \mathbf g=\frac{\sum_b n_b\,\nabla\mathcal L_b}{\sum_b n_b}.
+  \label{eq:accum}
+\end{equation}
+For the rotation-dependent terms this is exactly the gradient of the mean over every scored fragment in the step, the same as if all $K$ scenes had been processed at once. Dividing by $K$ instead would weight every \emph{scene} equally, although scenes hold anywhere from two to dozens of fragments; on one measured pair of scenes with two and eight fragments, the scene-weighted gradient had a cosine similarity of only 0.80 with the correct one.
+
+\paragraph{Several GPUs.} Each GPU processes its own micro-batches. At every step boundary the GPUs sum their fragment counts and their gradients, and every GPU divides the same sum by the same count, so all replicas apply the identical update and never drift apart. Because the step boundary depends only on the position of a micro-batch, every GPU reaches every boundary, whatever micro-batches it had to skip.
+
+\subsection{Optimiser}
+The gradient is clipped to a global Euclidean norm of 1, $\mathbf g\leftarrow\mathbf g\min(1,1/\norm{\mathbf g})$, and applied with AdamW~\cite{loshchilov2019adamw}:
+\begin{equation}
+  \mathbf m\leftarrow\beta_1\mathbf m+(1-\beta_1)\mathbf g,\quad
+  \mathbf v\leftarrow\beta_2\mathbf v+(1-\beta_2)\mathbf g^2,\quad
+  \boldsymbol\vartheta\leftarrow\boldsymbol\vartheta-\eta(k)\Big(\lambda\boldsymbol\vartheta+\frac{\hat{\mathbf m}}{\sqrt{\hat{\mathbf v}}+\epsilon}\Big),
+\end{equation}
+with bias-corrected moments $\hat{\mathbf m},\hat{\mathbf v}$, $\beta_1=0.9$, $\beta_2=0.999$, $\epsilon=10^{-8}$, and the weight decay $\lambda$ applied to every parameter. The decay is decoupled from the gradient: it shrinks every weight by the factor $1-\eta\lambda$ per step, independently of the adaptive scaling. A step to which no micro-batch contributed is skipped altogether, because AdamW would otherwise still move the weights through momentum and decay.
+
+\subsection{Learning-rate schedule}
+\label{sec:lr}
+The learning rate is a pure function of the micro-batch counter $k$, which advances at every micro-batch, including skipped ones, so it is the same on every GPU and after every resume. With $T_{\mathrm{tot}}$ micro-batches in the whole run, a warm-up of $W=\max(\lfloor wT_{\mathrm{tot}}\rfloor,1)$ micro-batches, and $p_k=\min\big((k-W)/(T_{\mathrm{tot}}-W),\,1\big)$,
+\begin{equation}
+  \eta(k)=\begin{cases}
+  \eta_{\max}\,\dfrac{k+1}{W}, & k<W,\\[6pt]
+  \eta_{\min}+\tfrac12(\eta_{\max}-\eta_{\min})\big(1+\cos\pi p_k\big), & k\ge W:
+  \end{cases}
+\end{equation}
+a linear warm-up followed by one half-cosine from $\eta_{\max}$ to $\eta_{\min}$, after which the rate stays at the floor. A periodic scheduler is avoided because past its period the rate climbs back up, and because its period is stored in its own state, so changing the number of epochs when resuming might not change the schedule. A step uses the rate of its last micro-batch. By default $\eta_{\max}=10^{-3}$, the warm-up is 3\% of training and $\eta_{\min}=0.02\,\eta_{\max}$. \Cref{fig:lr} shows the schedule of the reported run.
+
+\fig{fig_lr}{The learning-rate schedule of the reported run: $5\times10^{-4}$ to $6\times10^{-5}$ over 600 epochs of 320 micro-batches, without warm-up.}{lr}
+
+\subsection{Epochs, validation and checkpoints}
+An epoch is a fixed number of optimiser steps. After every epoch the model is evaluated, without gradients, on the fixed validation set of \cref{sec:data}, under the anchor protocol. Two checkpoints are kept: the \emph{last} one, written every epoch and also every 30 minutes in the middle of an epoch, and the \emph{best} one, written whenever the validation geodesic error improves. A checkpoint stores the weights, the optimiser state, the step counter, the random-number states, the history and the configuration, so a resumed run continues exactly where it stopped; an interrupted epoch is restarted with the step counter rewound to its beginning. A time budget is checked between epochs: once it is spent, the current epoch is finished, validated and saved, and the run stops.
+
+\subsection{Numerics and robustness}
+\begin{itemize}
+  \item \textbf{Single precision.} Training runs in 32-bit floating point. In half precision the attention products of unnormalised vector features overflow, and the softmax then produces invalid numbers; an earlier design of this project also trained measurably worse with mixed precision.
+  \item \textbf{Invalid values.} A loss that is not finite drops its micro-batch \emph{before} the backward pass: once an invalid value reaches the optimiser's moment estimates, they never recover. A micro-batch whose gradient is not finite is dropped as well.
+  \item \textbf{Memory.} A micro-batch that runs out of memory is retried once with gradient checkpointing, which recomputes every layer in the backward pass instead of storing its intermediate values: the result is identical and the cost is roughly one extra forward pass. Only if that also fails is the micro-batch dropped, and its name recorded, since the scenes that fail this way are the largest ones and dropping them silently would bias training towards small objects.
+  \item \textbf{Initial check.} An untrained equivariant network does not produce random rotations: its error on a fragment is the deterministic angle of its untrained frame, \cref{eq:abserror}. Before a run, the initial losses are compared with wide bands around the chance levels of \cref{tab:chance}, and the equivariance properties are tested.
+\end{itemize}
+
+\subsection{Configuration}
+\Cref{tab:config} lists the settings (I: intra layer, C: cross layer). The right-hand column gives the settings of the run whose learning-rate schedule is shown in \cref{fig:lr}, where they differ from the defaults and are recorded.
+
+\begin{table}[htbp]
+\centering\small
+\caption{Training configuration.}
+\label{tab:config}
+\begin{tabularx}{\linewidth}{@{}X>{\raggedright\arraybackslash}p{4.1cm}>{\raggedright\arraybackslash}p{4.3cm}@{}}
+\toprule
+setting & default & reported run \\
+\midrule
+\multicolumn{3}{@{}l}{\emph{data}}\\
+subset, split & Everyday, official object split & \\
+break patterns per object per epoch & 8 & \\
+fracture labels for tokens and candidates & dihedral, $\tau=0.9$ & \\
+tokens per scene $T$ & 2{,}048 & \\
+normalisation & one divisor per scene & \\
+\multicolumn{3}{@{}l}{\emph{model}}\\
+channels $C$ & 64 & 128 \\
+heads $\mathcal H$; $d_h$ (intra); $d_k$ (cross) & 4; 8; 16 & \\
+embedding size & 32 & \\
+layer sequence & I, I, I, I, I, C, C, C, I & I, I, C, I, C, I, C, I \\
+parameters & 928{,}640 & 2{,}771{,}424 \\
+\multicolumn{3}{@{}l}{\emph{objective}}\\
+rotation target & anchor & \\
+loss weights & all 1 & \\
+\multicolumn{3}{@{}l}{\emph{optimisation}}\\
+scenes per forward pass & 1 & \\
+micro-batches per optimiser step $K$ & 2 & 16 \\
+optimiser steps per epoch & 800 & 20 \\
+epochs & 40 & 600 \\
+peak learning rate $\eta_{\max}$ & $10^{-3}$ & $5\times10^{-4}$ \\
+warm-up & 3\% of training & none \\
+floor $\eta_{\min}$ & $2\times10^{-5}$ & $6\times10^{-5}$ \\
+weight decay $\lambda$ & $10^{-4}$ & $10^{-5}$ \\
+gradient clipping (global norm) & 1.0 & \\
+precision & 32-bit & \\
+GPUs & all available & 1 \\
+validation scenes per epoch & all & 128 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% =====================================================================
+\section{Design decisions and their reasons}
+\label{sec:rationale}
+
+\noindent\begin{minipage}{\linewidth}
+\centering\small
+\captionof{table}{The main design decisions.}
+\label{tab:rationale}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{4.8cm}X@{}}
+\toprule
+decision & reason \\
+\midrule
+learn rotations, solve translations & once orientations are known, placement is linear least squares; learning it would spend data on what geometry solves \\
+equivariance by construction & the label transforms exactly like an equivariant prediction, so the error is independent of the perturbation and no rotation needs to be learned (\cref{eq:cancel}) \\
+vector neurons & equivariance with plain linear algebra on 3-vectors: no spherical harmonics, no special libraries, moderate cost \\
+every vertex a node, the mesh its graph & nothing has to be built inside a fragment; the mesh already encodes adjacency \\
+edges carry two ordered face normals and an offset & the dihedral shape of the surface and the direction of the neighbour; the order is fixed by a rotation-invariant sign \\
+one scale divisor per scene; log-radius through a gate & mating surfaces keep their size; scale has no direction, so it can only gate \\
+equivariant to own pose, invariant to the others' & a fragment's label ignores the other fragments' perturbations, which are pure noise (\cref{eq:multi}) \\
+cross-fragment scores from invariants; matrix-valued messages & vector inner products across fragments depend on the relative perturbation; a sender may contribute an operator, never a direction \\
+fixed token budget on dihedral-labelled vertices & bounds the cost of a cross layer by $T^2$ pairs; the dihedral rule works on one fragment and is identical at training and inference \\
+intra layers after cross layers & cross layers change only tokens; the head pools every vertex \\
+Gram--Schmidt frame, prediction $M\T$ & continuous, equivariant, proper by construction; the transpose follows from the convention (\cref{eq:convention}) \\
+anchor target & the absolute frame of an unseen, round object is unobservable; relative to the anchor, the network must only map all fragments to one common frame (\cref{eq:anchorerror}) \\
+geodesic angle through atan2 & arccos has an infinite derivative at zero error \\
+contrastive embedding loss & a pull-only loss is minimised by collapse \\
+all loss weights 1 & the scales differ by nature; measure them before tuning \\
+fragment-weighted accumulation & every fragment counts once, whatever the scene and the number of GPUs \\
+learning rate as a function of the step & exact resumption, no rise after the end of the schedule \\
+single precision & attention products overflow in half precision \\
+\bottomrule
+\end{tabularx}
+\end{minipage}
+
+% =====================================================================
+\appendix
+
+\section{The chance level of the geodesic error}
+\label{app:chance}
+If $R$ is uniformly distributed on $\SO$ (Haar measure), its rotation angle $\theta\in[0,\pi]$ has the density
+\begin{equation}
+  p(\theta)=\frac{1-\cos\theta}{\pi},
+\end{equation}
+which follows from the Weyl integration formula: in axis--angle coordinates the Haar measure has a density proportional to $\sin^2(\theta/2)=(1-\cos\theta)/2$, uniform over the axis. Its mean is
+\begin{equation}
+  \begin{aligned}
+  \mathbb E[\theta]&=\frac1\pi\int_0^\pi\theta(1-\cos\theta)\,d\theta
+  =\frac1\pi\Big(\frac{\pi^2}2-\big[\theta\sin\theta+\cos\theta\big]_0^\pi\Big)\\
+  &=\frac1\pi\Big(\frac{\pi^2}2+2\Big)=\frac\pi2+\frac2\pi\approx2.2074\ \text{rad}=126.48^\circ,
+  \end{aligned}
+\end{equation}
+and since $\mathbb E[\theta^2]=\frac1\pi\big(\frac{\pi^3}3+2\pi\big)=\frac{\pi^2}3+2$, its standard deviation is $\sqrt{\pi^2/12-4/\pi^2}\approx0.646$ rad $=37.0^\circ$. A prediction that is independent of the label errs by the angle of $\hat R\T R$, which is uniform if either factor is, so its expected error is $126.5^\circ$. The same holds under the anchor protocol, because $\hat R_a\T\hat R_i$ and $R_a\T R_i$ are then independent and the second is uniform.
+
+\section{Closed forms of the position and normal terms}
+\label{app:closed}
+Let $E$ rotate by $\theta$ about the unit axis $\mathbf u$. By Rodrigues' formula,
+$E\x=\x\cos\theta+(\mathbf u\times\x)\sin\theta+\mathbf u(\mathbf u\cdot\x)(1-\cos\theta)$.
+Split $\x=\x_\parallel+\x_\perp$ along and across $\mathbf u$. Then $E\x-\x=(\cos\theta-1)\x_\perp+\sin\theta\,(\mathbf u\times\x_\perp)$, whose two parts are orthogonal and of lengths $(1-\cos\theta)\norm{\x_\perp}$ and $\sin\theta\norm{\x_\perp}$, so
+\begin{equation}
+  \norm{E\x-\x}^2=\norm{\x_\perp}^2\big((1-\cos\theta)^2+\sin^2\theta\big)=4\sin^2\tfrac\theta2\,\norm{\x_\perp}^2 .
+\end{equation}
+For a unit vector $\n$, $\n\cdot E\n=(\n\cdot\mathbf u)^2+\big(1-(\n\cdot\mathbf u)^2\big)\cos\theta$, hence
+\begin{equation}
+  1-\cos\angle(E\n,\n)=(1-\cos\theta)\big(1-(\n\cdot\mathbf u)^2\big)=2\sin^2\tfrac\theta2\,\big(1-(\n\cdot\mathbf u)^2\big).
+\end{equation}
+
+\section{Why the cross layer pools before building the matrix}
+The message to token $i$ could be written as a sum over partners of per-pair matrices. Building the matrix from the pooled context instead, $G_i=\MLP_G[\mathbf c_i;\mathbf s_i]$ with $\mathbf c_i=\sum_j\alpha_{ij}\mathbf v_j$, needs one matrix per receiving token: with 2{,}048 tokens, $\mathcal H=4$ heads and $C=128$ channels, that is $2048\times4\times32\times32$ numbers, about 34~MB in single precision, against about 2{,}000 times as much, some 70~GB, for one matrix per pair at four million pairs. Because the context passes through a nonlinear network, the result is not a sum of per-pair matrices, but every ingredient that crosses from the senders is still invariant, which is all that \cref{eq:multi} requires.
+
+% =====================================================================
+\begin{thebibliography}{99}
+\small
+\bibitem{deng2021vn} C.~Deng, O.~Litany, Y.~Duan, A.~Poulenard, A.~Tagliasacchi, L.~Guibas. Vector Neurons: a general framework for SO(3)-equivariant networks. \emph{ICCV}, 2021.
+\bibitem{velickovic2018gat} P.~Veli\v{c}kovi\'c, G.~Cucurull, A.~Casanova, A.~Romero, P.~Li\`o, Y.~Bengio. Graph attention networks. \emph{ICLR}, 2018.
+\bibitem{vaswani2017attention} A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones, A.~N.~Gomez, \L.~Kaiser, I.~Polosukhin. Attention is all you need. \emph{NeurIPS}, 2017.
+\bibitem{wu2023leveraging} R.~Wu, C.~Tie, Y.~Du, Y.~Zhao, H.~Dong. Leveraging SE(3) equivariance for learning 3D geometric shape assembly. \emph{ICCV}, 2023.
+\bibitem{sellan2022breakingbad} S.~Sell\'an, Y.-C.~Chen, Z.~Wu, A.~Garg, A.~Jacobson. Breaking Bad: a dataset for geometric fracture and reassembly. \emph{NeurIPS Datasets and Benchmarks}, 2022.
+\bibitem{li2025garf} S.~Li, Z.~Jiang, G.~Chen, C.~Xu, S.~Tan, X.~Wang, I.~Fang, K.~Zyskowski, S.~P.~McPherron, R.~Iovita, C.~Feng, J.~Zhang. GARF: learning generalizable 3D reassembly for real-world fractures. arXiv:2504.05400, 2025.
+\bibitem{wang2025puzzlefusionpp} Z.~Wang, J.~Chen, Y.~Furukawa. PuzzleFusion++: auto-agglomerative 3D fracture assembly by denoise and verify. \emph{ICLR}, 2025.
+\bibitem{zhou2019continuity} Y.~Zhou, C.~Barnes, J.~Lu, J.~Yang, H.~Li. On the continuity of rotation representations in neural networks. \emph{CVPR}, 2019.
+\bibitem{loshchilov2019adamw} I.~Loshchilov, F.~Hutter. Decoupled weight decay regularization. \emph{ICLR}, 2019.
+\bibitem{oord2018cpc} A.~van den Oord, Y.~Li, O.~Vinyals. Representation learning with contrastive predictive coding. arXiv:1807.03748, 2018.
+\bibitem{mezzadri2007random} F.~Mezzadri. How to generate random matrices from the classical compact groups. \emph{Notices of the AMS} 54(5), 2007.
+\bibitem{huber1964robust} P.~J.~Huber. Robust estimation of a location parameter. \emph{Annals of Mathematical Statistics} 35(1), 1964.
+\bibitem{thomas2018tfn} N.~Thomas, T.~Smidt, S.~Kearnes, L.~Yang, L.~Li, K.~Kohlhoff, P.~Riley. Tensor field networks: rotation- and translation-equivariant neural networks for 3D point clouds. arXiv:1802.08219, 2018.
+\bibitem{geiger2022e3nn} M.~Geiger, T.~Smidt. e3nn: Euclidean neural networks. arXiv:2207.09453, 2022.
+\end{thebibliography}
+
+\end{document}

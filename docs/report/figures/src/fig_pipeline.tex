@@ -1,0 +1,69 @@
+\documentclass[border=5pt]{standalone}
+\input{style}
+\input{cartoon}
+\begin{document}
+\begin{tikzpicture}
+  \def\S{0.36}
+  \tikzset{capt/.style={lbl, anchor=north}}
+  % (1) assembled object
+  \begin{scope}[shift={(0,0)}, scale=\S]
+    \foreach \P/\col in {A/pieceA,B/pieceB,C/pieceC}{
+      \begin{scope}[shift={(\csname c\P x\endcsname,\csname c\P y\endcsname)}]
+        \drawpiece{\P}{\col}
+      \end{scope}}
+  \end{scope}
+  \node[capt] at (0,-0.9) {fragments in their\\ assembled pose};
+
+  % (2) the input: centred, randomly rotated pieces
+  \begin{scope}[shift={(2.55,0)}]
+    \foreach \P/\col/\x/\y/\ang in {A/pieceA/-0.62/0.36/75,B/pieceB/0.62/0.42/-140,C/pieceC/0.0/-0.42/160}{
+      \begin{scope}[shift={(\x,\y)}, rotate=\ang, scale=\S]
+        \drawpiece{\P}{\col}
+      \end{scope}}
+  \end{scope}
+  \node[capt] at (2.55,-0.9) {input: centred,\\ scaled, randomly\\ rotated};
+
+  % (3) stage one
+  \node[vecbox, minimum width=2.3cm, minimum height=1.6cm] (net) at (5.3,0)
+    {\textbf{stage one}\\[1pt] SO(3)-equivariant\\ network};
+  \node[capt] at (5.3,-0.9) {learned; predicts\\ rotations only};
+
+  % (4) rotations applied
+  \begin{scope}[shift={(8.1,0.05)}]
+    \foreach \P/\col in {A/pieceA,B/pieceB,C/pieceC}{
+      \begin{scope}[shift={(1.5*\S*\csname c\P x\endcsname,1.5*\S*\csname c\P y\endcsname)}, scale=\S]
+        \drawpiece{\P}{\col}
+      \end{scope}}
+  \end{scope}
+  \node[capt] at (8.0,-0.9) {rotated back;\\ positions unknown};
+
+  % (5) stage two
+  \node[box, draw=out, fill=outfill, minimum width=2.25cm, minimum height=1.6cm] (sol) at (10.7,0)
+    {\textbf{stage two}\\[1pt] match pieces,\\ solve translations};
+  \node[capt] at (10.7,-0.9) {least squares;\\ nothing learned};
+
+  % (6) reassembled
+  \begin{scope}[shift={(13.25,0)}, scale=\S]
+    \foreach \P/\col in {A/pieceA,B/pieceB,C/pieceC}{
+      \begin{scope}[shift={(\csname c\P x\endcsname,\csname c\P y\endcsname)}]
+        \drawpiece{\P}{\col}
+      \end{scope}}
+  \end{scope}
+  \node[capt] at (13.25,-0.9) {reassembled\\ object};
+
+  % flow
+  \draw[arr] (0.9,0) -- (1.45,0);
+  \draw[arr] (3.6,0) -- (net.west);
+  \draw[outarr] (net.east) -- node[below, tlbl, pos=0.5] {$\hat R_i$} (7.1,0);
+  \draw[arr] (9.0,0) -- (sol.west);
+  \draw[outarr] (sol.east) -- node[below, tlbl, pos=0.5] {$\hat{\mathbf t}_i$} (12.35,0);
+  % the embedding goes straight to stage two
+  \draw[outarr] (net.north) -- ++(0,0.42) -| node[pos=0.25, above, tlbl] {per-vertex embedding $\mathbf z_v$ (rotation-invariant)} (sol.north);
+
+  % training branch
+  \node[box, draw=ink3, fill=white, dashed, text width=7.6cm] (loss) at (5.3,-2.9)
+    {\textbf{training only:} losses against the labels $R_i=Q_i^{\top}$, the assembled geometry and the coincidence clusters};
+  \draw[arr, ink3, dashed] (5.3,-1.72) -- (loss.north);
+  \draw[arr, ink3, dashed] (0,-1.75) |- (loss.west);
+\end{tikzpicture}
+\end{document}

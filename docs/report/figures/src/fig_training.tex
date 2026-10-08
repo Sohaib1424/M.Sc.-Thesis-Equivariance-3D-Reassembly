@@ -1,0 +1,51 @@
+\documentclass[border=5pt]{standalone}
+\input{style}
+\begin{document}
+\begin{tikzpicture}
+  \tikzset{
+    st/.style={box, font=\footnotesize, minimum height=12.5mm, minimum width=3.2cm},
+    vst/.style={st, draw=vec, fill=vecfill},
+    ost/.style={st, draw=out, fill=outfill},
+    pst/.style={st, draw=ink3, fill=white},
+    rowlab/.style={font=\small\bfseries, text=ink, rotate=90, anchor=south},
+  }
+  % ---------------- one micro-batch ----------------
+  \node[rowlab] at (-1.85,0) {micro-batch};
+  \node[pst] (s1) at (0,0) {draw an item\\ (object, break pattern)\\ from the epoch's list};
+  \node[st] (s2) at (3.8,0) {centre and scale;\\ perturb fragment $i$ by $Q_i$;\\ tokens and pairs};
+  \node[vst] (s3) at (7.6,0) {forward pass; loss $\mathcal L_b$:\\ a mean over the $n_b$\\ scored fragments};
+  \node[st] (s4) at (11.4,0) {backward pass of $n_b\,\mathcal L_b$,\\ added to the running\\ gradient sum};
+  \draw[arr] (s1) -- (s2);
+  \draw[arr] (s2) -- (s3);
+  \draw[arr] (s3) -- (s4);
+  \draw[arr] (s4.north) -- ++(0,0.4) -| node[pos=0.25, above, tlbl] {repeat: $K$ micro-batches per optimiser step (the run: $K=16$)} (s1.north);
+
+  % ---------------- one optimiser step ----------------
+  \node[rowlab] at (-1.85,-2.45) {optimiser step};
+  \node[st] (s5) at (0,-2.45) {sum over GPUs:\\ $\sum_b n_b\nabla\mathcal L_b$ and $\sum_b n_b$};
+  \node[st] (s6) at (3.8,-2.45) {$\mathbf g=\dfrac{\sum_b n_b\nabla\mathcal L_b}{\sum_b n_b}$};
+  \node[st] (s7) at (7.6,-2.45) {clip the global norm:\\ $\lVert\mathbf g\rVert_2\le 1$};
+  \node[ost] (s8) at (11.4,-2.45) {AdamW step at rate $\eta(k)$,\\ decoupled weight decay};
+  \draw[arr] (s4.south) -- ++(0,-0.38) -| (s5.north);
+  \draw[arr] (s5) -- (s6);
+  \draw[arr] (s6) -- (s7);
+  \draw[arr] (s7) -- (s8);
+
+  % ---------------- one epoch ----------------
+  \node[rowlab] at (-1.85,-4.95) {epoch};
+  \node[pst] (s9) at (0,-4.95) {end of epoch: a fixed\\ number of steps\\ (the run: 20)};
+  \node[st] (s10) at (3.8,-4.95) {validation: fixed scenes\\ and rotations,\\ anchor protocol};
+  \node[ost] (s11) at (7.6,-4.95) {keep \emph{best} (lowest\\ validation geodesic)\\ and \emph{last} checkpoints};
+  \node[pst] (s12) at (11.4,-4.95) {next epoch, or stop\\ once the time budget\\ is spent};
+  \draw[arr] (s8.south) -- ++(0,-0.38) -| node[pos=0.25, below, tlbl] {after the epoch's last step; otherwise back to the first row} (s9.north);
+  \draw[arr] (s9) -- (s10);
+  \draw[arr] (s10) -- (s11);
+  \draw[arr] (s11) -- (s12);
+
+  % ---------------- guards ----------------
+  \node[lbl, anchor=north west, align=left] at (-1.6,-5.95) {
+    guards: a non-finite loss drops its micro-batch before the backward pass; an out-of-memory micro-batch is\\
+    retried once with gradient checkpointing; a step to which nothing contributed is skipped.\\
+    $\eta(k)$ is a pure function of the micro-batch counter $k$, so a resumed run follows the same schedule.};
+\end{tikzpicture}
+\end{document}

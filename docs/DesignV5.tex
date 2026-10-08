@@ -1,0 +1,1003 @@
+\documentclass[11pt,a4paper]{report}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+\usepackage{parskip}
+\usepackage{fancyhdr}
+
+\setlist{itemsep=2pt,topsep=4pt,parsep=0pt}
+\definecolor{soft}{RGB}{95,99,104}
+\newcommand{\change}[1]{\par\vspace{2pt}\noindent\textcolor{soft}{\small\textbf{Changed since V4.}\ #1}\par\vspace{2pt}}
+\newcommand{\measured}[1]{\textbf{#1}}
+\newcommand{\SOthree}{\mathrm{SO}(3)}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textcolor{soft}{Equivariant 3D Fracture Reassembly --- Design V5}}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.2pt}
+
+\begin{document}
+
+\begin{titlepage}
+\centering
+\vspace*{4cm}
+{\Huge\bfseries Design V5\par}
+\vspace{0.8cm}
+{\Large Architectural Framework and Shared Pipeline Design\par}
+\vspace{0.4cm}
+{\large Equivariant 3D Fracture Reassembly\par}
+\vspace{2.5cm}
+{\large M.Sc. Thesis --- Design Document\par}
+\vspace{0.3cm}
+{\normalsize Revision 5, superseding Design V4\par}
+\vfill
+\begin{minipage}{0.85\textwidth}
+\small
+\textit{This revision replaces Design V4. Every figure quoted here has been
+measured on the implemented system or on the Breaking Bad dataset itself;
+where a quantity is still an assumption, it is labelled as one. Sections that
+depart from V4 carry an explicit note saying what changed and why, so that a
+reader of V4 can find the deltas without re-reading the whole document.}
+\end{minipage}
+\vspace{2cm}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+\chapter{Architectural Framework and Shared Pipeline Design}
+
+\section{Introduction}
+\label{sec:intro}
+
+The objective of this research is to reconstruct fractured three-dimensional
+objects from a collection of disconnected fragments. Unlike conventional shape
+reconstruction, fragment reassembly requires reasoning simultaneously about
+local geometry, global object structure, and relationships between fragments
+that no longer share explicit graph connections.
+
+The framework treats every fragment as an independent graph and employs an
+equivariant graph neural network to learn geometric representations that remain
+consistent under rotation. The central hypothesis is unchanged from V4:
+reassembly should be decomposed into two problems. First, the network learns how
+fragments are oriented. Second, once orientations are recovered, translations are
+solved by geometric optimisation rather than direct regression. This lets the
+network concentrate on geometric relationships and delegates final placement to a
+mathematically grounded procedure.
+
+The research question that motivates the whole design is one of \emph{economy}.
+The current state of the art, GARF, reaches 6.1$^{\circ}$ rotation RMSE using
+four H100 accelerators for 72 hours. This work asks whether equivariance can
+substitute for scale: whether a network that is $\SOthree$-equivariant
+\emph{by construction} needs to see far fewer examples than one that must learn
+rotational invariance from data, and can therefore be trained within a two-GPU,
+twelve-hour-session budget on Tesla T4 hardware.
+
+\subsection{Scope of this revision}
+\label{sub:scope}
+
+V4 proposed two candidate backbones, Vector Neuron Graph Attention (VN-GAT) and
+Tensor Field Graph Attention (TF-GAT). Only VN-GAT has been implemented and is
+described here. TF-GAT remains a documented alternative that was not pursued;
+nothing in the surrounding pipeline would prevent substituting it later.
+
+Table~\ref{tab:revisions} summarises what has changed. Each row is expanded in
+the section named.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{4.3cm}p{5.2cm}p{5.2cm}}
+\toprule
+\textbf{Component} & \textbf{Design V4} & \textbf{Design V5} \\
+\midrule
+Inter-fragment communication & 8 virtual nodes per fragment, pooled and broadcast & Direct attention between sampled fracture-surface vertices (\S\ref{sec:tokens}, \S\ref{sub:cross}) \\
+Edge features & length, midpoint, two face normals & two face normals, relative position (\S\ref{sub:edge}) \\
+Fragment scale & implicit & explicit invariant gate (\S\ref{sub:scale}) \\
+Connectivity & adjacency and incidence & adjacency only (\S\ref{sub:connectivity}) \\
+Equivariance condition & $L(R\cdot f) = D(R)\,L(f)$ & additionally invariant to \emph{other} fragments' poses (\S\ref{sec:equivariance}) \\
+Rotation representation & normalised quaternion & 6D vector pair, Gram--Schmidt (\S\ref{sub:head}) \\
+Rotation loss & $\arccos$ of the trace & $\operatorname{atan2}$ formulation (\S\ref{sub:rotloss}) \\
+Interface loss & $\lVert\sum_i z_i\rVert^2$ & InfoNCE over coincidence clusters (\S\ref{sub:corr}) \\
+Midpoint loss & present & removed with the midpoint feature (\S\ref{sub:aux}) \\
+Reference values & not specified & every term has a measured chance value (\S\ref{sec:reference}) \\
+\bottomrule
+\end{tabular}
+\caption{Revisions from Design V4. Three of these --- the interface loss, the
+rotation loss, and the equivariance condition --- are corrections of defects
+rather than refinements.}
+\label{tab:revisions}
+\end{table}
+
+\section{The dataset, measured}
+\label{sec:dataset}
+
+Several V4 decisions were made against assumed properties of the data. An
+exhaustive pass over the corpus was therefore run before finalising this
+revision: 1{,}442 objects and \measured{1{,}096{,}825 fragments}, processed in
+approximately one hour on four workers.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Quantity} & \textbf{Median} & \textbf{Mean} & \textbf{Maximum} \\
+\midrule
+Vertices per fragment & 296 & 1{,}550 & 83{,}039 \\
+Fracture vertices per fragment & 125 & 164 & 3{,}587 \\
+Fragments per scene & 3 & 8 & 99 \\
+\bottomrule
+\end{tabular}
+\caption{Breaking Bad, measured over the full corpus using coincidence ground
+truth.}
+\label{tab:dataset}
+\end{table}
+
+Dataset-wide, the fracture surface is \measured{10.6\% of vertices, 6.2\% of
+faces and 7.6\% of edges}. Two reduction figures are reported throughout this
+document because they answer different questions and diverge sharply: the
+\emph{per-fragment mean} removes 49.9\% of vertices, weighting every fragment
+equally, while the \emph{dataset aggregate} removes 89.4\%, weighting by size.
+Most fragments are small, and small fragments are mostly fracture surface, so a
+typical fragment loses half its vertices while the dataset loses nine tenths.
+
+Two consequences shape the design. The heavy tail --- a maximum of 83{,}039
+vertices against a median of 296 --- means any per-fragment memory budget must
+be set by the tail, not the median. And because the true fracture surface is
+small, the inter-fragment graph is far cheaper than V4 assumed
+(\S\ref{sub:graphcost}).
+
+\section{Geometric feature representation and graph construction}
+\label{sec:features}
+
+\subsection{Requirements}
+\label{sub:requirements}
+
+Meshes define graph structures naturally: vertices are nodes, mesh edges are
+graph edges. The representation must preserve geometric information, remain
+compatible with equivariant architectures, and carry information useful for
+fracture matching.
+
+The compatibility requirement is more restrictive than it appears. Vector Neuron
+features are shaped $(C,3)$, and a rotation acts on the last axis as
+$x \mapsto x R^{\top}$. Anything without a direction --- a length, a scalar
+scale, a count --- has no legal slot in that tensor, and placing one there
+silently breaks equivariance. This single constraint drives most of the changes
+in this section.
+
+\subsection{Fragment centralisation and scene standardisation}
+\label{sub:centralisation}
+
+Fragments occupy arbitrary locations. Using absolute coordinates would let the
+network learn dataset placement biases rather than intrinsic geometry. For each
+fragment $f_k$ with vertex set $V_k$, let
+\[
+c_k = \frac{1}{|V_k|}\sum_{v \in V_k} x_v, \qquad \tilde{x}_v = x_v - c_k .
+\]
+
+\change{Centralisation is now followed by a per-scene standardisation. All
+fragments of a scene are divided by a single scene radius, so the network sees
+shapes at a consistent scale. One divisor is used for both the ground-truth and
+the perturbed copy, because a rotation does not change a radius --- which is
+what allows the supervision relation of \S\ref{sub:rotloss} to survive
+normalisation exactly.}
+
+Centralisation must remain \emph{reversible}: stage two recovers per-fragment
+translation, and the original centroid vectors have to be retrievable.
+
+\subsection{Node features}
+\label{sub:node}
+
+Each node corresponds to a mesh vertex. The node representation is a
+vector-valued pair
+\[
+V_v = [\,\tilde{x}_v,\; n_v\,] \in \mathbb{R}^{2\times 3},
+\]
+the centralised coordinate and the vertex normal. The coordinate describes local
+shape within the fragment; the normal describes local surface orientation. This
+is unchanged from V4.
+
+\subsection{Edge features}
+\label{sub:edge}
+
+For an edge joining $u$ and $v$, V4 used
+$e_{uv} = [\,l_{uv},\, m_{uv},\, n^{(1)}_{uv},\, n^{(2)}_{uv}\,]$, combining a
+scalar length, a midpoint, and two face normals.
+
+\change{The length and the midpoint are removed; a relative position is added.
+The edge representation is now three vector channels,
+\[
+e_{uv} = [\,n^{(1)}_{uv},\; n^{(2)}_{uv},\; x_u - x_v\,] \in \mathbb{R}^{3\times 3}.
+\]}
+
+The length was a scalar sharing a tensor with directions, which is exactly the
+violation described in \S\ref{sub:requirements}. Its content --- local scale --- is recovered by
+the relative position $x_u - x_v$, whose norm \emph{is} the length and which
+additionally carries direction. The midpoint duplicated information already
+present in the two endpoint coordinates.
+
+The two face normals are stored in a canonical order derived from the mesh
+orientation, so that the pair is a well-defined function of the edge rather than
+of the order in which faces happened to be enumerated. Only these two channels
+participate in the face-normal loss; the relative position must not, because a
+cosine loss would normalise away the very length that is its content.
+
+\subsection{Fragment scale as an invariant gate}
+\label{sub:scale}
+
+Fragments span four to 83{,}039 vertices, so raw scale is heavy-tailed and would
+dominate anything it were concatenated with. Scale has no direction, so it
+cannot join the vector stream. It conditions that stream multiplicatively
+instead:
+\[
+g = \operatorname{softplus}\!\big(\mathrm{MLP}([\,\mathrm{Gram}(x),\ \log s\,])\big),
+\qquad x \leftarrow g \odot x ,
+\]
+where $\mathrm{Gram}(x)$ denotes the matrix of pairwise inner products of the
+vector channels, which is invariant, and $s$ is the fragment scale. The gain $g$
+is invariant, so the product remains equivariant. The logarithm is used because
+of the heavy tail; GARF applies a positional encoding for the same reason.
+
+\subsection{Connectivity}
+\label{sub:connectivity}
+
+\change{V4 retained both an adjacency (COO) structure and an incidence
+structure pairing nodes with globally shifted edge identifiers. Only the
+adjacency structure is retained.}
+
+Edges are stored bidirectionally, so structural symmetry is preserved. The
+incidence structure existed to let messages pass between nodes and edges; in the
+implemented design, edge features are consumed directly by the attention
+mechanism at each edge, which serves the same purpose without a second index
+tensor to keep synchronised.
+
+A correctness requirement that is easy to miss: the ground-truth and perturbed
+copies of a scene must share \emph{one} topology. The losses match vertices,
+edges and normals by index, so two independently constructed copies would
+compare unrelated rows without raising an error. Face de-duplication reorders
+faces lexicographically and can produce two different vertex orderings, so the
+two copies are built once and split, and their edge indices are asserted equal.
+
+\section{Equivariance: the constraint that shapes the design}
+\label{sec:equivariance}
+
+\subsection{Definition}
+\label{sub:definition}
+
+Let $R \in \SOthree$. A mapping $L$ is equivariant when
+\[
+L(R \cdot f_k) = D(R)\, L(f_k),
+\]
+where $D(R)$ acts on the output space. A conventional network treats two rotated
+copies of one fragment as unrelated inputs and must learn the same geometry many
+times over; an equivariant layer obtains the rotation for free, as an algebraic
+property rather than as something acquired from augmented data.
+
+\subsection{Equivariant to its own pose, invariant to every other fragment's}
+\label{sub:twolines}
+
+\change{V4 stated only the equation above. It is necessary but not sufficient,
+and the missing half determines the entire inter-fragment design.}
+
+Each fragment is perturbed by its \emph{own} rotation. The label for fragment
+$i$ therefore does not change when fragment $j$ lands at a different angle --- and
+the prediction must not either. Writing $A$ for a rotation applied to a single
+fragment's input, fragment $i$'s representation $H_i$ must satisfy both lines:
+\[
+\begin{aligned}
+H_i(P_1,\ldots,P_i A,\ldots,P_N) &= H_i(\,\cdot\,)\, A &&\text{equivariant to its own pose,}\\
+H_i(P_1,\ldots,P_j A,\ldots,P_N) &= H_i(\,\cdot\,) &&\text{invariant to every other pose } (j \neq i).
+\end{aligned}
+\]
+
+This is equation 7 of Wu et al., \emph{Leveraging SE(3) Equivariance for
+Learning 3D Geometric Shape Assembly}. The second line is forced by the task,
+before any architecture is chosen. An architecture that can see fragment $j$'s
+orientation must \emph{learn} to ignore it --- from data, by augmentation ---
+which is precisely what equivariance is supposed to make unnecessary. Worse,
+$j$'s orientation is not weak signal but pure noise injected by the
+perturbation, feeding directly into $i$'s prediction.
+
+\subsection{What may cross the gap}
+\label{sub:crosses}
+
+The constraint is not ``no vectors between fragments''. The cross-fragment layer
+takes $(T,C,3)$ vector features and returns $(T,C,3)$ vector features, and every
+operation on the spatial axis is equivariant. What is constrained is what a
+message may \emph{depend on}.
+
+Wu et al.'s correlation module is the construction that satisfies both lines:
+$C_{ij} = G_j \cdot F_i$, where $G_j$ is an \emph{invariant matrix} describing
+fragment $j$ and $F_i$ is fragment $i$'s \emph{own equivariant} features. A
+matrix, not a scalar --- the sender may re-mix the receiver's channels
+arbitrarily. What it cannot do is contribute a direction of its own, because a
+direction carries an orientation.
+
+What crosses is \emph{shape}. What does not cross is \emph{pose}. Nothing is
+lost by that: the relative pose of two arbitrarily tumbled fragments is the
+perturbation, not the object.
+
+A corollary constrains the attention scores. The natural score
+$\langle W_q x_i, W_k x_j\rangle$ is unusable, because under independent
+perturbations it becomes $\langle A_i a, A_j b\rangle$, which depends on the
+relative rotation $A_i^{\top}A_j$ --- exactly the quantity that is noise. Scores
+are therefore inner products of each token's invariant description.
+
+\subsection{A consequence: the perturbation cancels from the error}
+\label{sub:cancels}
+
+This property has a consequence for reading training curves that is worth
+stating explicitly, because the obvious interpretation of an initial loss is
+wrong.
+
+The head returns $R_{\text{pred}} = M^{\top}$, where $M$ is the equivariant
+frame, and the frame co-rotates with its input. On a fragment perturbed by $Q$
+the prediction is $M_{\text{asm}}^{\top} Q^{\top}$ while the label is
+$Q^{\top}$, so the error rotation is
+\[
+R_{\text{pred}} R_{\text{label}}^{\top}
+= M_{\text{asm}}^{\top} Q^{\top} Q
+= M_{\text{asm}}^{\top}.
+\]
+
+\textbf{The perturbation cancels exactly.} An untrained model's rotation error is
+the geodesic angle of its own frame on the \emph{assembled} fragment, and has
+nothing to do with how that fragment was tumbled. Verified numerically: across
+three independent perturbations the per-fragment errors agreed to
+\measured{$3\times10^{-13}$ radians}.
+
+Two things follow. First, $126.5^{\circ}$ is not a distribution an untrained
+equivariant model draws from; it is the mean angle between two \emph{independent}
+uniform rotations. Here the error is a deterministic function of the untrained
+network, so it equals $126.5^{\circ}$ only if those frames happen to be
+uniformly spread. Measured over twelve seeds on a 24-fragment batch, the initial
+error was $132.3^{\circ}\pm11.8$ for one architecture and $121.9^{\circ}\pm15.0$
+for another --- \emph{architecture-dependent}, not a defect.
+
+Second, it restates the objective usefully. Since the initial error \emph{is}
+$\angle M_{\text{asm}}$, training is literally driving the frame on assembled
+fragments to the identity. That is a fixed, learnable target, because the
+assembled pose is a convention shared by every scene in the dataset.
+
+\subsection{Numerical verification}
+\label{sub:verification}
+
+Equivariance is an algebraic identity, so it should hold to machine precision
+rather than approximately. All checks below were run in double precision.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lr}
+\toprule
+\textbf{Property} & \textbf{Residual} \\
+\midrule
+Every Vector Neuron primitive, $L(xR^{\top}) = L(x)R^{\top}$ & $\leq 10^{-15}$ \\
+Gram--Schmidt head orthonormal, $\det = +1$ & exact to $10^{-16}$ \\
+Intra-fragment attention, equivariance & $1.3\times10^{-15}$ \\
+Cross-fragment, own-pose equivariance & $4.4\times10^{-16}$ \\
+Cross-fragment, other-pose \emph{invariance} & $3.3\times10^{-16}$ \\
+Cross-scene leakage within a batch & exactly $0$ \\
+Whole model, per-fragment equivariance & $\leq 10^{-9}$ \\
+Perturbation cancellation (\S\ref{sub:cancels}) & $3\times10^{-13}$ \\
+\bottomrule
+\end{tabular}
+\caption{Measured equivariance residuals. A failure at $10^{-6}$ would indicate
+a real break rather than accumulated round-off.}
+\end{table}
+
+Two defects were caught by these checks, both of the kind that trains without
+complaining. A near-identity initialisation implemented by zeroing a gate's
+final weight makes the layer's output constant, which zeroes the gradient into
+everything upstream --- 31 of 77 parameters dead on the first steps, waking only
+as a bias drifted. And $\sqrt{s + \epsilon}$ perturbs \emph{every} norm rather
+than only the near-zero ones: the head came out orthonormal to only $10^{-8}$
+with $\det = 0.99999995$. Clamping the squared sum instead is exact away from
+zero.
+
+\section{Fracture surfaces and inter-fragment tokens}
+\label{sec:tokens}
+
+\subsection{Why the virtual-node design was withdrawn}
+\label{sub:virtual}
+
+V4 introduced eight coordinate-aware virtual nodes per fragment, pooled upward
+from vertices, attended across fragments, and broadcast back down. That design
+is withdrawn for two reasons.
+
+The first is the constraint of \S\ref{sub:twolines}. Virtual nodes with fixed spatial
+coordinates are \emph{positions}, and pooling vertex features onto them and
+attending between them lets a fragment's orientation influence its neighbours'
+representations. The mechanism cannot satisfy the invariance line without
+additional machinery.
+
+The second is empirical. The earlier VN-GAT design reached approximately
+$43^{\circ}$ on training data but stalled near $94^{\circ}$ on validation --- close
+to the \emph{axis-only floor} of $89.9^{\circ}$, which is the score of a model
+that recovers a fragment's axis but not its rotation about that axis. That is
+the signature of a per-fragment canonicaliser with no usable access to
+inter-fragment relationships.
+
+\change{Virtual nodes are replaced by direct attention between vertices lying on
+fracture surfaces. All vertices are retained as graph nodes; the fracture mask
+decides only which vertices are \emph{eligible} to become cross-fragment
+tokens.}
+
+\subsection{Two labellings, and the inference gap}
+\label{sub:labellings}
+
+A fragment's surface is two things glued together: the object's original
+exterior, which is smooth and shared with no one, and the fracture surface,
+where it tore away and which matches exactly one other fragment. Two independent
+labellings are available.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Method} & \textbf{What it uses} & \textbf{Available at inference?} \\
+\midrule
+Dihedral & sharp dihedral variation within one fragment & yes, one fragment alone \\
+Coincidence & vertices another fragment also occupies & no, needs the assembled scene \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Coincidence is ground truth and is how supervision is derived. Dihedral is the
+estimate a model can compute at test time, and it is \measured{much weaker than
+V4 assumed}: at its tuned threshold it over-labels by approximately
+\measured{3.9$\times$}, with precision 0.24 against recall 0.93. It also lights
+up handles, rims and feet --- sharp because the object was \emph{designed} that
+way, not because it broke there.
+
+This is the single largest gap between the reported results and a real
+deployment, and \S\ref{sec:status} states it as such. The threshold is chosen by measurement
+rather than by eye, scoring dihedral against coincidence across a sweep and
+reporting recall-weighted $F_\beta$ rather than $F_1$: a missed fracture face is
+an edge the model never sees, while a spurious one is only noise, so the two
+error types are not symmetric.
+
+\subsection{Token selection: geodesic-disk sampling under a per-scene budget}
+\label{sub:sampling}
+
+Cross-fragment tokens are selected from the masked vertices by farthest-point
+sampling under a \emph{geodesic} metric --- shortest path along fracture-surface
+mesh edges --- rather than a Euclidean one. The distinction matters on folded or
+re-entrant surfaces, where two points may be close in space while lying far
+apart on the surface; Euclidean sampling treats them as redundant and leaves
+part of the interface unsampled.
+
+The budget is \emph{per scene}, not per fragment. A single total $T$ is divided
+among the fragments in proportion to their fracture-surface area, and sampling
+then proceeds within each fragment's own eligible set. Two properties follow.
+
+A per-fragment cap is deliberately \emph{not} imposed. If a scene contains one
+large fragment and several small ones --- a head with the ears, nose and part of
+the hair broken off --- proportional allocation gives the large piece more
+tokens, which is the intended behaviour. Capping would destroy that
+proportionality for no benefit, because the total alone already bounds the cost:
+for any split $\{t_i\}$ summing to $T$, the number of undirected cross-fragment
+pairs is
+\[
+\frac{T^2 - \sum_i t_i^2}{2} \;<\; \frac{T^2}{2}.
+\]
+
+Sampling is per fragment and never over the pooled scene. At input time the
+fragments sit in arbitrary perturbed poses, so a single global farthest-point
+pass would select points according to where the pieces happened to land --- a
+different sample for every perturbation of the same scene, and no equivariance
+left.
+
+\subsection{The cost of the resulting graph}
+\label{sub:graphcost}
+
+V4's virtual-node compression was motivated by an assumed cost. With the true
+fracture surface measured at 10.6\% of vertices, connecting every fracture
+vertex to every fracture vertex of every \emph{other} fragment turns out to be
+affordable with no reduction at all.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+\textbf{Fragments in scene} & \textbf{Cross-fragment pairs} & \textbf{vs GARF's 6-layer stack} \\
+\midrule
+3 (median scene) & 46{,}875 & 0.001$\times$ \\
+8 (mean scene) & 753{,}088 & 0.01$\times$ \\
+20 & 2{,}968{,}750 & 0.04$\times$ \\
+99 (largest in corpus) & 75{,}796{,}875 & 1.01$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Unreduced inter-fragment graph cost. It crosses GARF's whole stack only
+at 99 fragments, which is exactly the largest scene in the dataset.}
+\end{table}
+
+\textbf{Reduction is therefore not needed for cost.} Sampling is retained for a
+different reason: to make the inter-fragment connection count \emph{fixed and
+predictable} rather than a function of whatever mesh happens to arrive. A
+retraction is owed here, and is recorded in \S\ref{sec:status}.
+
+\section{Network architecture}
+\label{sec:architecture}
+
+\subsection{Vector Neuron primitives}
+\label{sub:vn}
+
+Features are $(C,3)$ tensors. The primitives are bias-free linear channel
+mixing, a learned-hyperplane leaky rectifier, a layer normalisation over
+invariant magnitudes, and an invariant readout formed from inner products with
+learned directions. A linear map with a bias would break equivariance, because a
+constant offset does not rotate; the absence of bias is structural, not
+stylistic.
+
+\subsection{Intra-fragment attention}
+\label{sub:intra}
+
+Attention along real mesh edges. Scores are invariant inner products of
+projected query and key features, so weighting equivariant messages by them
+leaves the result equivariant. Each node also carries a self-transform outside
+the softmax, so a node with no incident edges still has an output, and so the
+layer can learn to ignore its neighbourhood entirely.
+
+Two implementation properties are worth recording because they are not
+cosmetic. Because the linear maps have no bias,
+$W[a;b;c] = W_a a + W_b b + W_c c$ exactly, so concatenation can be replaced by
+separate projections that are summed. This removes the concatenation temporaries
+and, more importantly, allows each projection to run on the $N$ \emph{nodes}
+before being gathered to the $E$ \emph{edges} rather than after --- roughly one
+sixth of the work on a triangle mesh.
+
+\subsection{Cross-fragment attention}
+\label{sub:cross}
+
+The layer that replaces V4's virtual nodes. It is a Vector Neuron layer
+throughout, and it implements the correlation construction of \S\ref{sub:crosses}:
+\[
+\begin{aligned}
+\text{logits}_{ij} &= \langle q(\mathrm{inv}_i),\, k(\mathrm{inv}_j)\rangle / \sqrt{d}
+&&\text{invariant to both poses,}\\
+\alpha &= \operatorname{softmax}_j \text{ within the scene, excluding } j\text{'s own fragment,}\\
+\mathrm{out}_i &= x_i + \Big(\sum_j \alpha_{ij} G_j\Big) x_i .
+\end{aligned}
+\]
+$G_j$ is a per-head channel-mixing matrix read from fragment $j$'s invariants.
+Because $G$ is a \emph{linear} function of those invariants,
+$\sum_j \alpha_{ij} G(v_j) = G\big(\sum_j \alpha_{ij} v_j\big)$, so the
+aggregation happens on the small invariant vectors and the matrix is built once
+per query rather than once per pair. This is not a cosmetic rearrangement: a
+per-pair matrix would be gigabytes at the pair counts a large scene reaches.
+
+Tokens attend across fragments \emph{within one scene}, never inside their own
+fragment --- the mesh graph already covers that --- and never across scenes. The
+cross-scene case is not hypothetical: a batch concatenates unrelated objects and
+fragment identifiers are globally unique, so an unmasked layer silently lets one
+object inform another and makes the prediction depend on batch composition. That
+defect occurred during development and is now excluded by construction and
+asserted in the test suite.
+
+\subsection{Layer schedule and propagation reach}
+\label{sub:schedule}
+
+The backbone is five intra-fragment layers, three cross-fragment layers, then
+one further intra-fragment layer: describe each fragment, let the fragments
+talk, then spread what they heard. The final clause is not decoration.
+
+A cross layer writes only to \emph{token} vertices, and the rotation head pools
+a mean over \emph{every} vertex --- so a vertex the tokens never reach
+contributes to the prediction without having heard from another fragment. Each
+intra layer after the last cross layer buys exactly one hop along mesh edges.
+Measured on real scenes:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lr}
+\toprule
+\textbf{After the last cross layer} & \textbf{Vertices informed} \\
+\midrule
+nothing & 17\% \\
+one intra layer & \measured{49\%} \\
+two intra layers & 64\% \\
+\bottomrule
+\end{tabular}
+\caption{Fraction of vertices within reach of a cross-fragment token. The first
+trailing layer buys 32 points, the second only 15 --- tokens cluster on fracture
+surfaces, so their neighbourhoods overlap.}
+\end{table}
+
+The reach is measured on the actual meshes at start-up rather than assumed,
+because it depends on how the fracture surface is shaped and cannot be derived
+from the token count alone.
+
+\subsection{Rotation head}
+\label{sub:head}
+
+\change{V4 predicted a normalised quaternion. V5 predicts two equivariant
+3-vectors and orthonormalises them by Gram--Schmidt.}
+
+The quaternion was chosen in V4 to avoid gimbal lock. It does, but it shares
+with every three- and four-parameter parameterisation a subtler problem: the map
+from $\SOthree$ to the representation is discontinuous, so a network must learn
+a discontinuous function, and the antipodal identification $q \sim -q$ leaves
+the target ambiguous unless handled explicitly. The 6D representation is
+continuous, which is the property that matters for regression.
+
+More decisively, it fits the equivariant setting exactly: the two vectors are
+ordinary vector features, so they rotate with the input for free, and
+Gram--Schmidt is equivariant. The head therefore produces an equivariant frame
+$M$ with no additional constraint, and returns $R_{\text{pred}} = M^{\top}$
+(the \emph{rows}, not the columns). The derivation, and the reason this
+transpose is the single easiest thing in the system to get backwards, are given
+in \S\ref{sub:rotloss}.
+
+\section{Training objective}
+\label{sec:objective}
+
+\subsection{Rotation loss}
+\label{sub:rotloss}
+
+Centred, the perturbation satisfies $v_{\text{pert}} = v_{\text{gt}} Q^{\top}$.
+Vector features inherit that rotation, so the frame satisfies
+$M_{\text{pert}} = Q M_{\text{gt}}$. The label is the rotation that undoes the
+perturbation, $R_{\text{gt}} = Q^{\top}$, so the head returns
+$R_{\text{pred}} = M^{\top}$, giving
+$R_{\text{pred}} = M_{\text{gt}}^{\top} Q^{\top}$ --- correct exactly when the
+network maps an assembled fragment to the identity frame.
+
+Getting this transpose backwards is invisible at initialisation, because chance
+is chance in either direction, and would surface only as a model that never
+converges. It is therefore asserted directly against a known perturbation rather
+than inferred from a loss curve.
+
+\change{V4 defined the angular error as
+$\theta = \arccos\big((\operatorname{tr}(R_k^{\top}R_{\text{gt}})-1)/2\big)$.
+V5 uses an $\operatorname{atan2}$ formulation of the same angle.}
+
+The two agree in value and differ in gradient. The derivative of $\arccos$ is
+unbounded at its endpoints, so the gradient of V4's loss \emph{diverges exactly
+as the model converges}, swamping every other term at precisely the point where
+fine alignment matters. The $\operatorname{atan2}$ form, taking the angle from
+the norm of the axis component against the trace, is finite throughout. Its
+guarded norm also takes a far smaller floor, because $\operatorname{atan2}$'s
+derivative cancels the norm's --- the loss is exactly zero at a perfect fit
+rather than reaching a $5\times10^{-9}$ radian floor.
+
+\subsection{Geometric auxiliary losses}
+\label{sub:aux}
+
+The predicted rotation is applied to the centred, non-standardised fragment and
+compared against the ground-truth copy, index by index:
+\[
+\begin{aligned}
+L_{\text{pos}} &= \frac{1}{|V|}\sum_{v} \lVert x_v - \hat{x}_v \rVert_2^2,
+&\qquad
+L_{\text{normal}} &= \frac{1}{|V|}\sum_{v} (1 - n_v \cdot \hat{n}_v), \\
+L_{\text{face}} &= \frac{1}{|E|}\sum_{e} \Big[(1 - n^{(1)}_e \cdot \hat{n}^{(1)}_e) + (1 - n^{(2)}_e \cdot \hat{n}^{(2)}_e)\Big] .
+\end{aligned}
+\]
+
+\change{V4's edge-midpoint loss $L_{\text{mid}}$ is removed together with the
+midpoint feature.}
+
+The face term is restricted to the two normal channels inside the loss rather
+than by the caller. Edges carry three channels, and passing all three is the
+obvious mistake: a cosine loss would normalise the relative position, whose
+\emph{length} is its content, and would silently move the term's chance value
+from 2.0 to 3.0.
+
+\subsection{Interface correspondence: two corrections}
+\label{sub:corr}
+
+This is the term that has changed most, and both changes are corrections.
+
+\textbf{V4's formulation is minimised by cancellation.} V4 defined
+\[
+L_{\text{emb-}v} = \sum_{x \in X_{\text{shared}}}
+\Big\lVert \sum_{(f,v) \in C_V(x)} z^{(f)}_v \Big\rVert_2^2 .
+\]
+Two \emph{opposite} embeddings score zero; two \emph{identical} ones score
+$4\lVert z\rVert^2$. The objective rewards exactly the wrong configuration while
+looking like a reasonable consistency penalty.
+
+\textbf{The obvious repair is minimised by collapse.} Replacing the norm of the
+sum with the scatter about each cluster centroid,
+\[
+L = \operatorname{mean}_c \operatorname{mean}_{i \in c}\, \lVert z_i - \bar{z}_c \rVert^2 ,
+\]
+fixes the cancellation and leaves a second trivial minimum: a \emph{constant}
+embedding scores exactly zero. This is not hypothetical --- it is what the first
+real training run did. Over 180 steps the loss fell from 0.0109 to 0.0010 while
+the spread of the embeddings fell from 0.166 to 0.021 and their norm held at
+2.0. The head was converging on a single vector and reporting success the whole
+way down. A constant embedding is worse than an untrained one for what this head
+exists to do, since stage two matches by mutual nearest neighbours and a
+constant embedding ties every distance.
+
+\change{The term is now InfoNCE over the coincidence clusters:
+\[
+L_{\text{corr}} = -\operatorname{mean}_i \log
+\frac{\sum_{p \in \mathrm{pos}(i)} \exp(s_{ip}/\tau)}
+     {\sum_{k \neq i} \exp(s_{ik}/\tau)},
+\]
+with $s$ the cosine similarity between $\ell_2$-normalised embeddings.}
+
+It is written contrastively rather than as a variance floor because the
+negatives are exactly the confusion set at matching time --- the other fracture
+vertices of the same scene --- so the training objective and the downstream use
+become the same question. Collapse now scores $\log(A-1) - \log|\mathrm{pos}|$,
+verified against the closed form: \measured{4.844} for 128 anchors in pairs,
+against \measured{0.024} for a perfect embedding. The point is not that collapse
+became impossible, but that it became \emph{visible}.
+
+Anchors are capped per batch, because the similarity matrix is quadratic in them
+and a scene can label thousands of vertices.
+
+A reporting consequence: the composite total no longer bottoms out at zero,
+since InfoNCE retains a small temperature-dependent floor even for a perfect
+embedding. The number to read instead is \textbf{match@1}, the fraction of
+coincident vertices whose true partner is their own nearest neighbour. It runs
+from near zero at chance to exactly 1, needs no per-batch reference, and a
+collapsed embedding cannot fake it.
+
+\subsection{Composite objective}
+\label{sub:composite}
+
+\[
+L_{\text{total}} = \lambda_1 L_{\text{rot}} + \lambda_2 L_{\text{pos}}
++ \lambda_3 L_{\text{normal}} + \lambda_4 L_{\text{face}}
++ \lambda_5 L_{\text{corr}} .
+\]
+
+All weights are currently 1.0 and \emph{deliberately untuned}. The terms have
+very different natural scales --- radians, a cosine in $[0,2]$, a distance in
+normalised units, a log-ratio --- and choosing weights before observing how each
+one moves is guesswork presented as a decision. Every term is reported
+separately so that the first training runs \emph{measure} the relative scales
+rather than assume them.
+
+\section{Reference values}
+\label{sec:reference}
+
+\change{V4 specified no reference values. Every number in this system is now
+read against what it must be when the model has learned nothing.}
+
+A geometric loss that is silently wrong still descends, so ``the loss went
+down'' proves nothing. All values below were established by Monte Carlo with
+fixed seeds, not asserted.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{llp{7.2cm}}
+\toprule
+\textbf{Quantity} & \textbf{At chance} & \textbf{Meaning} \\
+\midrule
+Geodesic angle & $126.48^{\circ}$ & $\pi/2 + 2/\pi$; a model here has learned nothing \\
+Euler RMSE, random & $86.29^{\circ}$ & an independent uniform prediction \\
+Euler RMSE, identity & $83.14^{\circ}$ & always predicting no rotation \\
+Axis-only floor & $89.9^{\circ}$ & axis recovered, rotation about it not \\
+Node normal loss & $1.0$ & mean of $1 - \cos$ over random directions \\
+Face normal loss & $2.0$ & two normals per edge, hence twice \\
+Node position loss & $4/3$ & on a unit sphere \\
+\bottomrule
+\end{tabular}
+\caption{Reference values. Every term of the objective has one.}
+\end{table}
+
+\textbf{The two Euler rows are the important pair, and the ambiguity in the word
+``chance'' is not harmless.} A model that collapses to predicting the identity
+--- the cheapest way to reduce a rotation loss early in training --- scores
+$83.14^{\circ}$, which is \emph{three degrees better than guessing}, on the
+metric GARF reports as its headline. The geodesic angle is identical for both,
+$126.48^{\circ}$, because a uniform rotation's angle is distributed the same way
+whether measured against the identity or against another uniform rotation. The
+geodesic angle therefore does not pay for the collapse, which is the argument
+for reporting it as the primary number and Euler RMSE only for comparability.
+
+The initial rotation reading is checked against a deliberately wide band, for
+the reason established in \S\ref{sub:cancels}: it is the untrained frame's own angle and
+moves with the architecture. A band tight around $126.5^{\circ}$ would flag
+every architecture change as a defect. What the check still catches is gross
+breakage --- a model beginning near $0^{\circ}$ or $180^{\circ}$ cannot be
+measuring the angle it claims to.
+
+\section{Correspondence discovery}
+\label{sec:correspondence}
+
+After training, interface embeddings identify candidate matching points between
+fragments. For every interface point a nearest-neighbour search is performed in
+embedding space, and \emph{mutual} nearest-neighbour matching is required: two
+points are a correspondence only if each selects the other. This reduces false
+matches and provides reliable geometric constraints for the translation solver.
+This section is unchanged from V4 in principle; what has changed is that the
+embedding it operates on is now trained by an objective that cannot be satisfied
+by a constant (\S\ref{sub:corr}).
+
+\section{Geometric optimisation-based translation recovery}
+\label{sec:translation}
+
+Translation estimation differs fundamentally from rotation estimation.
+Determining orientation requires semantic understanding of geometry and
+fragment relationships; determining translation, once orientations are known, is
+primarily a geometric consistency problem. Translations are therefore not
+predicted by the network but obtained by solving an optimisation.
+
+Let $p_i$ and $q_i$ denote corresponding interface points from mutual
+nearest-neighbour matching.
+
+\begin{align*}
+E_{\text{pos}} &= \sum_i \lVert p_i - q_i \rVert^2
+&&\text{matching surfaces should occupy the same locations,}\\
+E_{\text{normal}} &= \sum_i \lVert n^{(A)}_i + n^{(B)}_i \rVert^2
+&&\text{mating surfaces should have opposing normals,}\\
+E_{\text{collision}} &&&\text{penalises volume interpenetration.}
+\end{align*}
+
+The translation vectors are recovered globally by
+\[
+\min_{t_1,\ldots,t_N}\ \Big( E_{\text{pos}} + \lambda_{E_1} E_{\text{normal}}
++ \lambda_{E_2} E_{\text{collision}} \Big),
+\]
+placing fragments so as to satisfy interface alignment, normal consistency and
+collision avoidance simultaneously.
+
+\textbf{This stage is specified but not implemented.} It is stated here as
+unchanged from V4 so that the design remains complete, but no result in this
+document depends on it, and \S\ref{sec:status} records it as outstanding.
+
+\section{Workflow: training, validation, and inference}
+\label{sec:workflow}
+
+\subsection{The shared path}
+
+Training and validation share almost the entire pipeline. A scene directory is
+read once into fragments in their assembled frame; the fracture mask is computed
+from geometry; coincidence clusters and the ground-truth copy are taken in the
+assembled frame; a random rotation is drawn per fragment; the scene is
+standardised and tokens are sampled; fragments are concatenated into one ragged
+batch. The network runs identically in both modes. The path diverges only at the
+end: training computes the objective and steps the optimiser, while validation
+runs the same forward pass without gradients and scores the prediction.
+
+Two ordering constraints are absolute. \textbf{Coincidence must be computed
+before perturbation}, because it is defined in the assembled frame; afterwards
+nothing coincides and the labels come back empty while looking like a result.
+And the ground-truth and perturbed copies must be built once and split, for the
+topology reason of \S\ref{sub:connectivity}.
+
+\subsection{Validation is not label-free}
+
+The perturbation is generated by the pipeline itself, so $Q^{\top}$ is known and
+every metric is computable. What validation measures is generalisation to unseen
+\emph{objects}, not to unknown labels.
+
+A defect found here is worth recording, because it is the worst shape a defect
+can take. Official split matching originally used only the object directory
+name, discarding the category. Breaking Bad lists objects as
+\texttt{category/object} and directory names are \emph{not} unique across
+categories, so sixteen objects appeared in both the training and validation
+splits. Validation then becomes partly a memorisation test, and the number it
+produces is \emph{better} than the honest one --- it reads as success. Matching
+is now on the pair, and the loader refuses to run if any two splits intersect.
+
+\subsection{A real broken object}
+
+A third regime is worth separating explicitly, because it is the one the thesis
+must be honest about. On a genuinely broken object rather than a Breaking Bad
+sample:
+
+\begin{itemize}
+\item there is no $Q$, hence no label --- a prediction exists and nothing checks it;
+\item there are no coincidence labels, so the dihedral mask alone selects tokens,
+      at precision 0.24 (\S\ref{sub:labellings}). GARF's answer is a trained fracture
+      segmenter reaching above 99.5\%; this project does not have one;
+\item a rotation does not place a fragment --- stage two is required and is not built.
+\end{itemize}
+
+Any figure reported on Breaking Bad is therefore an \emph{optimistic bound},
+because it uses ground-truth fracture labels a deployment would not have.
+
+\section{Implementation within a commodity hardware budget}
+\label{sec:implementation}
+
+The economy question of \S\ref{sec:intro} makes implementation a design concern rather than
+an afterthought, so the constraints that shaped it are recorded here.
+
+\textbf{The binding constraint is memory, and it was in an unexpected place.}
+Cross-fragment attention gathers query, key and value tensors to the \emph{pair}
+dimension. Measured as the slope against pair count, that retained
+\measured{1{,}109 bytes per pair}: at 2{,}048 tokens over six fragments ---
+roughly 3.5 million pairs --- \measured{3.6 GB for a single scene}, per layer.
+Recomputing those gathers during the backward pass instead of storing them costs
+one extra forward pass of an indexing operation and takes the figure to
+\measured{86 bytes per pair, 0.28 GB}, a thirteen-fold reduction with outputs
+and gradients bitwise identical.
+
+\textbf{A retraction belongs here.} The token budget of 2{,}048 per scene was
+originally justified by comparing pair counts against GARF's stack --- a
+\emph{floating-point} argument, made about hardware with far more memory. It was
+never checked against the memory of the target device, which is the binding
+constraint and is quadratic in exactly that number. The value survives, but it
+survived by luck rather than because the check had been performed.
+
+\textbf{Gradient accumulation is not a free substitute for a larger batch.} When
+memory forces the batch down, accumulation is the standard remedy, but dividing
+each micro-batch's loss by the accumulation count weights each \emph{scene}
+equally, while a true batch weights each \emph{fragment} equally --- and a scene
+holds between two and 35 fragments. Measured on a two-fragment and an
+eight-fragment scene, the two gradients had cosine similarity \measured{0.80}
+and norms 45\% apart: a silent re-weighting of the objective introduced by a
+setting chosen for memory reasons. Weighting each micro-batch by its fragment
+count and normalising by the group total makes the two identical to seven
+decimal places on all four geometric terms. The contrastive term cannot be made
+to match, because its negatives are drawn from the batch --- and should not be,
+since within-scene negatives are the confusion set that matching actually faces.
+
+\textbf{Sessions are capped, so a run is a chain.} Training must survive being
+killed at a fixed wall-clock limit: checkpoints are written on a timer rather
+than only at epoch boundaries, because a single epoch over the full training set
+can outlast a session; the always-current checkpoint is kept separate from the
+best-so-far, because a policy-gated file alone can freeze while training
+continues and a resume then silently discards the gap; and the learning-rate
+schedule is a pure function of the step count rather than a stateful object,
+because such objects are periodic past their horizon and store that horizon in
+their own state.
+
+\section{Status, and what has not been established}
+\label{sec:status}
+
+This section exists because the failure mode of this class of system is a
+plausible number rather than an exception.
+
+\subsection{Established}
+
+The data and geometry layer, the equivariant network, the composite objective
+and the training engine are implemented and covered by an automated test suite
+that runs clean under warnings-as-errors. Equivariance holds to the residuals of
+\S\ref{sub:verification}. The rotation convention is asserted by round trip rather than inferred.
+The architecture demonstrably \emph{can} fit: driven on a small fixed set it
+reduces rotation error from $113^{\circ}$ to \measured{$0.4^{\circ}$} on one
+scene and from $137^{\circ}$ to \measured{$0.6^{\circ}$} on three; on 32 scenes
+it reached $13.3^{\circ}$ after 1{,}608 steps and was still descending. These
+are \emph{training}-error results and prove nothing about generalisation --- which
+is exactly what makes them useful, since they isolate ``are the conventions
+self-consistent'' from ``does it generalise''.
+
+\subsection{Not established}
+
+\textbf{Nothing has been trained to convergence on the real dataset.} Every
+figure in this document is a property of the architecture, the data, or the
+implementation --- not evidence that the system learns the task. A short
+calibration run over two full epochs left the rotation error flat at chance,
+which at roughly 3{,}500 of a planned 65{,}000 optimiser steps is not yet
+evidence either way.
+
+\subsection{Open questions}
+
+\begin{itemize}
+\item \textbf{Inference-time labelling.} Coincidence is unavailable at test
+      time and dihedral is weak (\S\ref{sub:labellings}). Until a segmenter exists, reported
+      numbers are an optimistic bound.
+\item \textbf{Supervision asymmetry.} The correspondence loss is defined over
+      coincident vertices, so it supervises only the fracture channel. Tokens
+      drawn from the original surface are shaped by the rotation loss alone.
+\item \textbf{Loss weights, layer counts, token budget.} All are currently
+      chosen rather than measured. The weights are deliberately equal so that
+      the first runs measure their natural scales.
+\item \textbf{Fragments with no fracture surface.} Coincidence reports a minimum
+      of zero, which should be impossible; most likely single-fragment modes,
+      but it needs counting, because such fragments receive no inter-fragment
+      edges at all.
+\item \textbf{The translation solver.} Specified in \S\ref{sec:translation}, not implemented.
+\end{itemize}
+
+\end{document}

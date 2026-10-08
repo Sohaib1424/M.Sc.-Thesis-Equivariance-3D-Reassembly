@@ -1,0 +1,44 @@
+\documentclass[border=5pt]{standalone}
+\input{style}
+\input{cartoon}
+\begin{document}
+\begin{tikzpicture}
+  \def\S{0.5}
+  % display positions (exploded), the same in every panel
+  \def\pieces{A/pieceA/-0.95/0.15,B/pieceB/0.1/-0.95,C/pieceC/0.95/0.35}
+  % (a) truth
+  \node[panel] at (-2.1,1.75) {(a) true orientations};
+  \begin{scope}
+    \foreach \P/\col/\x/\y in \pieces{
+      \begin{scope}[shift={(\x,\y)}, scale=\S]\drawpiece{\P}{\col}\end{scope}
+      \fill[ink] (\x,\y) circle (1.1pt);}
+    \node[tlbl, anchor=east] at (-1.55,0.55) {A};
+    \node[tlbl, anchor=west] at (1.75,0.75) {C};
+    \node[tlbl, anchor=west] at (0.95,-1.15) {B};
+  \end{scope}
+  \node[lbl, anchor=north] at (0,-1.75) {labels $R_i$; anchor $a$ = C,\\ the fragment of largest radius};
+
+  % (b) prediction: one shared global turn plus small individual errors
+  \node[panel] at (3.25,1.75) {(b) prediction $\hat R_i$};
+  \foreach \P/\col/\x/\y/\ang in {A/pieceA/-0.95/0.15/46,B/pieceB/0.1/-0.95/31,C/pieceC/0.95/0.35/40}{
+    \begin{scope}[shift={(5.3+\x,\y)}]
+      \begin{scope}[scale=\S]\draw[ink3, dashed, line width=0.6pt] \csname Piece\P\endcsname;\end{scope}
+      \begin{scope}[rotate=\ang, scale=\S]\drawpiece{\P}{\col}\end{scope}
+      \fill[ink] (0,0) circle (1.1pt);
+    \end{scope}}
+  \node[lbl, anchor=north] at (5.3,-1.75) {errors $46^\circ$, $31^\circ$, $40^\circ$: mostly one\\ shared turn no input can reveal};
+
+  % (c) after aligning the anchor
+  \node[panel] at (8.55,1.75) {(c) anchor aligned};
+  \foreach \P/\col/\x/\y/\ang in {A/pieceA/-0.95/0.15/6,B/pieceB/0.1/-0.95/-9,C/pieceC/0.95/0.35/0}{
+    \begin{scope}[shift={(10.6+\x,\y)}]
+      \begin{scope}[scale=\S]\draw[ink3, dashed, line width=0.6pt] \csname Piece\P\endcsname;\end{scope}
+      \begin{scope}[rotate=\ang, scale=\S]\drawpiece{\P}{\col}\end{scope}
+      \fill[ink] (0,0) circle (1.1pt);
+    \end{scope}}
+  \node[lbl, anchor=north] at (10.6,-1.75) {scored errors $6^\circ$ and $9^\circ$; the anchor\\ is exact and left out of every mean};
+  \draw[arr] (7.05,0) -- node[above, tlbl] {$C_s=R_a\hat R_a^{\top}$} node[below, tlbl] {$\tilde R_i=C_s\hat R_i$} (8.75,0);
+  \node[lbl, anchor=north, align=center, text=ink] at (4.9,-2.65) {dashed outline: true orientation.\quad
+    After alignment the error of fragment $i$ is $\angle(\tilde R_i,R_i)=\angle\big(\hat R_a^{\top}\hat R_i,\;R_a^{\top}R_i\big)$,\\ the error of its orientation \emph{relative to the anchor}.};
+\end{tikzpicture}
+\end{document}

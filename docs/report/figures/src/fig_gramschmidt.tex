@@ -1,0 +1,46 @@
+\documentclass[border=5pt]{standalone}
+\input{style}
+\begin{document}
+\begin{tikzpicture}
+  % ---------------- (a) Gram-Schmidt ----------------
+  \node[panel] at (-1.2,2.75) {(a) two vectors $\to$ a rotation};
+  \begin{scope}[x={(1.45cm,0cm)}, y={(0.62cm,0.42cm)}, z={(0cm,1.45cm)}]
+    \coordinate (O) at (0,0,0);
+    % faint reference axes
+    \draw[rule, line width=0.4pt] (-0.25,0,0) -- (1.9,0,0) (0,-0.5,0) -- (0,1.2,0) (0,0,-0.2) -- (0,0,1.5);
+    % the head's two outputs
+    \draw[vecarr] (O) -- (1.5,-0.25,0.25) node[below right, tlbl] {$\mathbf a$};
+    \draw[vecarr] (O) -- (0.9,0.2,1.25) node[above right, tlbl] {$\mathbf b$};
+    % projection of b on e1
+    \draw[ink2, densely dotted, line width=0.7pt] (0.9,0.2,1.25) -- (1.018,-0.17,0.17);
+    \fill[ink2] (1.018,-0.17,0.17) circle (1.1pt);
+    % the frame
+    \draw[outarr, line width=1.4pt] (O) -- (0.973,-0.162,0.162) node[pos=0.62, below, tlbl] {$\mathbf e_1$};
+    \draw[outarr, line width=1.4pt] (O) -- (-0.103,0.322,0.941) node[left, tlbl] {$\mathbf e_2$};
+    \draw[outarr, line width=1.4pt] (O) -- (-0.205,-0.933,0.297) node[left, tlbl] {$\mathbf e_3$};
+    \fill[ink] (O) circle (1.4pt);
+  \end{scope}
+  \node[lbl, anchor=north west, align=left, text=ink] at (-1.25,-0.75) {
+    $\mathbf e_1=\mathbf a/\lVert\mathbf a\rVert$\\[2pt]
+    $\mathbf e_2=\dfrac{\mathbf b-\langle\mathbf b,\mathbf e_1\rangle\mathbf e_1}{\lVert\mathbf b-\langle\mathbf b,\mathbf e_1\rangle\mathbf e_1\rVert}$\\[4pt]
+    $\mathbf e_3=\mathbf e_1\times\mathbf e_2$\qquad $M=[\,\mathbf e_1\ \mathbf e_2\ \mathbf e_3\,]$};
+  \node[lbl, anchor=north west, align=left] at (-1.25,-2.85) {orthonormal, $\det M=+1$ by construction};
+
+  % ---------------- (b) the convention ----------------
+  \begin{scope}[shift={(5.6,0)}]
+    \node[panel] at (-0.3,2.75) {(b) why the prediction is $\hat R=M^{\top}$};
+    \node[box, font=\small, minimum width=3.0cm] (x) at (1.3,1.6) {assembled $\mathbf x$};
+    \node[box, font=\small, minimum width=3.0cm] (xt) at (1.3,0.0) {input $\tilde{\mathbf x}=Q\mathbf x$};
+    \node[outbox, font=\small, minimum width=3.6cm] (M) at (6.1,0.0) {$M(\tilde{\mathbf x})=Q\,M(\mathbf x)$};
+    \node[outbox, font=\small, minimum width=3.6cm] (R) at (6.1,-1.6) {$\hat R=M(\tilde{\mathbf x})^{\top}=M(\mathbf x)^{\top}Q^{\top}$};
+    \draw[arr] (x) -- node[right, tlbl] {perturb by $Q$} (xt);
+    \draw[vecarr] (xt) -- node[above, tlbl] {network} (M);
+    \draw[outarr] (M) -- node[right, tlbl] {transpose} (R);
+    \node[lbl, anchor=north west, align=left, text=ink] at (-0.2,-2.3) {
+      the label is the rotation that undoes the perturbation: $R=Q^{\top}$\\[3pt]
+      if the network maps every \emph{assembled} fragment to the identity frame,\\
+      $M(\mathbf x)=I$, then $\hat R=Q^{\top}=R$ and $\hat R\,\tilde{\mathbf x}=\mathbf x$:\\[3pt]
+      one fixed, learnable target, the same for every fragment and scene};
+  \end{scope}
+\end{tikzpicture}
+\end{document}

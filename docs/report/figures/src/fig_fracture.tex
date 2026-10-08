@@ -1,0 +1,74 @@
+\documentclass[border=5pt]{standalone}
+\input{style}
+\input{dihedral}
+\input{cartoon}
+\begin{document}
+\begin{tikzpicture}
+  % =============== (a) the dihedral rule on a cross-section ===============
+  \node[panel] at (-2.65,2.1) {(a) dihedral rule, one fragment};
+  \begin{scope}[scale=0.95]
+    \fill[pieceA] \SecFill;
+    \draw[intact] \SecThin;
+    \draw[fracture] \SecThick;
+    \SecNormals
+    \foreach \p in \SecSharp {\fill[inv, draw=white, line width=0.4pt] \p circle (2.1pt);}
+    \node[tlbl] at (0,0.45) {intact surface};
+    \node[tlbl] at (0,-0.98) {fracture surface};
+  \end{scope}
+  \node[lbl, anchor=north west, align=left, text=ink] at (-2.45,-1.35)
+    {adjacent faces $f,g$ are sharp if\\
+     \hspace*{1em}$|\mathbf m_f\cdot\mathbf m_g|<0.9$ ($25.8^\circ$ to $154.2^\circ$)\\[2pt]
+     face $f$ is labelled if each vertex\\
+     \hspace*{1em}touches a face that has a\\
+     \hspace*{1em}sharp neighbour, and $\lfloor k_f/2\rfloor\le\sigma_f$};
+  \begin{scope}[shift={(-2.45,-3.7)}]
+    \fill[inv, draw=white] (0.1,0) circle (2.1pt); \node[tlbl, anchor=west] at (0.25,0) {sharp adjacency};
+    \draw[fracture] (2.75,0) -- (3.25,0); \node[tlbl, anchor=west] at (3.3,0) {labelled};
+  \end{scope}
+
+  % =============== (b) coincidence, training only ===============
+  \begin{scope}[shift={(5.6,0.15)}]
+    \node[panel] at (-2.05,1.95) {(b) coincidence};
+    \begin{scope}[scale=0.62]
+      \foreach \P/\col/\dx/\dy in {A/pieceA/-0.42/0.06,B/pieceB/0.04/-0.36,C/pieceC/0.33/0.15}{
+        \begin{scope}[shift={(\csname c\P x\endcsname+\dx,\csname c\P y\endcsname+\dy)}]
+          \drawpiece{\P}{\col}
+          \csname NameCracks\P\endcsname
+        \end{scope}}
+      % vertices that coincide in the assembled pose, joined across pieces
+      \foreach \c/\k in {0/1,0/2,0/3,0/4,0/5}{\draw[att, line width=0.7pt] (A-\c-\k) -- (C-\c-\k);
+        \fill[att] (A-\c-\k) circle (1.5pt) (C-\c-\k) circle (1.5pt);}
+      \foreach \c/\k in {1/1,1/2,1/3,1/4,1/5}{\draw[att, line width=0.7pt] (A-\c-\k) -- (B-\c-\k);
+        \fill[att] (A-\c-\k) circle (1.5pt) (B-\c-\k) circle (1.5pt);}
+      \foreach \c/\k in {2/1,2/2,2/3,2/4,2/5}{\draw[att, line width=0.7pt] (B-\c-\k) -- (C-\c-\k);
+        \fill[att] (B-\c-\k) circle (1.5pt) (C-\c-\k) circle (1.5pt);}
+    \end{scope}
+    \node[lbl, anchor=north, align=center, text=ink] at (-0.05,-1.45)
+      {pieces drawn apart; joined vertices\\ occupy the same point when assembled};
+    \node[lbl, anchor=north, align=center] at (-0.05,-2.35)
+      {exact, but needs the assembled scene:\\ training only (embedding supervision)};
+  \end{scope}
+
+  % =============== (c) tokens and pairs ===============
+  \begin{scope}[shift={(10.75,0.15)}]
+    \node[panel] at (-2.15,1.95) {(c) tokens and pairs};
+    \begin{scope}[scale=0.62]
+      \foreach \P/\col/\dx/\dy in {A/pieceA/-0.75/0.1,B/pieceB/0.05/-0.65,C/pieceC/0.6/0.25}{
+        \begin{scope}[shift={(\csname c\P x\endcsname+\dx,\csname c\P y\endcsname+\dy)}]
+          \drawpiece{\P}{\col}
+          \expandafter\let\expandafter\toklist\csname Tokens\P\endcsname
+          \foreach \x/\y [count=\i] in \toklist {\coordinate (t\P\i) at (\x,\y);}
+        \end{scope}}
+      \foreach \a in {1,...,5}{\foreach \b in {1,...,5}{
+        \draw[att, line width=0.35pt, opacity=0.55] (tA\a) -- (tB\b);
+        \draw[att, line width=0.35pt, opacity=0.55] (tA\a) -- (tC\b);
+        \draw[att, line width=0.35pt, opacity=0.55] (tB\a) -- (tC\b);}}
+      \foreach \P in {A,B,C}{\foreach \i in {1,...,5}{\node[token] at (t\P\i) {};}}
+    \end{scope}
+    \node[lbl, anchor=north, align=center, text=ink] at (0,-1.45)
+      {$T$ tokens per scene, shared by fracture\\ area; farthest-point sampled along\\ each fragment's labelled surface};
+    \node[lbl, anchor=north, align=center] at (0,-2.65)
+      {pairs: every token pair from\\ different fragments of the scene};
+  \end{scope}
+\end{tikzpicture}
+\end{document}

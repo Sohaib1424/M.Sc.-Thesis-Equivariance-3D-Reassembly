@@ -1,0 +1,64 @@
+% Shared by every figure. Colour marks the TYPE of a quantity, never decoration:
+%   blue   (vec) equivariant: rotates with its fragment     -- solid arrows
+%   orange (inv) invariant: unchanged by any rotation        -- dashed arrows
+%   aqua   (att) attention / communication between elements
+%   violet (out) what the network outputs
+% Text is always ink; a coloured mark next to it carries the meaning.
+\usepackage{amsmath,amssymb,bm}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc,shapes.geometric,
+  shapes.misc,decorations.pathreplacing,decorations.pathmorphing,matrix,
+  patterns,cd,shadows}
+\definecolor{vec}{HTML}{2A78D6}
+\definecolor{inv}{HTML}{EB6834}
+\definecolor{att}{HTML}{1BAF7A}
+\definecolor{out}{HTML}{4A3AA7}
+\definecolor{ink}{HTML}{0B0B0B}
+\definecolor{ink2}{HTML}{52514E}
+\definecolor{ink3}{HTML}{8A877F}
+\definecolor{neutral}{HTML}{F0EFEC}
+\definecolor{rule}{HTML}{CFCCC4}
+\definecolor{pieceA}{HTML}{E4E1DA}
+\definecolor{pieceB}{HTML}{CDC9BF}
+\definecolor{pieceC}{HTML}{B3AEA2}
+\colorlet{vecfill}{vec!9}
+\colorlet{invfill}{inv!10}
+\colorlet{attfill}{att!11}
+\colorlet{outfill}{out!9}
+\tikzset{
+  >={Stealth[length=2.3mm,width=1.7mm]},
+  every picture/.style={line cap=round, line join=round},
+  box/.style={draw=ink2, fill=neutral, rounded corners=2.5pt, align=center,
+    font=\small, inner sep=4pt, minimum height=8mm, text=ink, line width=0.6pt, nohyph},
+  vecbox/.style={box, draw=vec, fill=vecfill},
+  invbox/.style={box, draw=inv, fill=invfill},
+  attbox/.style={box, draw=att, fill=attfill},
+  outbox/.style={box, draw=out, fill=outfill},
+  plain/.style={box, draw=ink3, fill=white},
+  arr/.style={->, draw=ink2, line width=0.7pt},
+  vecarr/.style={->, draw=vec, line width=1.1pt},
+  invarr/.style={->, draw=inv, line width=1.1pt, dash pattern=on 3.2pt off 1.8pt},
+  attarr/.style={->, draw=att, line width=1.1pt, dash pattern=on 1.2pt off 1.4pt},
+  outarr/.style={->, draw=out, line width=1.1pt},
+  nohyph/.style={execute at begin node={\hyphenpenalty=10000\exhyphenpenalty=10000\relax}},
+  lbl/.style={font=\footnotesize, text=ink2, align=center, nohyph},
+  tlbl/.style={font=\footnotesize, text=ink, align=center, nohyph},
+  group/.style={draw=ink3, dashed, rounded corners=5pt, inner sep=7pt},
+  op/.style={circle, draw=ink2, fill=white, inner sep=0pt, minimum size=5.2mm,
+    font=\small, line width=0.6pt},
+  piece/.style={fill=#1, draw=none},
+  intact/.style={draw=ink2, line width=0.6pt},
+  fracture/.style={draw=ink, line width=1.5pt},
+  token/.style={circle, fill=att, draw=white, line width=0.5pt, inner sep=0pt,
+    minimum size=4.2pt},
+  vtx/.style={circle, fill=ink, inner sep=0pt, minimum size=3pt},
+  panel/.style={font=\small\bfseries, text=ink, anchor=north west},
+}
+% one piece of the cartoon, in its own centred frame: fill, intact edge, fracture edge
+\newcommand{\drawpiece}[2]{% #1 = A|B|C, #2 = fill colour
+  \fill[#2] \csname Piece#1\endcsname;
+  \draw[intact] \csname Intact#1\endcsname;
+  \draw[fracture] \csname Crack#1\endcsname;}
+% a legend entry: a short line in a given style, then its text
+\newcommand{\legendline}[3]{% #1 position, #2 style, #3 text
+  \draw[#2] (#1) -- ++(0.7,0) node[right, tlbl, text=ink] {#3};}

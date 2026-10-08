@@ -1,0 +1,53 @@
+\documentclass[border=5pt]{standalone}
+\input{style}
+\begin{document}
+\begin{tikzpicture}
+  \tikzset{fb/.style={font=\small, minimum height=8.5mm}, note/.style={lbl, align=left, anchor=west}}
+  % sides
+  \fill[vecfill!45] (-0.95,0.75) rectangle (5.35,-11.05);
+  \fill[neutral!70] (5.35,0.75) rectangle (10.4,-7.85);
+  \draw[ink3, dashed, line width=0.8pt] (5.35,0.75) -- (5.35,-7.85);
+  \node[tlbl, anchor=north west] at (-0.85,0.7) {\textbf{receiving token} $i$, fragment $f(i)$};
+  \node[tlbl, anchor=north west] at (5.45,0.7) {\textbf{sending tokens} $j\in\mathcal P(i)$:\\ other fragments, same scene};
+  % inputs and invariant descriptions
+  \node[vecbox, fb] (hi) at (2.2,-0.75) {$h_i\in\mathbb R^{C\times 3}$};
+  \node[vecbox, fb] (hj) at (7.9,-0.95) {$h_j$};
+  \node[invbox, fb] (si) at (2.2,-2.0) {$\mathbf s_i=\iota_4(h_i)$};
+  \node[invbox, fb] (sj) at (7.9,-2.0) {$\mathbf s_j=\iota_4(h_j)$};
+  \draw[vecarr] (hi) -- (si);
+  \draw[vecarr] (hj) -- (sj);
+  \node[invbox, fb] (qi) at (2.2,-3.25) {$\mathbf q_i=W_Q\mathbf s_i+\mathbf b_Q$};
+  \node[invbox, fb, align=center] (kj) at (7.9,-3.4) {$\mathbf k_j=W_K\mathbf s_j+\mathbf b_K$\\ $\mathbf v_j=W_V\mathbf s_j+\mathbf b_V$};
+  \draw[invarr] (si) -- (qi);
+  \draw[invarr] (sj) -- (kj);
+  % attention across the boundary
+  \node[invbox, fb] (lam) at (3.55,-4.75) {$\lambda_{ij}^{\eta}=\langle\mathbf q_i^{\eta},\mathbf k_j^{\eta}\rangle/\sqrt{d_k}$};
+  \draw[invarr] (qi) -- (qi |- lam.north);
+  \draw[invarr] ($(kj.south)+(-0.8,0)$) |- (lam.east);
+  \node[attbox, fb] (alp) at (3.55,-6.0) {$\alpha_{ij}^{\eta}=\mathrm{softmax}_{j\in\mathcal P(i)}\,\lambda_{ij}^{\eta}$};
+  \draw[invarr] (lam) -- (alp);
+  \node[invbox, fb] (ctx) at (3.55,-7.3) {$\mathbf c_i=\big[\textstyle\sum_{j}\alpha_{ij}^{\eta}\mathbf v_j^{\eta}\big]_{\eta=1}^{H}$};
+  \draw[invarr] (alp) -- (ctx);
+  \draw[invarr] ($(kj.south)+(0.8,0)$) |- (ctx.east);
+  % the matrix-valued message
+  \node[invbox, fb, align=center] (G) at (2.2,-8.6) {$G_i=\mathrm{MLP}_G[\mathbf c_i;\mathbf s_i]$\\ $H$ blocks of $\tfrac CH\times\tfrac CH$};
+  \draw[invarr] (ctx.south -| G.north) ++(0.6,0) -- ($(G.north)+(0.6,0)$);
+  \draw[invarr] (si.west) -- (-0.1,-2.0) |- ($(G.west)+(0,0.18)$);
+  \node[vecbox, fb] (mu) at (2.2,-9.85) {$\boldsymbol\mu_i=\mathrm{blockdiag}(G_i)\,h_i$};
+  \draw[invarr] (G) -- (mu);
+  \draw[vecarr] (hi.west) -- (-0.6,-0.75) |- (mu.west);
+  \node[vecbox, fb] (out) at (7.0,-9.85) {$h_i'=\mathrm{VN\text{-}LN}\big(h_i+W_P\,\boldsymbol\mu_i\big)$};
+  \draw[vecarr] (mu) -- (out);
+  \node[note] at (5.55,-10.65) {written back to the token's vertex};
+  % notes
+  \node[note, anchor=north west] at (5.45,-5.3) {only invariant\\ quantities cross\\ the boundary: the\\ senders' \emph{shape},\\ never their \emph{pose}};
+  \node[note] at (5.75,-8.55) {an invariant matrix times $i$'s own\\ equivariant features: equivariant to\\ $i$'s pose, invariant to everyone else's};
+  % legend
+  \begin{scope}[shift={(7.55,-11.65)}]
+    \draw[vecarr] (-7.6,0) -- (-6.9,0) node[right, tlbl] {equivariant, $C\times 3$};
+    \draw[invarr] (-3.9,0) -- (-3.2,0) node[right, tlbl] {invariant};
+    \fill[attfill, draw=att] (-1.45,-0.15) rectangle (-0.85,0.15);
+    \node[right, tlbl] at (-0.8,0) {attention weights};
+  \end{scope}
+\end{tikzpicture}
+\end{document}

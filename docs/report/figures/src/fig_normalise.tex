@@ -1,0 +1,69 @@
+\documentclass[border=5pt]{standalone}
+\input{style}
+\input{cartoon}
+\begin{document}
+\begin{tikzpicture}
+  % ---------------- (a) assembled, world frame ----------------
+  \node[panel] at (-2.6,2.57) {(a) assembled, world frame};
+  \foreach \P/\col in {A/pieceA,B/pieceB,C/pieceC}{
+    \begin{scope}[shift={(\csname c\P x\endcsname,\csname c\P y\endcsname)}]
+      \drawpiece{\P}{\col}
+    \end{scope}}
+  \foreach \P in {A,B,C}{
+    \coordinate (c\P) at (\csname c\P x\endcsname,\csname c\P y\endcsname);
+    \draw[ink, line width=0.7pt] ($(c\P)+(-0.09,-0.09)$) -- ($(c\P)+(0.09,0.09)$)
+      ($(c\P)+(-0.09,0.09)$) -- ($(c\P)+(0.09,-0.09)$);}
+  \node[tlbl, anchor=north] at ($(cA)+(0,-0.1)$) {$\mathbf c_A$};
+  \node[tlbl, anchor=north] at ($(cB)+(0,-0.1)$) {$\mathbf c_B$};
+  \node[tlbl, anchor=north] at ($(cC)+(0,-0.1)$) {$\mathbf c_C$};
+  \node[tlbl] at ($(cA)+(-0.25,0.55)$) {A};
+  \node[tlbl] at ($(cB)+(-0.55,-0.1)$) {B};
+  \node[tlbl] at ($(cC)+(0.45,0.5)$) {C};
+  % radius of the largest piece = scene divisor
+  \draw[inv, line width=1.0pt, dash pattern=on 3.2pt off 1.8pt] (cC) -- ++(\farCx,\farCy)
+    node[pos=0.55, above, tlbl, inner sep=2pt] {$r_C$};
+  \fill[inv] ($(cC)+(\farCx,\farCy)$) circle (1.3pt);
+  \node[lbl, anchor=north] at (0,-1.75) {fracture surfaces drawn bold,\\ intact surface thin};
+  \node[tlbl, anchor=north] at (0,-2.5) {scene divisor $d=\max_i r_i = r_C$};
+
+  % ---------------- (b) centred and scaled ----------------
+  \def\U{1.0}
+  \begin{scope}[shift={(4.9,0.95)}]
+    \node[panel] at (-1.3,1.62) {(b) centred, divided by $d$};
+    \foreach \P/\col/\x in {A/pieceA/0,B/pieceB/2.45,C/pieceC/4.9}{
+      \begin{scope}[shift={(\x,0)}]
+        \draw[rule, line width=0.5pt, dashed] (0,0) circle (\U);
+        \draw[rule, line width=0.4pt] (-1.08,0) -- (1.08,0) (0,-1.08) -- (0,1.08);
+        \begin{scope}[scale=\U*\invd]
+          \drawpiece{\P}{\col}
+        \end{scope}
+        \fill[ink] (0,0) circle (1.1pt);
+        \node[tlbl] at (0,-1.32) {\P};
+      \end{scope}}
+    \node[lbl, anchor=west] at (5.95,0.35) {$\mathbf y=\dfrac{\mathbf x-\mathbf c_i}{d}$};
+    \node[lbl, anchor=west] at (5.95,-0.45) {unit circle};
+  \end{scope}
+
+  % ---------------- (c) independent random rotations ----------------
+  \begin{scope}[shift={(4.9,-2.35)}]
+    \node[panel] at (-1.3,1.62) {(c) one random rotation per piece};
+    \foreach \P/\col/\x/\ang in {A/pieceA/0/75,B/pieceB/2.45/-140,C/pieceC/4.9/160}{
+      \begin{scope}[shift={(\x,0)}]
+        \draw[rule, line width=0.5pt, dashed] (0,0) circle (\U);
+        \draw[rule, line width=0.4pt] (-1.08,0) -- (1.08,0) (0,-1.08) -- (0,1.08);
+        \begin{scope}[rotate=\ang, scale=\U*\invd]
+          \drawpiece{\P}{\col}
+        \end{scope}
+        \fill[ink] (0,0) circle (1.1pt);
+        \draw[vec, line width=0.9pt, ->] (0:0.38) arc[start angle=0, end angle=\ang, radius=0.38];
+        \node[tlbl] at (0,-1.32) {$Q_{\P}$};
+      \end{scope}}
+    \node[lbl, anchor=west] at (5.95,0.45) {$\tilde{\mathbf y}=Q_i\,\mathbf y$};
+    \node[lbl, anchor=west] at (5.95,-0.2) {label};
+    \node[lbl, anchor=west] at (5.95,-0.62) {$R_i=Q_i^{\top}$};
+  \end{scope}
+
+  % arrows between panels
+  \draw[arr] (2.55,0.95) -- (3.45,0.95);
+\end{tikzpicture}
+\end{document}

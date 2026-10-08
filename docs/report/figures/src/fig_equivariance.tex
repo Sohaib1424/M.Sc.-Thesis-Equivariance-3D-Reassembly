@@ -1,0 +1,52 @@
+\documentclass[border=6pt, varwidth=16.2cm]{standalone}
+\input{style}
+\tikzcdset{
+  arrow style=tikz, arrows={line width=0.8pt},
+  diagrams={>={Stealth[length=2.2mm,width=1.6mm]}},
+}
+\newcommand{\vecin}{\textcolor{vec}}
+\begin{document}
+\centering
+\begin{minipage}[t]{5.1cm}\centering
+  \textbf{(a) vector features}\\[6pt]
+  \begin{tikzcd}[column sep=1.5cm, row sep=1.05cm]
+    X \arrow[r, "f", draw=vec] \arrow[d, "\cdot\,Q^{\top}"', ink2] & H \arrow[d, "\cdot\,Q^{\top}", ink2] \\
+    XQ^{\top} \arrow[r, "f"', draw=vec] & HQ^{\top}
+  \end{tikzcd}\\[4pt]
+  {\footnotesize every layer, and so the backbone:\\ $f(XQ^{\top})=f(X)\,Q^{\top}$}
+\end{minipage}\hfill
+\begin{minipage}[t]{5.1cm}\centering
+  \textbf{(b) embedding}\\[6pt]
+  \begin{tikzcd}[column sep=1.5cm, row sep=1.05cm]
+    X \arrow[r, "\mathbf z", draw=inv] \arrow[d, "\cdot\,Q^{\top}"', ink2] & \mathbf z \arrow[d, equal, ink2] \\
+    XQ^{\top} \arrow[r, "\mathbf z"', draw=inv] & \mathbf z
+  \end{tikzcd}\\[4pt]
+  {\footnotesize invariant:\\ $\mathbf z(XQ^{\top})=\mathbf z(X)$}
+\end{minipage}\hfill
+\begin{minipage}[t]{5.1cm}\centering
+  \textbf{(c) frame and rotation}\\[6pt]
+  \begin{tikzcd}[column sep=1.5cm, row sep=1.05cm]
+    X \arrow[r, "\hat R", draw=out] \arrow[d, "\cdot\,Q^{\top}"', ink2] & \hat R \arrow[d, "\cdot\,Q^{\top}", ink2] \\
+    XQ^{\top} \arrow[r, "\hat R"', draw=out] & \hat R\,Q^{\top}
+  \end{tikzcd}\\[4pt]
+  {\footnotesize $M(XQ^{\top})=Q\,M(X)$, \ $\hat R=M^{\top}$:\\ $\hat R(XQ^{\top})=\hat R(X)\,Q^{\top}$}
+\end{minipage}
+
+\vspace{12pt}
+\begin{minipage}[t]{7.9cm}\centering
+  \textbf{(d) several fragments, one rotation each}\\[8pt]
+  {\small $\begin{aligned}
+    H_i(\ldots,X_iA_i^{\top},\ldots)&=H_i(\ldots,X_i,\ldots)\,A_i^{\top}\\[2pt]
+    H_i(\ldots,X_jA_j^{\top},\ldots)&=H_i(\ldots,X_j,\ldots)\quad(j\ne i)
+  \end{aligned}$}\\[5pt]
+  {\footnotesize equivariant to its own pose, invariant to the others'}
+\end{minipage}\hfill
+\begin{minipage}[t]{7.9cm}\centering
+  \textbf{(e) why the perturbation cancels}\\[8pt]
+  {\small $\begin{aligned}
+    \hat R(XQ^{\top})&=\hat R(X)\,Q^{\top},\qquad R=Q^{\top}\\[2pt]
+    \angle\big(\hat R(XQ^{\top}),R\big)&=\angle\big(\hat R(X)Q^{\top},\,IQ^{\top}\big)=\angle\big(\hat R(X),I\big)
+  \end{aligned}$}\\[5pt]
+  {\footnotesize the error depends on the assembled fragment only}
+\end{minipage}
+\end{document}

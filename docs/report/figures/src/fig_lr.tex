@@ -1,0 +1,29 @@
+\documentclass[border=5pt]{standalone}
+\input{style}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\begin{document}
+\begin{tikzpicture}
+  \begin{axis}[
+    width=12.5cm, height=5.6cm,
+    xmin=0, xmax=600, ymin=0, ymax=5.6,
+    xlabel={epoch}, ylabel={learning rate $\eta$ \ ($\times10^{-4}$)},
+    xtick={0,100,200,300,400,500,600}, ytick={0,0.6,1,2,3,4,5},
+    yticklabels={0,0.6,1,2,3,4,5},
+    axis lines=left, tick style={ink3}, axis line style={ink3},
+    every axis label/.style={font=\footnotesize, text=ink2},
+    tick label style={font=\footnotesize, text=ink2},
+    ymajorgrids, grid style={rule!70, line width=0.3pt},
+    clip=false,
+  ]
+    \addplot[domain=0:600, samples=240, line width=1.6pt, color=ink]
+      {0.6 + 0.5*(5 - 0.6)*(1 + cos(deg(pi*x/600)))};
+    \draw[ink3, dashed, line width=0.5pt] (axis cs:0,0.6) -- (axis cs:600,0.6);
+    \node[tlbl, anchor=north east] at (axis cs:600,0.55) {floor $\eta_{\min}=6\times10^{-5}$};
+    \node[tlbl, anchor=south west] at (axis cs:4,5.0) {peak $\eta_{\max}=5\times10^{-4}$, no warm-up};
+    \fill[ink] (axis cs:199,3.91) circle (2.2pt);
+    \draw[ink2, line width=0.5pt] (axis cs:199,3.91) -- (axis cs:255,4.6)
+      node[right, tlbl] {epoch 199 of the reported run: $3.9\times10^{-4}$ ($78\%$ of the peak)};
+  \end{axis}
+\end{tikzpicture}
+\end{document}

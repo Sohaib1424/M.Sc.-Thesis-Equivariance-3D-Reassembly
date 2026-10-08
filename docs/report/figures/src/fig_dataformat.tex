@@ -1,0 +1,50 @@
+\documentclass[border=5pt]{standalone}
+\input{style}
+\input{cells}
+\begin{document}
+\begin{tikzpicture}
+  \def\K{0.9}
+  % (a) cells
+  \begin{scope}[scale=\K]
+    \fill[neutral] \CellOutline;
+    \draw[ink3, line width=0.35pt] \CellWalls;
+    \draw[intact] \CellOutline;
+  \end{scope}
+  \node[panel] at (0,2.95) {(a) cells};
+  % (b) a break pattern assigns cells to pieces
+  \begin{scope}[shift={(4.55,0)}, scale=\K]
+    \CellFills
+    \draw[ink3, line width=0.35pt] \CellWalls;
+    \draw[intact] \CellOutline;
+  \end{scope}
+  \node[panel] at (4.55,2.95) {(b) break pattern $k$};
+  % (c) pieces: internal walls cancel, walls between pieces remain
+  \begin{scope}[shift={(9.1,0)}, scale=\K]
+    \CellFills
+    \draw[intact] \CellOutline;
+    \draw[fracture] \PieceWalls;
+  \end{scope}
+  \node[panel] at (9.1,2.95) {(c) pieces};
+  \node[lbl, anchor=west] at (12.85,1.75) {walls inside a\\ piece cancel;};
+  \node[lbl, anchor=west] at (12.85,0.85) {walls between\\ pieces become\\ fracture surfaces};
+  \draw[arr] (3.75,1.17) -- (4.4,1.17);
+  \draw[arr] (8.3,1.17) -- (8.95,1.17);
+
+  % bottom: how one break pattern becomes fragment meshes
+  \begin{scope}[shift={(0,-0.95)}]
+    \tikzset{row/.style={font=\footnotesize, minimum height=2.7cm, anchor=north west}}
+    \node[plain, row] (s1) at (0,0)
+      {\textbf{once per object}\\[2pt] fine mesh $(V,F)$\\ cell matrix $M$:\\ vertex $\to$ cell};
+    \node[plain, row] (s2) at (3.25,0)
+      {\textbf{per break pattern $k$}\\[2pt] cell labels $\mathbf c^{(k)}$:\\ cell $\to$ piece};
+    \node[box, row] (s3) at (6.6,0)
+      {vertex labels\\ $\boldsymbol\ell=M\,\mathbf c^{(k)}$\\[3pt] triangle labels\\ $\lambda_t=\ell_{t_1}$ (first vertex)};
+    \node[box, row, align=left] (s4) at (9.95,0)
+      {\textbf{per piece $p$}\\[2pt] keep faces with $\lambda_t=p$\\ weld duplicate vertices\\ cancel faces stored twice\\ \quad with opposite winding\\ drop unused vertices};
+    \draw[arr] (s1.east) -- (s2.west);
+    \draw[arr] (s2.east) -- (s3.west);
+    \draw[arr] (s3.east) -- (s4.west);
+    \draw[arr] (s4.east) -- ++(0.4,0) node[right, tlbl, anchor=west] {fragment\\ meshes,\\ assembled\\ pose};
+  \end{scope}
+\end{tikzpicture}
+\end{document}

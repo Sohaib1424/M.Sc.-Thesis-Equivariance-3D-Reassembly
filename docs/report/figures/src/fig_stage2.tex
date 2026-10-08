@@ -1,0 +1,57 @@
+\documentclass[border=5pt]{standalone}
+\input{style}
+\input{cartoon}
+\begin{document}
+\begin{tikzpicture}
+  \tikzset{form/.style={lbl, text=ink, anchor=north, align=center}}
+  % ================= (a) matches between rotated, still-centred pieces =================
+  \node[panel] at (-2.45,2.1) {(a) matching};
+  \begin{scope}[scale=0.62]
+    \foreach \P/\col/\dx/\dy in {A/pieceA/-0.95/0.1,B/pieceB/0.05/-0.85,C/pieceC/0.75/0.3}{
+      \begin{scope}[shift={(\csname c\P x\endcsname+\dx,\csname c\P y\endcsname+\dy)}]
+        \drawpiece{\P}{\col}
+        \csname NameCracks\P\endcsname
+      \end{scope}}
+    \foreach \c/\k in {0/1,0/3,0/5}{\draw[att, line width=0.9pt] (A-\c-\k) -- (C-\c-\k);}
+    \foreach \c/\k in {1/2,1/4}{\draw[att, line width=0.9pt] (A-\c-\k) -- (B-\c-\k);}
+    \foreach \c/\k in {2/1,2/3,2/5}{\draw[att, line width=0.9pt] (B-\c-\k) -- (C-\c-\k);}
+    \draw[ink2, line width=0.9pt, dash pattern=on 2.5pt off 1.5pt] (A-0-2) -- (B-2-2);
+    \foreach \p in {A-0-1,C-0-1,A-0-3,C-0-3,A-0-5,C-0-5,A-1-2,B-1-2,A-1-4,B-1-4,B-2-1,C-2-1,B-2-3,C-2-3,B-2-5,C-2-5,A-0-2,B-2-2}{
+      \fill[ink] (\p) circle (1.5pt);}
+  \end{scope}
+  \node[form] at (0.0,-1.6) {pieces rotated by $\tilde R_i$, still centred;\\
+    mutual nearest neighbours in $\mathbf z$ between\\ fracture vertices of different fragments};
+  \draw[ink3, line width=0.5pt] ($(A-0-2)!0.62!(B-2-2)$) -- (1.75,-0.95) node[lbl, anchor=west] {wrong match};
+
+  % ================= (b) the solve =================
+  \begin{scope}[shift={(6.2,0.25)}]
+    \node[panel] at (-2.4,1.85) {(b) solving for translations};
+    \node[circle, draw=ink2, fill=pieceA, minimum size=8mm, font=\small] (gA) at (-1.2,0.75) {A};
+    \node[circle, draw=ink2, fill=pieceB, minimum size=8mm, font=\small] (gB) at (0.0,-0.75) {B};
+    \node[circle, draw=ink2, fill=pieceC, minimum size=8mm, font=\small] (gC) at (1.2,0.75) {C};
+    \draw[att, line width=1.6pt] (gA) -- node[above, tlbl] {3} (gC);
+    \draw[att, line width=1.2pt] (gA) -- node[left, tlbl] {2+1} (gB);
+    \draw[att, line width=1.6pt] (gB) -- node[right, tlbl] {3} (gC);
+    \node[form, anchor=north] at (0,-1.35) {
+      $E(\mathbf t)=\sum_m w_m\big\lVert\mathbf t_{a_m}-\mathbf t_{b_m}-\mathbf d_m\big\rVert^2$,\ \ $\mathbf d_m=\mathbf q_m-\mathbf p_m$\\[3pt]
+      $\big(L+\rho I+\tfrac1F\mathbf 1\mathbf 1^{\top}\big)\,T=B$,\ \ then $T\leftarrow T-\mathbf 1\bar{\mathbf t}^{\top}$\\[3pt]
+      $w_m=b_m\min\!\big(1,\ \delta/r_m\big)$: 5 solves, $\delta=0.05$};
+  \end{scope}
+
+  % ================= (c) placed =================
+  \begin{scope}[shift={(11.85,0.25)}]
+    \node[panel] at (-1.7,1.85) {(c) placed};
+    \begin{scope}[scale=0.62]
+      \foreach \P/\col in {A/pieceA,B/pieceB,C/pieceC}{
+        \begin{scope}[shift={(\csname c\P x\endcsname,\csname c\P y\endcsname)}]
+          \drawpiece{\P}{\col}
+        \end{scope}}
+    \end{scope}
+    \node[form] at (0,-1.35) {translations fixed relative\\ to the anchor: $\hat{\mathbf t}_i-\hat{\mathbf t}_a$\\ against $\mathbf c_i-\mathbf c_a$};
+  \end{scope}
+  \draw[arr] (3.15,0.2) -- (3.75,0.2);
+  \draw[arr] (8.55,0.2) -- (9.55,0.2);
+  \node[lbl, anchor=north, align=center] at (6.2,-3.15) {match weight from normal opposition: $b_m=\operatorname{clip}_{[0,1]}\tfrac12\big(1-\cos\angle(\hat{\mathbf n}_{p},\hat{\mathbf n}_{q})\big)$, 1 for opposed normals;\\
+    edge labels in (b): matches between two fragments; everything in world units};
+\end{tikzpicture}
+\end{document}
